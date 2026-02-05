@@ -96,8 +96,13 @@ neg_mix_end = 0.7
 neg_mix_ramp_epochs = 20
 ```
 
+Stability add-ons:
+- `neg_gate_margin`: if hallucinated negatives are too strong (`g_neg > g_pos + margin`), fall back to shuffle for that batch.
+- `grad_clip`: gradient norm clipping to reduce instability.
+
 ## Training Plots
 Set `log_csv` and `plot_path` in `configs/default.toml` to write a CSV of per-epoch metrics and a PNG plot.
+Recommended publishable location: `reports/ff_train.csv` and `reports/ff_train.png`.
 
 ## MPS Batch Auto-Tune
 Set `auto_tune_batch = true` in `configs/default.toml` to probe larger batch sizes on MPS and pick the biggest that fits.

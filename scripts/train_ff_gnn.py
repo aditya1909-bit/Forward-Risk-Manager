@@ -118,6 +118,8 @@ def main() -> int:
     parser.add_argument("--neg-mix-start", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--neg-mix-end", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--neg-mix-ramp-epochs", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--neg-gate-margin", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -150,6 +152,8 @@ def main() -> int:
     neg_mix_start = _get_setting(args, section, "neg_mix_start", 0.0)
     neg_mix_end = _get_setting(args, section, "neg_mix_end", 0.7)
     neg_mix_ramp_epochs = _get_setting(args, section, "neg_mix_ramp_epochs", 10)
+    neg_gate_margin = _get_setting(args, section, "neg_gate_margin", 0.1)
+    grad_clip = _get_setting(args, section, "grad_clip", 1.0)
 
     hall_steps = _get_setting(args, section, "hallucinate_steps", 10)
     hall_lr = _get_setting(args, section, "hallucinate_lr", 0.1)
@@ -298,7 +302,7 @@ def main() -> int:
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w") as f:
-            f.write("epoch,loss,g_pos,g_neg\n")
+            f.write("epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio\n")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -306,6 +310,10 @@ def main() -> int:
         total_pos = 0.0
         total_neg = 0.0
         batches = 0
+
+        hall_used = 0
+        total_used = 0
+        hall_gated = 0
 
         for batch in loader:
             try:
@@ -343,14 +351,27 @@ def main() -> int:
                     batch.batch,
                     hall_cfg,
                 )
+                hall_used += 1
             else:
                 x_neg = make_negative(x, batch.batch, mode=use_mode, noise_std=noise_std)
+            total_used += 1
+
+            if use_mode == "hallucinate":
+                h_neg_probe = model(x_neg, batch.edge_index)
+                g_neg_probe = goodness(h_neg_probe, batch.batch).mean().item()
+                g_pos_probe = g_pos.mean().item()
+                if g_neg_probe > g_pos_probe + neg_gate_margin:
+                    x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=noise_std)
+                    hall_used -= 1
+                    hall_gated += 1
             h_neg = model(x_neg, batch.edge_index)
             g_neg = goodness(h_neg, batch.batch)
 
             loss = ff_loss(g_pos, g_neg, target=goodness_target)
             optim.zero_grad()
             loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optim.step()
 
             total_loss += loss.item()
@@ -358,16 +379,20 @@ def main() -> int:
             total_neg += g_neg.mean().item()
             batches += 1
 
+        hall_ratio = hall_used / total_used if total_used else 0.0
+        gate_ratio = hall_gated / total_used if total_used else 0.0
         print(
             f"Epoch {epoch:02d} | loss={total_loss / batches:.4f} "
-            f"g_pos={total_pos / batches:.4f} g_neg={total_neg / batches:.4f}"
+            f"g_pos={total_pos / batches:.4f} g_neg={total_neg / batches:.4f} "
+            f"hall_ratio={hall_ratio:.2f} gate_ratio={gate_ratio:.2f}"
         )
 
         if log_csv:
             with Path(log_csv).open("a") as f:
                 f.write(
                     f"{epoch},{total_loss / batches:.6f},"
-                    f"{total_pos / batches:.6f},{total_neg / batches:.6f}\n"
+                    f"{total_pos / batches:.6f},{total_neg / batches:.6f},"
+                    f"{hall_ratio:.4f},{gate_ratio:.4f}\n"
                 )
 
     if save_model:
@@ -385,6 +410,10 @@ def main() -> int:
             plt.plot(df["epoch"], df["loss"], label="loss")
             plt.plot(df["epoch"], df["g_pos"], label="g_pos")
             plt.plot(df["epoch"], df["g_neg"], label="g_neg")
+            if "hallucinate_ratio" in df.columns:
+                plt.plot(df["epoch"], df["hallucinate_ratio"], label="hall_ratio")
+            if "gate_ratio" in df.columns:
+                plt.plot(df["epoch"], df["gate_ratio"], label="gate_ratio")
             plt.xlabel("Epoch")
             plt.ylabel("Value")
             plt.legend()
