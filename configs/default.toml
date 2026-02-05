@@ -1,0 +1,49 @@
+[build_graphs]
+prices = "data/processed/prices.csv"
+constituents = "data/processed/constituents.csv"
+out = "data/processed/graphs.pt"
+window = 20
+step = 1
+top_k = 10
+corr_threshold = ""
+min_nodes = 50
+feature_mode = "window"
+normalize = true
+symmetric = true
+include_tickers = ["MDY"]
+workers = 7
+
+[train]
+graphs = "data/processed/graphs.pt"
+epochs = 50
+batch_size = 32
+lr = 0.001
+hidden_dim = 64
+num_layers = 2
+dropout = 0.1
+goodness_target = 1.0
+neg_mode = "mix"
+noise_std = 0.05
+device = "mps"
+loader_workers = 3
+seed = 7
+log_csv = "runs/ff_train.csv"
+plot_path = "runs/ff_train.png"
+save_model = "runs/ff_model.pt"
+auto_tune_batch = true
+auto_tune_max_batch = 32
+auto_tune_factor = 2
+auto_tune_min_batch = 1
+neg_warmup_epochs = 20
+neg_mix_start = 0.0
+neg_mix_end = 0.7
+neg_mix_ramp_epochs = 20
+
+# Hallucinated negatives (used when neg_mode = "hallucinate")
+hallucinate_steps = 4
+hallucinate_lr = 0.05
+hallucinate_l2 = 0.02
+hallucinate_mean = 0.01
+hallucinate_std = 0.01
+hallucinate_corr = 0.2
+hallucinate_clamp_std = 3.0

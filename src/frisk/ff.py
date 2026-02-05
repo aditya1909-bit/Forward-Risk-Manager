@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+from typing import Literal
+
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import global_mean_pool
+
+
+def goodness(h: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    h2 = h * h
+    g_mean = global_mean_pool(h2, batch)
+    return g_mean.mean(dim=1)  # per-graph scalar
+
+
+def make_negative(
+    x: torch.Tensor,
+    batch: torch.Tensor,
+    mode: Literal["shuffle", "noise", "shuffle+noise"] = "shuffle",
+    noise_std: float = 0.05,
+) -> torch.Tensor:
+    out = x.clone()
+    graph_ids = batch.unique()
+    for gid in graph_ids:
+        idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+        if idx.numel() == 0:
+            continue
+        if mode in ("shuffle", "shuffle+noise"):
+            perm = torch.randperm(idx.numel(), device=x.device)
+            out[idx] = out[idx][perm]
+        if mode in ("noise", "shuffle+noise") and noise_std > 0:
+            out[idx] = out[idx] + noise_std * torch.randn_like(out[idx])
+    return out
+
+
+def ff_loss(
+    g_pos: torch.Tensor,
+    g_neg: torch.Tensor,
+    target: float = 1.0,
+) -> torch.Tensor:
+    # Encourage g_pos > target and g_neg < target
+    loss_pos = F.softplus(target - g_pos)
+    loss_neg = F.softplus(g_neg - target)
+    return (loss_pos + loss_neg).mean()

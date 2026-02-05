@@ -35,9 +35,12 @@ def _pick_col(norm_map: Dict[str, str], candidates: List[str]) -> Optional[str]:
     return None
 
 
-def _load_csvs(path: Path) -> pd.DataFrame:
+def _load_csvs(path: Path, exclude: Optional[Iterable[Path]] = None) -> pd.DataFrame:
     if path.is_dir():
         files = sorted(path.glob("*.csv"))
+        if exclude:
+            exclude_set = {p.resolve() for p in exclude if p is not None}
+            files = [f for f in files if f.resolve() not in exclude_set]
         if not files:
             raise FileNotFoundError(f"No CSV files found in {path}")
         frames = []
@@ -57,6 +60,9 @@ def _coerce_date(series: pd.Series) -> pd.Series:
 
 def _clean_ticker(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.upper().str.strip()
+    # Some QC exports include "TICKER SECURITYID" in one field.
+    # Split on whitespace first to keep the plain ticker.
+    s = s.str.split().str[0]
     # Extract first plausible ticker-like token
     s = s.str.extract(r"([A-Z0-9][A-Z0-9\.\-/]*)", expand=False)
     return s
@@ -235,7 +241,14 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    prices_raw = _load_csvs(prices_path)
+    exclude_prices = []
+    if prices_path.is_dir():
+        if constituents_path.is_file():
+            exclude_prices.append(constituents_path)
+        if coarse_path and coarse_path.is_file():
+            exclude_prices.append(coarse_path)
+
+    prices_raw = _load_csvs(prices_path, exclude=exclude_prices)
     constituents_raw = _load_csvs(constituents_path)
     prices = _standardize_prices(prices_raw, args)
     constituents = _standardize_constituents(constituents_raw, args)
