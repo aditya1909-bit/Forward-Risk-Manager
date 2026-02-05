@@ -10,7 +10,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.data import load_prices, compute_log_returns, load_constituents, build_membership_map
+from frisk.data import load_prices, compute_log_returns_and_volume, load_constituents, build_membership_map
 from frisk.graph_builder import GraphBuildConfig, build_rolling_corr_graphs
 
 
@@ -47,7 +47,15 @@ def main() -> int:
         "--corr-threshold", type=float, help="Correlation threshold", default=argparse.SUPPRESS
     )
     parser.add_argument("--min-nodes", type=int, help="Minimum nodes per graph", default=argparse.SUPPRESS)
-    parser.add_argument("--feature-mode", choices=["window", "last"], default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--feature-mode",
+        choices=["window", "last", "window_plus_summary"],
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--rsi-period", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--mdy-ticker", default=argparse.SUPPRESS)
+    parser.add_argument("--edge-norm", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--edge-weight-mode", choices=["abs", "raw", "ones"], default=argparse.SUPPRESS)
     parser.add_argument(
         "--no-normalize", action="store_true", help="Disable per-node z-score normalization"
     )
@@ -81,6 +89,10 @@ def main() -> int:
     corr_threshold = _get_setting(args, section, "corr_threshold", None)
     min_nodes = _get_setting(args, section, "min_nodes", 50)
     feature_mode = _get_setting(args, section, "feature_mode", "window")
+    rsi_period = _get_setting(args, section, "rsi_period", 14)
+    mdy_ticker = _get_setting(args, section, "mdy_ticker", "MDY")
+    edge_norm = _get_setting(args, section, "edge_norm", True)
+    edge_weight_mode = _get_setting(args, section, "edge_weight_mode", "abs")
     normalize = _get_setting(args, section, "normalize", True)
     symmetric = _get_setting(args, section, "symmetric", True)
     include_tickers = _get_setting(args, section, "include_tickers", [])
@@ -101,7 +113,7 @@ def main() -> int:
         top_k = None
 
     prices = load_prices(Path(prices_path))
-    returns = compute_log_returns(prices)
+    returns, volume = compute_log_returns_and_volume(prices)
     constituents = load_constituents(Path(constituents_path))
     membership_map = build_membership_map(constituents, extra_tickers=include_tickers)
 
@@ -114,9 +126,15 @@ def main() -> int:
         feature_mode=feature_mode,
         normalize=normalize,
         symmetric=symmetric,
+        rsi_period=rsi_period,
+        mdy_ticker=mdy_ticker,
+        edge_norm=edge_norm,
+        edge_weight_mode=edge_weight_mode,
     )
 
-    graphs, dates, tickers = build_rolling_corr_graphs(returns, membership_map, cfg, num_workers=workers)
+    graphs, dates, tickers, stats = build_rolling_corr_graphs(
+        returns, volume, membership_map, cfg, num_workers=workers
+    )
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -125,9 +143,25 @@ def main() -> int:
         "dates": dates,
         "tickers": tickers,
         "config": cfg.__dict__,
+        "stats": stats,
     }
     torch.save(payload, out_path)
+    if dates:
+        start_date = dates[0]
+        end_date = dates[-1]
+    else:
+        start_date = "n/a"
+        end_date = "n/a"
     print(f"Wrote {out_path} with {len(graphs)} graphs")
+    print(
+        f"Date range: {start_date} -> {end_date} | "
+        f"windows: {stats.get('total_windows', 0)} | "
+        f"built: {stats.get('built', 0)} | "
+        f"skipped: members={stats.get('skipped_no_members', 0)}, "
+        f"cols={stats.get('skipped_no_cols', 0)}, "
+        f"min_nodes={stats.get('skipped_min_nodes', 0)}, "
+        f"no_edges={stats.get('skipped_no_edges', 0)}"
+    )
     return 0
 
 

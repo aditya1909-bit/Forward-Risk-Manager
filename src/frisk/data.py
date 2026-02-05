@@ -20,7 +20,10 @@ def load_prices(path: Path, price_col: str = "adj_close") -> pd.DataFrame:
         else:
             raise ValueError(f"prices.csv missing '{price_col}' (or 'close')")
 
-    df = df[["date", "ticker", price_col]].copy()
+    cols = ["date", "ticker", price_col]
+    if "volume" in df.columns:
+        cols.append("volume")
+    df = df[cols].copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
     df = df.dropna(subset=["date", "ticker"])
@@ -29,11 +32,13 @@ def load_prices(path: Path, price_col: str = "adj_close") -> pd.DataFrame:
     return df
 
 
-def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    pivot = prices.pivot(index="date", columns="ticker", values="price")
-    pivot = pivot.sort_index()
+def compute_log_returns_and_volume(prices: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    pivot = prices.pivot(index="date", columns="ticker", values="price").sort_index()
     returns = np.log(pivot / pivot.shift(1))
-    return returns
+    volume = None
+    if "volume" in prices.columns:
+        volume = prices.pivot(index="date", columns="ticker", values="volume").sort_index()
+    return returns, volume
 
 
 def load_constituents(path: Path) -> pd.DataFrame:

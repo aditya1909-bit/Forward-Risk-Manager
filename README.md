@@ -81,6 +81,62 @@ Set `neg_mode = "hallucinate"` in `configs/default.toml` to enable gradient-asce
 
 Tune the `hallucinate_*` fields in the config to control steps, learning rate, and penalty weights.
 
+## Feature Mode
+`feature_mode = "window_plus_summary"` appends summary indicators to the raw return window:
+- Realized volatility
+- Momentum (sum of log returns)
+- Volume shock
+- Beta vs MDY
+- RSI
+
+## GCN + Cached Edge Norm
+Graphs now store normalized edge weights for faster GCN passes:
+- `edge_norm = true`
+- `edge_weight_mode = "abs"` (uses absolute correlation for adjacency)
+
+## Layer-wise FF (Efficiency)
+Set `ff_layerwise = true` to train layers sequentially using local FF losses.
+
+## Partial Hallucinations (Efficiency)
+Limit hallucination optimization to a subset of nodes:
+```
+hallucinate_node_fraction = 0.5
+hallucinate_node_min = 20
+```
+
+## Plot Hallucinations
+Generate a visual sanity check:
+
+```bash
+python scripts/plot_hallucination.py --config configs/default.toml
+```
+
+Pick a specific date:
+```bash
+python scripts/plot_hallucination.py --config configs/default.toml --date 2023-02-01
+```
+
+List available dates:
+```bash
+python scripts/plot_hallucination.py --config configs/default.toml --list-dates
+```
+
+Export the plotted windows to CSV:
+```bash
+python scripts/plot_hallucination.py --config configs/default.toml --save-csv reports/hallucination_window.csv
+```
+
+Export all nodes to CSV:
+```bash
+python scripts/plot_hallucination.py --config configs/default.toml --save-csv-all reports/hallucination_window_all.csv
+```
+
+## Goodness Temperature Sweep
+Quickly probe how `goodness_temp` changes the scale of goodness without training:
+```bash
+python scripts/train_ff_gnn.py --config configs/default.toml --temp-sweep 0.25,0.5,1.0,2.0
+```
+
 You can also use a warm-start schedule:
 ```
 neg_mode = "schedule"
@@ -106,6 +162,30 @@ Recommended publishable location: `reports/ff_train.csv` and `reports/ff_train.p
 
 ## MPS Batch Auto-Tune
 Set `auto_tune_batch = true` in `configs/default.toml` to probe larger batch sizes on MPS and pick the biggest that fits.
+
+## Benchmarking (FF vs Backprop)
+Run a small benchmark to compare speed and outcomes between:
+- `ff_layerwise` (layer-wise FF)
+- `ff_e2e` (end-to-end FF)
+- `backprop` (standard supervised classifier on pos/neg)
+
+```bash
+python scripts/benchmark_training.py --config configs/default.toml
+```
+
+Customize via `configs/default.toml`:
+```
+[benchmark]
+epochs = 5
+batch_size = 32
+eval_frac = 0.2
+neg_mode = "mix"
+eval_neg_mode = "shuffle"
+timing_warmup_epochs = 1
+out_csv = "reports/benchmark.csv"
+```
+
+The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_acc`, `eval_g_pos`, `eval_g_neg`, and `eval_sep`.
 
 ## Notes
 - If you don’t have `adj_close`, the converter falls back to `close`.

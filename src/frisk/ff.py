@@ -4,13 +4,19 @@ from typing import Literal
 
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import global_mean_pool
 
-
-def goodness(h: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+def goodness(h: torch.Tensor, batch: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     h2 = h * h
-    g_mean = global_mean_pool(h2, batch)
-    return g_mean.mean(dim=1)  # per-graph scalar
+    # per-node energy
+    node_energy = h2.mean(dim=1)
+    # log-sum-exp per graph (smooth max)
+    g_list = []
+    for gid in batch.unique():
+        idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+        e = node_energy[idx]
+        g = temperature * torch.logsumexp(e / temperature, dim=0)
+        g_list.append(g)
+    return torch.stack(g_list, dim=0)
 
 
 def make_negative(

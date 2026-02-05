@@ -15,7 +15,7 @@ from torch_geometric.loader import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.models import GraphSAGEEncoder
+from frisk.models import GCNEncoder
 from frisk.ff import goodness, make_negative, ff_loss
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 
@@ -52,6 +52,7 @@ def _try_batch_size(
     neg_mode,
     noise_std,
     goodness_target,
+    goodness_temp,
     hall_cfg: HallucinationConfig,
 ):
     loader = DataLoader(
@@ -64,8 +65,9 @@ def _try_batch_size(
     batch = next(iter(loader))
     batch = batch.to(device)
     x = batch.x
-    h_pos = model(x, batch.edge_index)
-    g_pos = goodness(h_pos, batch.batch)
+    edge_weight = getattr(batch, "edge_weight", None)
+    h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
     if neg_mode == "hallucinate":
         x_neg = hallucinate_negative(
             model,
@@ -74,11 +76,12 @@ def _try_batch_size(
             getattr(batch, "edge_attr", None),
             batch.batch,
             hall_cfg,
+            edge_weight=edge_weight,
         )
     else:
         x_neg = make_negative(x, batch.batch, mode=neg_mode, noise_std=noise_std)
-    h_neg = model(x_neg, batch.edge_index)
-    g_neg = goodness(h_neg, batch.batch)
+    h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
     loss = ff_loss(g_pos, g_neg, target=goodness_target)
     loss.backward()
     model.zero_grad(set_to_none=True)
@@ -120,6 +123,8 @@ def main() -> int:
     parser.add_argument("--neg-mix-ramp-epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--neg-gate-margin", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--temp-sweep", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-layerwise", action="store_true", default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -136,6 +141,8 @@ def main() -> int:
     num_layers = _get_setting(args, section, "num_layers", 2)
     dropout = _get_setting(args, section, "dropout", 0.1)
     goodness_target = _get_setting(args, section, "goodness_target", 1.0)
+    goodness_temp = _get_setting(args, section, "goodness_temp", 1.0)
+    temp_sweep = _get_setting(args, section, "temp_sweep", "")
     neg_mode = _get_setting(args, section, "neg_mode", "shuffle")
     noise_std = _get_setting(args, section, "noise_std", 0.05)
     device_choice = _get_setting(args, section, "device", "cpu")
@@ -154,6 +161,9 @@ def main() -> int:
     neg_mix_ramp_epochs = _get_setting(args, section, "neg_mix_ramp_epochs", 10)
     neg_gate_margin = _get_setting(args, section, "neg_gate_margin", 0.1)
     grad_clip = _get_setting(args, section, "grad_clip", 1.0)
+    ff_layerwise = _get_setting(args, section, "ff_layerwise", False) or getattr(
+        args, "ff_layerwise", False
+    )
 
     hall_steps = _get_setting(args, section, "hallucinate_steps", 10)
     hall_lr = _get_setting(args, section, "hallucinate_lr", 0.1)
@@ -192,6 +202,7 @@ def main() -> int:
     print(
         f"neg_mode: {neg_mode} | batch_size: {batch_size} | loader_workers: {loader_workers}"
     )
+    print(f"ff_layerwise: {ff_layerwise}")
     if neg_mode in ("schedule", "mix"):
         print(f"neg_warmup_epochs: {neg_warmup_epochs}")
     if neg_mode == "mix":
@@ -205,12 +216,33 @@ def main() -> int:
     )
 
     input_dim = graphs[0].x.shape[1]
-    model = GraphSAGEEncoder(
+    model = GCNEncoder(
         in_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         dropout=dropout,
     ).to(device)
+
+    if temp_sweep:
+        temps = [float(t.strip()) for t in str(temp_sweep).split(",") if t.strip()]
+        if not temps:
+            raise ValueError("temp_sweep provided but no valid values found.")
+        print(f"Temp sweep: {temps}")
+        loader = DataLoader(
+            graphs,
+            batch_size=min(batch_size, 32),
+            shuffle=True,
+            drop_last=False,
+            num_workers=loader_workers,
+        )
+        batch = next(iter(loader)).to(device)
+        x = batch.x
+        edge_weight = getattr(batch, "edge_weight", None)
+        h = model(x, batch.edge_index, edge_weight=edge_weight)
+        for t in temps:
+            g = goodness(h, batch.batch, temperature=t).mean().item()
+            print(f"goodness_temp={t} -> mean_goodness={g:.4f}")
+        return 0
 
     hall_cfg = HallucinationConfig(
         steps=hall_steps,
@@ -220,6 +252,9 @@ def main() -> int:
         std_weight=hall_std,
         corr_weight=hall_corr,
         clamp_std=hall_clamp,
+        goodness_temp=goodness_temp,
+        node_fraction=_get_setting(args, section, "hallucinate_node_fraction", 1.0),
+        node_min=_get_setting(args, section, "hallucinate_node_min", 1),
     )
 
     if auto_tune and device.type == "mps":
@@ -238,6 +273,7 @@ def main() -> int:
                     neg_mode,
                     noise_std,
                     goodness_target,
+                    goodness_temp,
                     hall_cfg,
                 )
                 best_bs = test_bs
@@ -269,6 +305,7 @@ def main() -> int:
                         neg_mode,
                         noise_std,
                         goodness_target,
+                        goodness_temp,
                         hall_cfg,
                     )
                     best_bs = test_bs
@@ -326,8 +363,7 @@ def main() -> int:
                     ) from exc
                 raise
             x = batch.x
-            h_pos = model(x, batch.edge_index)
-            g_pos = goodness(h_pos, batch.batch)
+            edge_weight = getattr(batch, "edge_weight", None)
 
             if neg_mode == "schedule":
                 use_mode = "shuffle" if epoch <= neg_warmup_epochs else "hallucinate"
@@ -342,41 +378,109 @@ def main() -> int:
             else:
                 use_mode = neg_mode
 
-            if use_mode == "hallucinate":
-                x_neg = hallucinate_negative(
-                    model,
-                    x,
-                    batch.edge_index,
-                    getattr(batch, "edge_attr", None),
-                    batch.batch,
-                    hall_cfg,
-                )
-                hall_used += 1
+            if ff_layerwise:
+                x_in = x
+                layer_losses = 0.0
+                layer_gpos = 0.0
+                layer_gneg = 0.0
+                for li in range(len(model.layers)):
+                    layer_mode = use_mode
+                    if use_mode == "hallucinate" and li > 0:
+                        # Hallucination penalties are defined in input space; keep deeper layers shuffle-based.
+                        layer_mode = "shuffle"
+                    h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
+                    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+
+                    if layer_mode == "hallucinate":
+                        forward_fn = lambda x_var, li=li: model.forward_layer(
+                            x_var, batch.edge_index, edge_weight, li
+                        )
+                        x_neg = hallucinate_negative(
+                            model,
+                            x_in,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            batch.batch,
+                            hall_cfg,
+                            edge_weight=edge_weight,
+                            forward_fn=forward_fn,
+                        )
+                        hall_used += 1
+                    else:
+                        x_neg = make_negative(x_in, batch.batch, mode=layer_mode, noise_std=noise_std)
+                    total_used += 1
+
+                    if layer_mode == "hallucinate":
+                        h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                        g_neg_probe = goodness(
+                            h_neg_probe, batch.batch, temperature=goodness_temp
+                        ).mean().item()
+                        g_pos_probe = g_pos.mean().item()
+                        if g_neg_probe > g_pos_probe + neg_gate_margin:
+                            x_neg = make_negative(x_in, batch.batch, mode="shuffle", noise_std=noise_std)
+                            hall_used -= 1
+                            hall_gated += 1
+
+                    h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+
+                    loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                    optim.zero_grad()
+                    loss.backward()
+                    if grad_clip and grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optim.step()
+
+                    layer_losses += loss.item()
+                    layer_gpos += g_pos.mean().item()
+                    layer_gneg += g_neg.mean().item()
+                    x_in = h_pos.detach()
+
+                total_loss += layer_losses / len(model.layers)
+                total_pos += layer_gpos / len(model.layers)
+                total_neg += layer_gneg / len(model.layers)
             else:
-                x_neg = make_negative(x, batch.batch, mode=use_mode, noise_std=noise_std)
-            total_used += 1
+                h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
-            if use_mode == "hallucinate":
-                h_neg_probe = model(x_neg, batch.edge_index)
-                g_neg_probe = goodness(h_neg_probe, batch.batch).mean().item()
-                g_pos_probe = g_pos.mean().item()
-                if g_neg_probe > g_pos_probe + neg_gate_margin:
-                    x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=noise_std)
-                    hall_used -= 1
-                    hall_gated += 1
-            h_neg = model(x_neg, batch.edge_index)
-            g_neg = goodness(h_neg, batch.batch)
+                if use_mode == "hallucinate":
+                    x_neg = hallucinate_negative(
+                        model,
+                        x,
+                        batch.edge_index,
+                        getattr(batch, "edge_attr", None),
+                        batch.batch,
+                        hall_cfg,
+                        edge_weight=edge_weight,
+                    )
+                    hall_used += 1
+                else:
+                    x_neg = make_negative(x, batch.batch, mode=use_mode, noise_std=noise_std)
+                total_used += 1
 
-            loss = ff_loss(g_pos, g_neg, target=goodness_target)
-            optim.zero_grad()
-            loss.backward()
-            if grad_clip and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optim.step()
+                if use_mode == "hallucinate":
+                    h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                    g_neg_probe = goodness(
+                        h_neg_probe, batch.batch, temperature=goodness_temp
+                    ).mean().item()
+                    g_pos_probe = g_pos.mean().item()
+                    if g_neg_probe > g_pos_probe + neg_gate_margin:
+                        x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=noise_std)
+                        hall_used -= 1
+                        hall_gated += 1
+                h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
 
-            total_loss += loss.item()
-            total_pos += g_pos.mean().item()
-            total_neg += g_neg.mean().item()
+                loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                optim.zero_grad()
+                loss.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optim.step()
+
+                total_loss += loss.item()
+                total_pos += g_pos.mean().item()
+                total_neg += g_neg.mean().item()
             batches += 1
 
         hall_ratio = hall_used / total_used if total_used else 0.0

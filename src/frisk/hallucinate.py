@@ -17,6 +17,9 @@ class HallucinationConfig:
     std_weight: float = 0.05
     corr_weight: float = 1.0
     clamp_std: Optional[float] = 3.0
+    goodness_temp: float = 1.0
+    node_fraction: float = 1.0
+    node_min: int = 1
 
 
 def _edge_corr_loss(
@@ -52,6 +55,8 @@ def hallucinate_negative(
     edge_attr: Optional[torch.Tensor],
     batch: torch.Tensor,
     config: HallucinationConfig,
+    edge_weight: Optional[torch.Tensor] = None,
+    forward_fn=None,
 ) -> torch.Tensor:
     # Freeze model params during hallucination steps
     req_grad = [p.requires_grad for p in model.parameters()]
@@ -71,9 +76,25 @@ def hallucinate_negative(
             clamp_min = mean0 - config.clamp_std * std0
             clamp_max = mean0 + config.clamp_std * std0
 
+        if config.node_fraction < 1.0:
+            mask = torch.zeros(x0.size(0), device=x0.device, dtype=torch.bool)
+            for gid in batch.unique():
+                idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+                if idx.numel() == 0:
+                    continue
+                k = max(config.node_min, int(idx.numel() * config.node_fraction))
+                perm = torch.randperm(idx.numel(), device=x0.device)[:k]
+                mask[idx[perm]] = True
+        else:
+            mask = torch.ones(x0.size(0), device=x0.device, dtype=torch.bool)
+        mask = mask[:, None]
+
         for _ in range(config.steps):
-            h = model(x_var, edge_index)
-            g = goodness(h, batch).mean()
+            if forward_fn is not None:
+                h = forward_fn(x_var)
+            else:
+                h = model(x_var, edge_index, edge_weight=edge_weight)
+            g = goodness(h, batch, temperature=config.goodness_temp).mean()
 
             l2 = (x_var - x0).pow(2).mean()
             mean_pen = (x_var.mean() - mean0).pow(2)
@@ -91,6 +112,10 @@ def hallucinate_negative(
             opt.zero_grad()
             loss.backward()
             opt.step()
+
+            if mask is not None:
+                with torch.no_grad():
+                    x_var.data = torch.where(mask, x_var.data, x0)
 
             if config.clamp_std is not None:
                 x_var.data.clamp_(clamp_min, clamp_max)
