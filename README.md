@@ -171,6 +171,10 @@ Stability add-ons:
 ## Training Plots
 Set `log_csv` and `plot_path` in `configs/default.toml` to write a CSV of per-epoch metrics and a PNG plot.
 Recommended publishable location: `reports/ff_train.csv` and `reports/ff_train.png`.
+The CSV now includes `hall_hardness` (avg `g_neg - g_pos` for hallucinated batches).
+
+## Baseline Config
+The current tuned baseline is stored at `configs/baseline.toml`.
 
 ## MPS Batch Auto-Tune
 Set `auto_tune_batch = true` in `configs/default.toml` to probe larger batch sizes on MPS and pick the biggest that fits.
@@ -254,6 +258,27 @@ python scripts/plot_ff_sweep.py --csv reports/ff_sweep.csv
 Pareto frontier plot:
 ```bash
 python scripts/plot_ff_sweep.py --csv reports/ff_sweep.csv --pareto-out reports/ff_sweep_pareto.png
+```
+
+Hallucination diagnostics (distribution overlay + diff histogram):
+```bash
+python scripts/plot_hallucination_diagnostics.py --csv reports/hallucination_window_all.csv
+```
+
+Calibrate hallucinations (KL/JS + tail ratios):
+```bash
+python scripts/hallucination_calibration.py --csv reports/hallucination_window_all.csv
+```
+
+## Scenario Book + Stress Test Report
+Generate a scenario book from multiple windows:
+```bash
+python scripts/scenario_book.py --config configs/default.toml --num-scenarios 10 --out reports/scenario_book.csv
+```
+
+Generate a stress test report (portfolio-level metrics + plot):
+```bash
+python scripts/stress_test_report.py --csv reports/scenario_book.csv --out-csv reports/stress_test_report.csv --out-plot reports/stress_test_report.png
 ```
 
 Generate a sweep summary report (top-K + Pareto):

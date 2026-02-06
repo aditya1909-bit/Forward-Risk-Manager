@@ -431,7 +431,7 @@ def main() -> int:
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w") as f:
-            f.write("epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio\n")
+            f.write("epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness\n")
 
     epoch_iter = tqdm(
         range(1, epochs + 1),
@@ -457,6 +457,8 @@ def main() -> int:
         hall_used = 0
         total_used = 0
         hall_gated = 0
+        hall_hardness_sum = 0.0
+        hall_hardness_count = 0
 
         for batch in loader:
             try:
@@ -496,6 +498,7 @@ def main() -> int:
                     h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
                     g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
+                    hall_active = layer_mode == "hallucinate"
                     if layer_mode == "hallucinate":
                         forward_fn = lambda x_var, li=li: model.forward_layer(
                             x_var, batch.edge_index, edge_weight, li
@@ -530,6 +533,7 @@ def main() -> int:
                             x_neg = make_negative(x_in, batch.batch, mode="shuffle", noise_std=noise_std)
                             hall_used -= 1
                             hall_gated += 1
+                            hall_active = False
 
                     h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                     g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
@@ -544,6 +548,9 @@ def main() -> int:
                     layer_losses += loss.item()
                     layer_gpos += g_pos.mean().item()
                     layer_gneg += g_neg.mean().item()
+                    if hall_active:
+                        hall_hardness_sum += (g_neg.mean().item() - g_pos.mean().item())
+                        hall_hardness_count += 1
                     x_in = h_pos.detach()
 
                 total_loss += layer_losses / len(model.layers)
@@ -553,6 +560,7 @@ def main() -> int:
                 h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
                 g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
+                hall_active = use_mode == "hallucinate"
                 if use_mode == "hallucinate":
                     x_neg = hallucinate_negative(
                         model,
@@ -578,6 +586,7 @@ def main() -> int:
                         x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=noise_std)
                         hall_used -= 1
                         hall_gated += 1
+                        hall_active = False
                 h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                 g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
 
@@ -591,10 +600,14 @@ def main() -> int:
                 total_loss += loss.item()
                 total_pos += g_pos.mean().item()
                 total_neg += g_neg.mean().item()
+                if hall_active:
+                    hall_hardness_sum += (g_neg.mean().item() - g_pos.mean().item())
+                    hall_hardness_count += 1
             batches += 1
 
         hall_ratio = hall_used / total_used if total_used else 0.0
         gate_ratio = hall_gated / total_used if total_used else 0.0
+        hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
         # Progress bar only; metrics are saved to CSV/plots.
 
         if log_csv:
@@ -602,7 +615,7 @@ def main() -> int:
                 f.write(
                     f"{epoch},{total_loss / batches:.6f},"
                     f"{total_pos / batches:.6f},{total_neg / batches:.6f},"
-                    f"{hall_ratio:.4f},{gate_ratio:.4f}\n"
+                    f"{hall_ratio:.4f},{gate_ratio:.4f},{hall_hardness:.6f}\n"
                 )
 
     if save_model:
@@ -624,6 +637,8 @@ def main() -> int:
                 plt.plot(df["epoch"], df["hallucinate_ratio"], label="hall_ratio")
             if "gate_ratio" in df.columns:
                 plt.plot(df["epoch"], df["gate_ratio"], label="gate_ratio")
+            if "hall_hardness" in df.columns:
+                plt.plot(df["epoch"], df["hall_hardness"], label="hall_hardness")
             plt.xlabel("Epoch")
             plt.ylabel("Value")
             plt.legend()

@@ -23,7 +23,7 @@ progress = true
 
 [train]
 graphs = "data/processed/graphs.pt"
-epochs = 50
+epochs = 120
 batch_size = 32
 lr = 0.001
 hidden_dim = 64
@@ -54,7 +54,7 @@ neg_warmup_epochs = 20
 neg_mix_start = 0.0
 neg_mix_end = 0.5
 neg_mix_ramp_epochs = 40
-neg_gate_margin = 1.0
+neg_gate_margin = 0.2
 grad_clip = 1.0
 layerwise_neg_mode = "shuffle+noise"
 layerwise_noise_std = 0.12
@@ -63,14 +63,14 @@ layerwise_hall_mean = 0.01
 layerwise_hall_std = 0.01
 
 # Hallucinated negatives (used when neg_mode = "hallucinate")
-hallucinate_steps = 1
-hallucinate_lr = 0.02
-hallucinate_l2 = 0.05
-hallucinate_mean = 0.01
-hallucinate_std = 0.01
-hallucinate_corr = 0.3
+hallucinate_steps = 4
+hallucinate_lr = 0.04
+hallucinate_l2 = 0.03
+hallucinate_mean = 0.005
+hallucinate_std = 0.005
+hallucinate_corr = 0.15
 hallucinate_clamp_std = 3.0
-hallucinate_node_fraction = 0.2
+hallucinate_node_fraction = 0.5
 hallucinate_node_min = 20
 
 [benchmark]
@@ -150,17 +150,17 @@ apply_backup_suffix = ".bak"
 isolate_thread_settings = true
 
 [train.hallucinate_curriculum]
-enabled = false
+enabled = true
 start_epoch = 10
-ramp_epochs = 20
+ramp_epochs = 30
 steps_start = 1
 steps_end = 4
 lr_start = 0.02
-lr_end = 0.05
+lr_end = 0.04
 l2_start = 0.08
-l2_end = 0.05
-corr_start = 0.1
-corr_end = 0.3
+l2_end = 0.03
+corr_start = 0.3
+corr_end = 0.15
 node_fraction_start = 0.2
 node_fraction_end = 0.5
 node_min_start = 10
