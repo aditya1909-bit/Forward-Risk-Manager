@@ -13,6 +13,7 @@ import torch
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_mean_pool
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
@@ -180,7 +181,13 @@ def _benchmark_ff(
     )
 
     epoch_times = []
-    for epoch in range(1, config["epochs"] + 1):
+    for epoch in tqdm(
+        range(1, config["epochs"] + 1),
+        desc="Benchmark",
+        unit="epoch",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    ):
         model.train()
         t0 = time.perf_counter()
         graphs_seen = 0
@@ -320,7 +327,13 @@ def _benchmark_backprop(graphs, device, config):
     )
 
     epoch_times = []
-    for epoch in range(1, config["epochs"] + 1):
+    for epoch in tqdm(
+        range(1, config["epochs"] + 1),
+        desc="Benchmark",
+        unit="epoch",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    ):
         model.train()
         t0 = time.perf_counter()
         graphs_seen = 0
@@ -520,6 +533,7 @@ def main() -> int:
         print(r)
 
     plot_path = bench_cfg.get("plot_path", "reports/benchmark_speed_sep.png")
+    bar_plot_path = bench_cfg.get("bar_plot_path", "reports/benchmark.png")
     try:
         import matplotlib.pyplot as plt
 
@@ -540,6 +554,30 @@ def main() -> int:
         fig.savefig(plot_path, dpi=150)
         plt.close(fig)
         print(f"Wrote {plot_path}")
+
+        # Bar chart summary (avg_epoch_s + eval_acc)
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        modes = [r["mode"] for r in results]
+        avg_epoch_s = [r["avg_epoch_s"] for r in results]
+        eval_acc = [r.get("eval_acc", 0.0) for r in results]
+
+        ax = axes[0]
+        ax.bar(modes, avg_epoch_s, color=["#4C78A8", "#72B7B2", "#F58518"])
+        ax.set_title("Avg Epoch Time (s)")
+        ax.set_ylabel("seconds")
+
+        ax = axes[1]
+        ax.bar(modes, eval_acc, color=["#4C78A8", "#72B7B2", "#F58518"])
+        ax.set_title("Eval Accuracy")
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("accuracy")
+
+        fig.tight_layout()
+        bar_plot_path = Path(bar_plot_path)
+        bar_plot_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(bar_plot_path, dpi=150)
+        plt.close(fig)
+        print(f"Wrote {bar_plot_path}")
     except Exception as exc:
         print(f"Plotting failed: {exc}")
     return 0

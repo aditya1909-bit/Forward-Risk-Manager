@@ -219,6 +219,11 @@ The script also writes a speed-vs-separation plot:
 reports/benchmark_speed_sep.png
 ```
 
+And a bar chart summary:
+```
+reports/benchmark.png
+```
+
 ## Auto-Sweep (FF Hyperparams)
 Run a lightweight grid search over FF settings and rank by `eval_sep`:
 

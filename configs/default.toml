@@ -82,6 +82,7 @@ eval_neg_mode = "shuffle"
 timing_warmup_epochs = 1
 out_csv = "reports/benchmark.csv"
 plot_path = "reports/benchmark_speed_sep.png"
+bar_plot_path = "reports/benchmark.png"
 
 [sweep]
 epochs = 3
