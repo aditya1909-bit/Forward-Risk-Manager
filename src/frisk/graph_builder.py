@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import pandas as pd
+from tqdm import tqdm
 from torch_geometric.data import Data
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 
@@ -232,6 +233,10 @@ def build_rolling_corr_graphs(
     membership_map: Dict[str, List[str]],
     config: GraphBuildConfig,
     num_workers: int = 1,
+    parallel_backend: str | None = "threadpool",
+    joblib_prefer: str = "threads",
+    joblib_n_jobs: int | None = None,
+    progress: bool = True,
 ) -> Tuple[List[Data], List[str], List[List[str]], Dict[str, int]]:
     dates = list(returns.index)
     graphs: List[Data] = []
@@ -248,19 +253,86 @@ def build_rolling_corr_graphs(
 
     end_indices = list(range(config.window - 1, len(dates), config.step))
 
-    if num_workers and num_workers > 1:
+    def _task(end_idx: int):
+        return _window_to_graph_data(end_idx, dates, returns, volume, membership_map, config)
+
+    backend = (parallel_backend or "threadpool").lower()
+    use_parallel = num_workers is not None and num_workers > 1 and backend not in ("none", "serial")
+
+    if use_parallel and backend in ("joblib", "loky"):
+        try:
+            from joblib import Parallel, delayed  # type: ignore
+
+            n_jobs = joblib_n_jobs if joblib_n_jobs is not None else num_workers
+            if progress and joblib_prefer == "threads":
+                pbar = tqdm(
+                    total=len(end_indices),
+                    desc="Building graphs",
+                    unit="win",
+                    dynamic_ncols=True,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                )
+
+                def _task_pbar(end_idx: int):
+                    res = _task(end_idx)
+                    pbar.update(1)
+                    return res
+
+                results = Parallel(
+                    n_jobs=n_jobs,
+                    prefer=joblib_prefer,
+                    batch_size="auto",
+                )(delayed(_task_pbar)(end_idx) for end_idx in end_indices)
+                pbar.close()
+            else:
+                results = Parallel(
+                    n_jobs=n_jobs,
+                    prefer=joblib_prefer,
+                    batch_size="auto",
+                )(delayed(_task)(end_idx) for end_idx in end_indices)
+        except Exception as exc:
+            print(f"joblib parallel failed ({exc}); falling back to ThreadPoolExecutor")
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                it = executor.map(_task, end_indices)
+                if progress:
+                    it = tqdm(
+                        it,
+                        total=len(end_indices),
+                        desc="Building graphs",
+                        unit="win",
+                        dynamic_ncols=True,
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                    )
+                results = list(it)
+    elif use_parallel:
         from concurrent.futures import ThreadPoolExecutor
 
-        def _task(end_idx: int):
-            return _window_to_graph_data(end_idx, dates, returns, volume, membership_map, config)
-
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            results = list(executor.map(_task, end_indices))
+            it = executor.map(_task, end_indices)
+            if progress:
+                it = tqdm(
+                    it,
+                    total=len(end_indices),
+                    desc="Building graphs",
+                    unit="win",
+                    dynamic_ncols=True,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                )
+            results = list(it)
     else:
-        results = [
-            _window_to_graph_data(end_idx, dates, returns, volume, membership_map, config)
-            for end_idx in end_indices
-        ]
+        it = end_indices
+        if progress:
+            it = tqdm(
+                it,
+                total=len(end_indices),
+                desc="Building graphs",
+                unit="win",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+        results = [_task(end_idx) for end_idx in it]
 
     stats["total_windows"] = len(results)
     for result, reason in results:

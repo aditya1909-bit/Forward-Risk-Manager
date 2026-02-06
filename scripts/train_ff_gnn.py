@@ -11,6 +11,7 @@ import os
 import torch
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
@@ -41,6 +42,10 @@ def _get_setting(args: argparse.Namespace, section: dict, key: str, default):
 def _is_oom(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "out of memory" in msg or "oom" in msg
+
+
+def _lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
 
 
 def _try_batch_size(
@@ -148,6 +153,12 @@ def main() -> int:
     device_choice = _get_setting(args, section, "device", "cpu")
     seed = _get_setting(args, section, "seed", 7)
     loader_workers = _get_setting(args, section, "loader_workers", 0)
+    dataloader_persistent = _get_setting(args, section, "dataloader_persistent_workers", True)
+    dataloader_prefetch = _get_setting(args, section, "dataloader_prefetch_factor", 2)
+    dataloader_pin_memory = _get_setting(args, section, "dataloader_pin_memory", False)
+    dataloader_mp_context = _get_setting(args, section, "dataloader_mp_context", "")
+    torch_num_threads = _get_setting(args, section, "torch_num_threads", None)
+    torch_num_interop_threads = _get_setting(args, section, "torch_num_interop_threads", None)
     log_csv = _get_setting(args, section, "log_csv", "")
     plot_path = _get_setting(args, section, "plot_path", "")
     save_model = _get_setting(args, section, "save_model", "")
@@ -172,8 +183,76 @@ def main() -> int:
     hall_std = _get_setting(args, section, "hallucinate_std", 0.05)
     hall_corr = _get_setting(args, section, "hallucinate_corr", 1.0)
     hall_clamp = _get_setting(args, section, "hallucinate_clamp_std", 3.0)
+    hall_node_fraction = _get_setting(args, section, "hallucinate_node_fraction", 1.0)
+    hall_node_min = _get_setting(args, section, "hallucinate_node_min", 1)
+    hall_curriculum = section.get("hallucinate_curriculum", {})
+    hall_curr_enabled = bool(hall_curriculum.get("enabled", False))
+    hall_curr_start = int(hall_curriculum.get("start_epoch", 1))
+    hall_curr_ramp = int(hall_curriculum.get("ramp_epochs", 1))
+    layerwise_neg_mode = _get_setting(args, section, "layerwise_neg_mode", "shuffle")
+    layerwise_noise_std = _get_setting(args, section, "layerwise_noise_std", noise_std)
+    layerwise_hall_corr = _get_setting(args, section, "layerwise_hall_corr", 0.0)
+    layerwise_hall_mean = _get_setting(args, section, "layerwise_hall_mean", hall_mean)
+    layerwise_hall_std = _get_setting(args, section, "layerwise_hall_std", hall_std)
+
+    def _hall_cfg_for_epoch(epoch: int, corr_override: float | None = None, mean_override: float | None = None, std_override: float | None = None) -> HallucinationConfig:
+        if not hall_curr_enabled:
+            return HallucinationConfig(
+                steps=hall_steps,
+                lr=hall_lr,
+                l2_weight=hall_l2,
+                mean_weight=hall_mean if mean_override is None else mean_override,
+                std_weight=hall_std if std_override is None else std_override,
+                corr_weight=hall_corr if corr_override is None else corr_override,
+                clamp_std=hall_clamp,
+                goodness_temp=goodness_temp,
+                node_fraction=hall_node_fraction,
+                node_min=hall_node_min,
+            )
+
+        if epoch < hall_curr_start:
+            t = 0.0
+        else:
+            ramp = max(1, hall_curr_ramp)
+            t = min(1.0, (epoch - hall_curr_start) / ramp)
+
+        def _curr_val(name: str, base: float, cast=None):
+            start = hall_curriculum.get(f"{name}_start", base)
+            end = hall_curriculum.get(f"{name}_end", start)
+            val = _lerp(float(start), float(end), t)
+            if cast is not None:
+                return cast(val)
+            return val
+
+        steps = max(1, _curr_val("steps", hall_steps, lambda v: int(round(v))))
+        lr = _curr_val("lr", hall_lr)
+        l2 = _curr_val("l2", hall_l2)
+        mean_w = _curr_val("mean", hall_mean) if mean_override is None else mean_override
+        std_w = _curr_val("std", hall_std) if std_override is None else std_override
+        corr_w = _curr_val("corr", hall_corr) if corr_override is None else corr_override
+        clamp_std = _curr_val("clamp_std", hall_clamp)
+        node_fraction = _curr_val("node_fraction", hall_node_fraction)
+        node_fraction = min(1.0, max(0.0, float(node_fraction)))
+        node_min = max(1, _curr_val("node_min", hall_node_min, lambda v: int(round(v))))
+
+        return HallucinationConfig(
+            steps=steps,
+            lr=lr,
+            l2_weight=l2,
+            mean_weight=mean_w,
+            std_weight=std_w,
+            corr_weight=corr_w,
+            clamp_std=clamp_std,
+            goodness_temp=goodness_temp,
+            node_fraction=node_fraction,
+            node_min=node_min,
+        )
 
     set_seed(seed)
+    if torch_num_threads:
+        torch.set_num_threads(int(torch_num_threads))
+    if torch_num_interop_threads:
+        torch.set_num_interop_threads(int(torch_num_interop_threads))
     if device_choice == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but not available")
@@ -203,6 +282,24 @@ def main() -> int:
         f"neg_mode: {neg_mode} | batch_size: {batch_size} | loader_workers: {loader_workers}"
     )
     print(f"ff_layerwise: {ff_layerwise}")
+    if torch_num_threads or torch_num_interop_threads:
+        print(
+            f"torch threads: {torch.get_num_threads()} | interop: {torch.get_num_interop_threads()}"
+        )
+    if hall_curr_enabled:
+        steps_start = hall_curriculum.get("steps_start", hall_steps)
+        steps_end = hall_curriculum.get("steps_end", hall_steps)
+        lr_start = hall_curriculum.get("lr_start", hall_lr)
+        lr_end = hall_curriculum.get("lr_end", hall_lr)
+        frac_start = hall_curriculum.get("node_fraction_start", hall_node_fraction)
+        frac_end = hall_curriculum.get("node_fraction_end", hall_node_fraction)
+        print(
+            "hallucination curriculum: "
+            f"start={hall_curr_start}, ramp={hall_curr_ramp}, "
+            f"steps {steps_start}->{steps_end}, "
+            f"lr {lr_start}->{lr_end}, "
+            f"node_fraction {frac_start}->{frac_end}"
+        )
     if neg_mode in ("schedule", "mix"):
         print(f"neg_warmup_epochs: {neg_warmup_epochs}")
     if neg_mode == "mix":
@@ -244,18 +341,7 @@ def main() -> int:
             print(f"goodness_temp={t} -> mean_goodness={g:.4f}")
         return 0
 
-    hall_cfg = HallucinationConfig(
-        steps=hall_steps,
-        lr=hall_lr,
-        l2_weight=hall_l2,
-        mean_weight=hall_mean,
-        std_weight=hall_std,
-        corr_weight=hall_corr,
-        clamp_std=hall_clamp,
-        goodness_temp=goodness_temp,
-        node_fraction=_get_setting(args, section, "hallucinate_node_fraction", 1.0),
-        node_min=_get_setting(args, section, "hallucinate_node_min", 1),
-    )
+    hall_cfg = _hall_cfg_for_epoch(hall_curr_start if hall_curr_enabled else 1)
 
     if auto_tune and device.type == "mps":
         print("Auto-tuning batch size for MPS...")
@@ -326,13 +412,19 @@ def main() -> int:
             print(f"Auto-tune selected batch_size={best_bs}")
             batch_size = best_bs
 
-    loader = DataLoader(
-        graphs,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=loader_workers,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "drop_last": False,
+        "num_workers": loader_workers,
+        "pin_memory": bool(dataloader_pin_memory) if device.type == "cuda" else False,
+    }
+    if loader_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(dataloader_persistent)
+        loader_kwargs["prefetch_factor"] = int(dataloader_prefetch)
+        if dataloader_mp_context:
+            loader_kwargs["multiprocessing_context"] = dataloader_mp_context
+    loader = DataLoader(graphs, **loader_kwargs)
     optim = Adam(model.parameters(), lr=lr)
 
     if log_csv:
@@ -341,8 +433,22 @@ def main() -> int:
         with log_path.open("w") as f:
             f.write("epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio\n")
 
-    for epoch in range(1, epochs + 1):
+    epoch_iter = tqdm(
+        range(1, epochs + 1),
+        desc="Training",
+        unit="epoch",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    for epoch in epoch_iter:
         model.train()
+        hall_cfg = _hall_cfg_for_epoch(epoch)
+        hall_cfg_layer = _hall_cfg_for_epoch(
+            epoch,
+            corr_override=layerwise_hall_corr,
+            mean_override=layerwise_hall_mean,
+            std_override=layerwise_hall_std,
+        )
         total_loss = 0.0
         total_pos = 0.0
         total_neg = 0.0
@@ -386,8 +492,7 @@ def main() -> int:
                 for li in range(len(model.layers)):
                     layer_mode = use_mode
                     if use_mode == "hallucinate" and li > 0:
-                        # Hallucination penalties are defined in input space; keep deeper layers shuffle-based.
-                        layer_mode = "shuffle"
+                        layer_mode = "hallucinate"
                     h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
                     g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
@@ -401,13 +506,18 @@ def main() -> int:
                             batch.edge_index,
                             getattr(batch, "edge_attr", None),
                             batch.batch,
-                            hall_cfg,
+                            hall_cfg_layer,
                             edge_weight=edge_weight,
                             forward_fn=forward_fn,
                         )
                         hall_used += 1
                     else:
-                        x_neg = make_negative(x_in, batch.batch, mode=layer_mode, noise_std=noise_std)
+                        x_neg = make_negative(
+                            x_in,
+                            batch.batch,
+                            mode=layerwise_neg_mode,
+                            noise_std=layerwise_noise_std,
+                        )
                     total_used += 1
 
                     if layer_mode == "hallucinate":
@@ -485,11 +595,7 @@ def main() -> int:
 
         hall_ratio = hall_used / total_used if total_used else 0.0
         gate_ratio = hall_gated / total_used if total_used else 0.0
-        print(
-            f"Epoch {epoch:02d} | loss={total_loss / batches:.4f} "
-            f"g_pos={total_pos / batches:.4f} g_neg={total_neg / batches:.4f} "
-            f"hall_ratio={hall_ratio:.2f} gate_ratio={gate_ratio:.2f}"
-        )
+        # Progress bar only; metrics are saved to CSV/plots.
 
         if log_csv:
             with Path(log_csv).open("a") as f:

@@ -62,6 +62,18 @@ python scripts/build_graphs.py \
 ```
 
 Tip: Use `--include-tickers MDY` if you want the ETF as a global context node even though it’s not in the constituents list.
+You can disable the progress bar with `--no-progress` or `progress = false` in config.
+
+## Optional: joblib Parallel Backend
+If you want `joblib` parallelism for graph building on macOS, set:
+```
+[build_graphs]
+parallel_backend = "joblib"
+joblib_prefer = "threads"
+joblib_n_jobs = 7
+```
+
+If joblib isn't installed, the builder will fall back to the threadpool backend.
 
 ## FF-GNN Training
 Train a simple Forward-Forward GNN that uses graph topology during message passing and a per-graph goodness score.
@@ -163,6 +175,17 @@ Recommended publishable location: `reports/ff_train.csv` and `reports/ff_train.p
 ## MPS Batch Auto-Tune
 Set `auto_tune_batch = true` in `configs/default.toml` to probe larger batch sizes on MPS and pick the biggest that fits.
 
+## Parallelism Knobs (macOS)
+For faster data loading and CPU ops:
+```
+loader_workers = 3
+torch_num_threads = 8
+torch_num_interop_threads = 2
+dataloader_persistent_workers = true
+dataloader_prefetch_factor = 2
+dataloader_mp_context = "spawn"
+```
+
 ## Benchmarking (FF vs Backprop)
 Run a small benchmark to compare speed and outcomes between:
 - `ff_layerwise` (layer-wise FF)
@@ -186,6 +209,121 @@ out_csv = "reports/benchmark.csv"
 ```
 
 The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_acc`, `eval_g_pos`, `eval_g_neg`, and `eval_sep`.
+
+The script also writes a speed-vs-separation plot:
+```
+reports/benchmark_speed_sep.png
+```
+
+## Auto-Sweep (FF Hyperparams)
+Run a lightweight grid search over FF settings and rank by `eval_sep`:
+
+```bash
+python scripts/ff_sweep.py --config configs/default.toml
+```
+
+Configure the sweep in `configs/default.toml`:
+```
+[sweep]
+epochs = 3
+batch_size = 32
+eval_frac = 0.2
+out_csv = "reports/ff_sweep.csv"
+modes = ["ff_layerwise", "ff_e2e"]
+goodness_temp = [0.25, 0.5]
+goodness_target = [2.0, 2.5]
+neg_mix_end = [0.3, 0.5]
+hall_steps = [1, 3]
+hall_lr = [0.03, 0.05]
+hall_node_fraction = [0.1, 0.2]
+top_k = 10
+parallel_workers = 1
+parallel_backend = "process"
+parallel_mp_context = "spawn"
+parallel_force_cpu = true
+worker_torch_threads = 1
+worker_torch_interop_threads = 1
+worker_loader_workers = 0
+```
+
+Plot sweep tradeoffs:
+```bash
+python scripts/plot_ff_sweep.py --csv reports/ff_sweep.csv
+```
+
+Pareto frontier plot:
+```bash
+python scripts/plot_ff_sweep.py --csv reports/ff_sweep.csv --pareto-out reports/ff_sweep_pareto.png
+```
+
+Generate a sweep summary report (top-K + Pareto):
+```bash
+python scripts/ff_sweep_summary.py --csv reports/ff_sweep.csv --out reports/ff_sweep_summary.txt
+```
+
+## Sweep Parallelism Auto-Tuner
+Find the fastest sweep parallelism settings on your Mac:
+
+```bash
+python scripts/tune_sweep_parallel.py --config configs/default.toml
+```
+
+Configure candidates in `configs/default.toml`:
+```
+[sweep_tune]
+out_csv = "reports/sweep_parallel_tune.csv"
+device = "cpu"
+epochs = 1
+batch_size = 32
+sample_graphs = 64
+max_batches = 2
+neg_mode = "shuffle"
+parallel_backend = "process"
+parallel_mp_context = "spawn"
+parallel_workers = [1, 2, 3, 4]
+worker_torch_threads = [1, 2]
+worker_torch_interop_threads = [1]
+worker_loader_workers = [0, 1]
+apply = true
+apply_to = "configs/default.toml"
+apply_section = "sweep"
+apply_min_improvement = 0.1
+apply_backup = true
+apply_backup_suffix = ".bak"
+isolate_thread_settings = true
+```
+
+## Hard-Negative Curriculum
+Optionally ramp hallucination strength over time:
+```
+[train.hallucinate_curriculum]
+enabled = true
+start_epoch = 10
+ramp_epochs = 20
+steps_start = 1
+steps_end = 4
+lr_start = 0.02
+lr_end = 0.05
+l2_start = 0.08
+l2_end = 0.05
+corr_start = 0.1
+corr_end = 0.3
+node_fraction_start = 0.2
+node_fraction_end = 0.5
+node_min_start = 10
+node_min_end = 20
+```
+
+## Layer-wise Negatives (Advanced)
+If you enable `ff_layerwise`, you can strengthen negatives in deeper layers:
+```
+layerwise_neg_mode = "shuffle+noise"
+layerwise_noise_std = 0.08
+layerwise_hall_corr = 0.0
+layerwise_hall_mean = 0.01
+layerwise_hall_std = 0.01
+```
+These settings apply only to layer-wise training.
 
 ## Notes
 - If you don’t have `adj_close`, the converter falls back to `close`.

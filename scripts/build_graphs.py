@@ -71,6 +71,29 @@ def main() -> int:
         help="Number of worker threads for building windows (use >1 for parallelism)",
         default=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--parallel-backend",
+        choices=["threadpool", "joblib", "serial"],
+        help="Parallel backend: threadpool (default), joblib, or serial",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--joblib-prefer",
+        choices=["threads", "processes"],
+        help="joblib backend preference",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--joblib-n-jobs",
+        type=int,
+        help="joblib n_jobs (defaults to workers)",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bar output",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -97,6 +120,16 @@ def main() -> int:
     symmetric = _get_setting(args, section, "symmetric", True)
     include_tickers = _get_setting(args, section, "include_tickers", [])
     workers = _get_setting(args, section, "workers", 1)
+    parallel_backend = _get_setting(args, section, "parallel_backend", "threadpool")
+    joblib_prefer = _get_setting(args, section, "joblib_prefer", "threads")
+    joblib_n_jobs = _get_setting(args, section, "joblib_n_jobs", None)
+    progress = _get_setting(args, section, "progress", True)
+    if isinstance(joblib_n_jobs, str) and joblib_n_jobs.lower() in ("", "none", "null"):
+        joblib_n_jobs = None
+    if isinstance(joblib_n_jobs, int) and joblib_n_jobs <= 0:
+        joblib_n_jobs = None
+    if getattr(args, "no_progress", False):
+        progress = False
 
     if isinstance(include_tickers, str):
         include_tickers = [t.strip() for t in include_tickers.split(",") if t.strip()]
@@ -133,7 +166,15 @@ def main() -> int:
     )
 
     graphs, dates, tickers, stats = build_rolling_corr_graphs(
-        returns, volume, membership_map, cfg, num_workers=workers
+        returns,
+        volume,
+        membership_map,
+        cfg,
+        num_workers=workers,
+        parallel_backend=parallel_backend,
+        joblib_prefer=joblib_prefer,
+        joblib_n_jobs=joblib_n_jobs,
+        progress=progress,
     )
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

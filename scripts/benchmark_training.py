@@ -142,13 +142,20 @@ def _benchmark_ff(
     layerwise: bool,
 ):
     train_graphs, eval_graphs = _split_graphs(graphs, eval_frac=config["eval_frac"], seed=config["seed"])
-    loader = DataLoader(
-        train_graphs,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        drop_last=False,
-        num_workers=config["loader_workers"],
-    )
+    loader_kwargs = {
+        "batch_size": config["batch_size"],
+        "shuffle": True,
+        "drop_last": False,
+        "num_workers": config["loader_workers"],
+        "pin_memory": bool(config.get("pin_memory", False)) if device.type == "cuda" else False,
+    }
+    if config["loader_workers"] > 0:
+        loader_kwargs["persistent_workers"] = bool(config.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+        mp_ctx = config.get("multiprocessing_context", "")
+        if mp_ctx:
+            loader_kwargs["multiprocessing_context"] = mp_ctx
+    loader = DataLoader(train_graphs, **loader_kwargs)
     eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
 
     model = GCNEncoder(
@@ -273,13 +280,20 @@ def _benchmark_ff(
 
 def _benchmark_backprop(graphs, device, config):
     train_graphs, eval_graphs = _split_graphs(graphs, eval_frac=config["eval_frac"], seed=config["seed"])
-    loader = DataLoader(
-        train_graphs,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        drop_last=False,
-        num_workers=config["loader_workers"],
-    )
+    loader_kwargs = {
+        "batch_size": config["batch_size"],
+        "shuffle": True,
+        "drop_last": False,
+        "num_workers": config["loader_workers"],
+        "pin_memory": bool(config.get("pin_memory", False)) if device.type == "cuda" else False,
+    }
+    if config["loader_workers"] > 0:
+        loader_kwargs["persistent_workers"] = bool(config.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+        mp_ctx = config.get("multiprocessing_context", "")
+        if mp_ctx:
+            loader_kwargs["multiprocessing_context"] = mp_ctx
+    loader = DataLoader(train_graphs, **loader_kwargs)
     eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
 
     model = GCNEncoder(
@@ -435,6 +449,10 @@ def main() -> int:
 
     device = _choose_device(train_cfg.get("device", "cpu"))
     _set_seed(int(train_cfg.get("seed", 7)))
+    if train_cfg.get("torch_num_threads"):
+        torch.set_num_threads(int(train_cfg["torch_num_threads"]))
+    if train_cfg.get("torch_num_interop_threads"):
+        torch.set_num_interop_threads(int(train_cfg["torch_num_interop_threads"]))
 
     config = {
         "epochs": int(bench_cfg.get("epochs", 5)),
@@ -454,6 +472,10 @@ def main() -> int:
         "goodness_temp": float(train_cfg.get("goodness_temp", 1.0)),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "loader_workers": int(train_cfg.get("loader_workers", 0)),
+        "persistent_workers": bool(train_cfg.get("dataloader_persistent_workers", True)),
+        "prefetch_factor": int(train_cfg.get("dataloader_prefetch_factor", 2)),
+        "pin_memory": bool(train_cfg.get("dataloader_pin_memory", False)),
+        "multiprocessing_context": str(train_cfg.get("dataloader_mp_context", "")),
         "eval_frac": float(bench_cfg.get("eval_frac", 0.2)),
         "seed": int(train_cfg.get("seed", 7)),
         "hall_steps": int(train_cfg.get("hallucinate_steps", 3)),
@@ -496,6 +518,30 @@ def main() -> int:
     print(f"Wrote {out_path}")
     for r in results:
         print(r)
+
+    plot_path = bench_cfg.get("plot_path", "reports/benchmark_speed_sep.png")
+    try:
+        import matplotlib.pyplot as plt
+
+        xs = [r["graphs_per_s"] for r in results]
+        ys = [r.get("eval_sep", 0.0) for r in results]
+        labels = [r["mode"] for r in results]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.scatter(xs, ys, color="#4C78A8")
+        for x, y, label in zip(xs, ys, labels):
+            ax.annotate(label, (x, y), textcoords="offset points", xytext=(6, 4))
+        ax.set_xlabel("graphs/sec")
+        ax.set_ylabel("eval_sep (g_pos - g_neg)")
+        ax.set_title("Speed vs Separation")
+        fig.tight_layout()
+        plot_path = Path(plot_path)
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        print(f"Wrote {plot_path}")
+    except Exception as exc:
+        print(f"Plotting failed: {exc}")
     return 0
 
 
