@@ -287,6 +287,25 @@ Generate a scenario book from multiple windows:
 python scripts/scenario_book.py --config configs/default.toml --num-scenarios 10 --out reports/scenario_book.csv
 ```
 
+You can also set defaults in `configs/default.toml`:
+```
+[scenario_book]
+num_scenarios = 50
+target_ticker = "MDY"
+target_drop = -0.10
+constraint_weight = 20.0
+adaptive = true
+target_hit_rate = 0.6
+target_tolerance = 0.01
+max_adapt_steps = 40
+diag_out = "reports/scenario_constraint_diagnostics.csv"
+out = "reports/scenario_book.csv"
+```
+Then run:
+```bash
+python scripts/scenario_book.py --config configs/default.toml
+```
+
 Constrained “dreaming” (pick a ticker that exists in your graphs; e.g., MDY):
 ```bash
 python scripts/scenario_book.py --config configs/default.toml \

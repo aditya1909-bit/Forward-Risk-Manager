@@ -12,24 +12,28 @@ class GCNEncoder(nn.Module):
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         self.layers = nn.ModuleList()
+        # Keep normalization off: FF goodness relies on energy magnitude.
         self.layers.append(GCNConv(in_dim, hidden_dim, add_self_loops=False, normalize=False))
         for _ in range(num_layers - 1):
             self.layers.append(GCNConv(hidden_dim, hidden_dim, add_self_loops=False, normalize=False))
         self.dropout = nn.Dropout(dropout)
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
 
     def forward(
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor | None = None,
+        return_all: bool = False,
     ) -> torch.Tensor:
         h = x
-        for layer, norm in zip(self.layers, self.norms):
+        outputs: list[torch.Tensor] = []
+        for layer in self.layers:
             h = layer(h, edge_index, edge_weight=edge_weight)
-            h = norm(h)
             h = F.relu(h)
             h = self.dropout(h)
+            outputs.append(h)
+        if return_all:
+            return outputs  # type: ignore[return-value]
         return h
 
     def forward_layer(
@@ -40,9 +44,7 @@ class GCNEncoder(nn.Module):
         layer_idx: int,
     ) -> torch.Tensor:
         layer = self.layers[layer_idx]
-        norm = self.norms[layer_idx]
         h = layer(x, edge_index, edge_weight=edge_weight)
-        h = norm(h)
         h = F.relu(h)
         h = self.dropout(h)
         return h

@@ -268,12 +268,70 @@ def main() -> int:
     args = parser.parse_args()
     if args.target_ticker:
         args.target_ticker = args.target_ticker.strip().upper()
-    if args.adaptive and not args.target_ticker:
-        raise ValueError("--adaptive requires --target-ticker")
-
     cfg = _load_config(args.config)
     train_cfg = cfg.get("train", {})
     build_cfg = cfg.get("build_graphs", {})
+    scenario_cfg = cfg.get("scenario_book", {})
+
+    def _maybe_override(key: str, flags, cast=None):
+        flag_list = flags if isinstance(flags, (list, tuple)) else [flags]
+        if any(flag in sys.argv for flag in flag_list):
+            return
+        if key not in scenario_cfg:
+            return
+        val = scenario_cfg[key]
+        if isinstance(val, list):
+            val = ",".join(str(x) for x in val)
+        if cast:
+            val = cast(val)
+        setattr(args, key, val)
+
+    _maybe_override("num_scenarios", "--num-scenarios", int)
+    _maybe_override("seed", "--seed", int)
+    _maybe_override("indices", "--indices")
+    _maybe_override("dates", "--dates")
+    _maybe_override("target_ticker", "--target-ticker")
+    _maybe_override("target_drop", "--target-drop", float)
+    _maybe_override("constraint_weight", "--constraint-weight", float)
+    _maybe_override("constraint_mode", "--constraint-mode")
+    _maybe_override("max_tickers", "--max-tickers", int)
+    _maybe_override("diag_out", "--diag-out")
+    _maybe_override("out", "--out")
+    _maybe_override("adaptive", "--adaptive", bool)
+    _maybe_override("target_hit_rate", "--target-hit-rate", float)
+    _maybe_override("target_tolerance", "--target-tolerance", float)
+    _maybe_override("max_adapt_steps", "--max-adapt-steps", int)
+    _maybe_override("adapt_constraint_mult", "--adapt-constraint-mult", float)
+    _maybe_override("adapt_hall_step_inc", "--adapt-hall-step-inc", int)
+    _maybe_override("adapt_hall_lr_mult", "--adapt-hall-lr-mult", float)
+    _maybe_override("adapt_hall_l2_mult", "--adapt-hall-l2-mult", float)
+    _maybe_override("adapt_hall_mean_mult", "--adapt-hall-mean-mult", float)
+    _maybe_override("adapt_hall_std_mult", "--adapt-hall-std-mult", float)
+    _maybe_override("adapt_hall_corr_mult", "--adapt-hall-corr-mult", float)
+    _maybe_override("adapt_hall_node_inc", "--adapt-hall-node-inc", float)
+    _maybe_override("adapt_hall_clamp_inc", "--adapt-hall-clamp-inc", float)
+    _maybe_override("adapt_max_constraint", "--adapt-max-constraint", float)
+    _maybe_override("adapt_max_steps", "--adapt-max-steps", int)
+    _maybe_override("adapt_max_lr", "--adapt-max-lr", float)
+    _maybe_override("adapt_max_clamp_std", "--adapt-max-clamp-std", float)
+    _maybe_override("adapt_min_l2", "--adapt-min-l2", float)
+    _maybe_override("adapt_min_mean", "--adapt-min-mean", float)
+    _maybe_override("adapt_min_std", "--adapt-min-std", float)
+    _maybe_override("adapt_min_corr", "--adapt-min-corr", float)
+
+    _maybe_override("hall_steps", "--hall-steps", int)
+    _maybe_override("hall_lr", "--hall-lr", float)
+    _maybe_override("hall_l2", "--hall-l2", float)
+    _maybe_override("hall_corr", "--hall-corr", float)
+    _maybe_override("hall_mean_weight", "--hall-mean-weight", float)
+    _maybe_override("hall_std_weight", "--hall-std-weight", float)
+    _maybe_override("hall_clamp_std", "--hall-clamp-std", float)
+    _maybe_override("hall_node_fraction", "--hall-node-fraction", float)
+
+    if args.target_ticker:
+        args.target_ticker = args.target_ticker.strip().upper()
+    if args.adaptive and not args.target_ticker:
+        raise ValueError("--adaptive requires --target-ticker")
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
     try:

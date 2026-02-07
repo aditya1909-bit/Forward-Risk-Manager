@@ -7,6 +7,8 @@ import random
 import sys
 import tomllib
 import os
+import csv
+import math
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +52,76 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
+def _compute_risk_targets(
+    prices_path: str,
+    ticker: str,
+    dates: list[str],
+    horizon: int,
+    standardize: bool,
+) -> tuple[list[float | None], float, float]:
+    prices: list[tuple[str, float]] = []
+    with Path(prices_path).open() as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames:
+            raise ValueError("prices.csv missing header")
+        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
+        for row in r:
+            if row.get("ticker") != ticker:
+                continue
+            date = row.get("date")
+            if not date:
+                continue
+            val = row.get(price_col, "")
+            if not val:
+                continue
+            try:
+                price = float(val)
+            except ValueError:
+                continue
+            prices.append((date, price))
+    if not prices:
+        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
+
+    prices.sort(key=lambda x: x[0])
+    date_list = [d for d, _ in prices]
+    price_list = [p for _, p in prices]
+    returns = [
+        math.log(price_list[i + 1] / price_list[i])
+        for i in range(len(price_list) - 1)
+        if price_list[i] > 0 and price_list[i + 1] > 0
+    ]
+    idx_map = {d: i for i, d in enumerate(date_list)}
+
+    targets: list[float | None] = []
+    for d in dates:
+        idx = idx_map.get(d)
+        if idx is None:
+            targets.append(None)
+            continue
+        if idx + horizon > len(returns):
+            targets.append(None)
+            continue
+        window = returns[idx : idx + horizon]
+        if not window:
+            targets.append(None)
+            continue
+        mean = sum(window) / len(window)
+        var = sum((x - mean) ** 2 for x in window) / len(window)
+        vol = math.sqrt(var)
+        targets.append(vol)
+
+    finite = [t for t in targets if t is not None]
+    if not finite:
+        return targets, 0.0, 1.0
+    mean = sum(finite) / len(finite)
+    var = sum((x - mean) ** 2 for x in finite) / len(finite)
+    std = math.sqrt(var) if var > 0 else 1.0
+
+    if standardize:
+        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
+    return targets, mean, std
+
+
 def _try_batch_size(
     graphs,
     model,
@@ -63,6 +135,7 @@ def _try_batch_size(
     hall_cfg: HallucinationConfig,
     window_len: int | None,
     summary_dim: int,
+    multiscale: bool,
 ):
     loader = DataLoader(
         graphs,
@@ -75,30 +148,70 @@ def _try_batch_size(
     batch = batch.to(device)
     x = batch.x
     edge_weight = getattr(batch, "edge_weight", None)
-    h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
-    if neg_mode == "hallucinate":
-        x_neg = hallucinate_negative(
-            model,
+    if multiscale:
+        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+        if neg_mode == "hallucinate":
+            x_neg_hall = hallucinate_negative(
+                model,
+                x,
+                batch.edge_index,
+                getattr(batch, "edge_attr", None),
+                batch.batch,
+                hall_cfg,
+                edge_weight=edge_weight,
+            )
+        else:
+            x_neg_hall = make_negative(
+                x,
+                batch.batch,
+                mode=neg_mode,
+                noise_std=noise_std,
+                window_len=window_len,
+                summary_dim=summary_dim,
+            )
+        x_neg_time = make_negative(
             x,
-            batch.edge_index,
-            getattr(batch, "edge_attr", None),
             batch.batch,
-            hall_cfg,
-            edge_weight=edge_weight,
-        )
-    else:
-        x_neg = make_negative(
-            x,
-            batch.batch,
-            mode=neg_mode,
+            mode="time_flip",
             noise_std=noise_std,
             window_len=window_len,
             summary_dim=summary_dim,
         )
-    h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
-    loss = ff_loss(g_pos, g_neg, target=goodness_target)
+        layers_neg_h = model(x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True)
+        layers_neg_t = model(x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True)
+        loss = 0.0
+        for h_pos, h_neg_h, h_neg_t in zip(layers_pos, layers_neg_h, layers_neg_t):
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+            g_neg_h = goodness(h_neg_h, batch.batch, temperature=goodness_temp)
+            g_neg_t = goodness(h_neg_t, batch.batch, temperature=goodness_temp)
+            loss = loss + ff_loss(g_pos, g_neg_h, target=goodness_target)
+            loss = loss + ff_loss(g_pos, g_neg_t, target=goodness_target)
+        loss = loss / max(1, len(layers_pos))
+    else:
+        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+        g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+        if neg_mode == "hallucinate":
+            x_neg = hallucinate_negative(
+                model,
+                x,
+                batch.edge_index,
+                getattr(batch, "edge_attr", None),
+                batch.batch,
+                hall_cfg,
+                edge_weight=edge_weight,
+            )
+        else:
+            x_neg = make_negative(
+                x,
+                batch.batch,
+                mode=neg_mode,
+                noise_std=noise_std,
+                window_len=window_len,
+                summary_dim=summary_dim,
+            )
+        h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+        g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+        loss = ff_loss(g_pos, g_neg, target=goodness_target)
     loss.backward()
     model.zero_grad(set_to_none=True)
 
@@ -151,6 +264,7 @@ def main() -> int:
     parser.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--temp-sweep", default=argparse.SUPPRESS)
     parser.add_argument("--ff-layerwise", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-multiscale", action="store_true", default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -197,6 +311,12 @@ def main() -> int:
     ff_layerwise = _get_setting(args, section, "ff_layerwise", False) or getattr(
         args, "ff_layerwise", False
     )
+    ff_multiscale = _get_setting(args, section, "ff_multiscale", False) or getattr(
+        args, "ff_multiscale", False
+    )
+    if ff_multiscale and ff_layerwise:
+        print("ff_multiscale enabled; disabling ff_layerwise.")
+        ff_layerwise = False
 
     hall_steps = _get_setting(args, section, "hallucinate_steps", 10)
     hall_lr = _get_setting(args, section, "hallucinate_lr", 0.1)
@@ -220,6 +340,16 @@ def main() -> int:
     window_len = int(build_cfg.get("window", 20))
     returns_len = window_len if feature_mode in ("window", "window_plus_summary") else 1
     summary_dim = 5 if feature_mode == "window_plus_summary" else 0
+
+    energy_penalty_weight = float(_get_setting(args, section, "energy_penalty_weight", 0.0))
+    energy_penalty_mode = _get_setting(args, section, "energy_penalty_mode", "last")
+
+    risk_head_enabled = bool(_get_setting(args, section, "risk_head_enabled", False))
+    risk_ticker = _get_setting(args, section, "risk_ticker", "MDY")
+    risk_horizon = int(_get_setting(args, section, "risk_horizon", 21))
+    risk_loss_weight = float(_get_setting(args, section, "risk_loss_weight", 0.1))
+    risk_loss_type = _get_setting(args, section, "risk_loss_type", "huber")
+    risk_standardize = bool(_get_setting(args, section, "risk_standardize", True))
 
     def _hall_cfg_for_epoch(epoch: int, corr_override: float | None = None, mean_override: float | None = None, std_override: float | None = None) -> HallucinationConfig:
         if not hall_curr_enabled:
@@ -296,8 +426,12 @@ def main() -> int:
         # Older torch versions don't support weights_only
         payload = torch.load(Path(graphs_path), map_location="cpu")
     graphs = payload["graphs"]
+    dates = payload.get("dates", [])
     if not graphs:
         raise ValueError("No graphs found in the provided file.")
+
+    for i, g in enumerate(graphs):
+        setattr(g, "graph_idx", i)
 
     print(f"device: {device}")
     print(f"mps built: {torch.backends.mps.is_built()}")
@@ -307,7 +441,16 @@ def main() -> int:
     print(
         f"neg_mode: {neg_mode} | batch_size: {batch_size} | loader_workers: {loader_workers}"
     )
-    print(f"ff_layerwise: {ff_layerwise}")
+    print(f"ff_layerwise: {ff_layerwise} | ff_multiscale: {ff_multiscale}")
+    if energy_penalty_weight > 0:
+        print(
+            f"energy_penalty: {energy_penalty_weight} (mode={energy_penalty_mode})"
+        )
+    if risk_head_enabled:
+        print(
+            f"risk_head: ticker={risk_ticker} horizon={risk_horizon} "
+            f"weight={risk_loss_weight} type={risk_loss_type} std={risk_standardize}"
+        )
     if torch_num_threads or torch_num_interop_threads:
         print(
             f"torch threads: {torch.get_num_threads()} | interop: {torch.get_num_interop_threads()}"
@@ -345,6 +488,34 @@ def main() -> int:
         num_layers=num_layers,
         dropout=dropout,
     ).to(device)
+
+    risk_head = None
+    risk_targets = None
+    risk_target_mean = 0.0
+    risk_target_std = 1.0
+    if risk_head_enabled:
+        if ff_layerwise:
+            print("risk_head disabled when ff_layerwise is enabled.")
+            risk_head_enabled = False
+        elif not dates:
+            print("risk_head disabled: graphs payload missing dates.")
+            risk_head_enabled = False
+        else:
+            prices_path = build_cfg.get("prices", "data/processed/prices.csv")
+            try:
+                risk_targets, risk_target_mean, risk_target_std = _compute_risk_targets(
+                    prices_path=prices_path,
+                    ticker=str(risk_ticker),
+                    dates=dates,
+                    horizon=risk_horizon,
+                    standardize=risk_standardize,
+                )
+            except Exception as exc:
+                print(f"risk_head disabled: {exc}")
+                risk_head_enabled = False
+
+    if risk_head_enabled:
+        risk_head = torch.nn.Linear(hidden_dim, 1).to(device)
 
     if temp_sweep:
         temps = [float(t.strip()) for t in str(temp_sweep).split(",") if t.strip()]
@@ -389,6 +560,7 @@ def main() -> int:
                     hall_cfg,
                     returns_len,
                     summary_dim,
+                    ff_multiscale,
                 )
                 best_bs = test_bs
                 test_bs = int(test_bs * auto_tune_factor)
@@ -418,12 +590,13 @@ def main() -> int:
                         loader_workers,
                         neg_mode,
                         noise_std,
-                        goodness_target,
-                        goodness_temp,
-                        hall_cfg,
-                        returns_len,
-                        summary_dim,
-                    )
+                    goodness_target,
+                    goodness_temp,
+                    hall_cfg,
+                    returns_len,
+                    summary_dim,
+                    ff_multiscale,
+                )
                     best_bs = test_bs
                     break
                 except RuntimeError as exc:
@@ -455,13 +628,19 @@ def main() -> int:
         if dataloader_mp_context:
             loader_kwargs["multiprocessing_context"] = dataloader_mp_context
     loader = DataLoader(graphs, **loader_kwargs)
-    optim = Adam(model.parameters(), lr=lr)
+    if risk_head is not None:
+        optim = Adam(list(model.parameters()) + list(risk_head.parameters()), lr=lr)
+    else:
+        optim = Adam(model.parameters(), lr=lr)
 
     if log_csv:
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w") as f:
-            f.write("epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness\n")
+            f.write(
+                "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
+                "energy_penalty,risk_loss\n"
+            )
 
     epoch_iter = tqdm(
         range(1, epochs + 1),
@@ -483,6 +662,9 @@ def main() -> int:
         total_pos = 0.0
         total_neg = 0.0
         batches = 0
+        energy_penalty_sum = 0.0
+        risk_loss_sum = 0.0
+        risk_batches = 0
 
         hall_used = 0
         total_used = 0
@@ -516,7 +698,141 @@ def main() -> int:
             else:
                 use_mode = neg_mode
 
-            if ff_layerwise:
+            if ff_multiscale:
+                layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+
+                hall_active = use_mode == "hallucinate"
+                if use_mode == "hallucinate":
+                    x_neg_hall = hallucinate_negative(
+                        model,
+                        x,
+                        batch.edge_index,
+                        getattr(batch, "edge_attr", None),
+                        batch.batch,
+                        hall_cfg,
+                        edge_weight=edge_weight,
+                    )
+                    hall_used += 1
+                else:
+                    x_neg_hall = make_negative(
+                        x,
+                        batch.batch,
+                        mode=use_mode,
+                        noise_std=noise_std,
+                        window_len=returns_len,
+                        summary_dim=summary_dim,
+                    )
+                total_used += 1
+
+                x_neg_time = make_negative(
+                    x,
+                    batch.batch,
+                    mode="time_flip",
+                    noise_std=noise_std,
+                    window_len=returns_len,
+                    summary_dim=summary_dim,
+                )
+
+                layers_neg_h = model(
+                    x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
+                )
+                layers_neg_t = model(
+                    x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
+                )
+
+                if use_mode == "hallucinate":
+                    g_pos_probe = goodness(
+                        layers_pos[-1], batch.batch, temperature=goodness_temp
+                    ).mean().item()
+                    g_neg_probe = goodness(
+                        layers_neg_h[-1], batch.batch, temperature=goodness_temp
+                    ).mean().item()
+                    if g_neg_probe > g_pos_probe + neg_gate_margin:
+                        x_neg_hall = make_negative(
+                            x,
+                            batch.batch,
+                            mode="shuffle",
+                            noise_std=noise_std,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
+                        )
+                        hall_used -= 1
+                        hall_gated += 1
+                        hall_active = False
+                        layers_neg_h = model(
+                            x_neg_hall,
+                            batch.edge_index,
+                            edge_weight=edge_weight,
+                            return_all=True,
+                        )
+
+                batch_loss = 0.0
+                for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
+                    g_p = goodness(h_p, batch.batch, temperature=goodness_temp)
+                    g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp)
+                    g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp)
+                    batch_loss += ff_loss(g_p, g_n_h, target=goodness_target)
+                    batch_loss += ff_loss(g_p, g_n_t, target=goodness_target)
+                batch_loss = batch_loss / max(1, len(layers_pos))
+
+                energy_penalty_val = 0.0
+                if energy_penalty_weight > 0:
+                    if energy_penalty_mode == "all":
+                        energy_penalty_val = sum(
+                            h.pow(2).mean() for h in layers_pos
+                        ) / max(1, len(layers_pos))
+                    else:
+                        energy_penalty_val = layers_pos[-1].pow(2).mean()
+                    batch_loss = batch_loss + energy_penalty_weight * energy_penalty_val
+
+                risk_loss_val = 0.0
+                if risk_head is not None and risk_targets is not None:
+                    graph_idx = batch.graph_idx
+                    if not torch.is_tensor(graph_idx):
+                        graph_idx = torch.tensor(graph_idx)
+                    idx_list = graph_idx.tolist()
+                    target_vals = [
+                        risk_targets[i] if risk_targets[i] is not None else float("nan")
+                        for i in idx_list
+                    ]
+                    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
+                    mask = torch.isfinite(target)
+                    if mask.any():
+                        embed = global_mean_pool(layers_pos[-1], batch.batch)
+                        pred = risk_head(embed).squeeze(-1)
+                        if risk_loss_type == "mse":
+                            risk_loss_val = F.mse_loss(pred[mask], target[mask])
+                        else:
+                            risk_loss_val = F.smooth_l1_loss(pred[mask], target[mask])
+                        batch_loss = batch_loss + risk_loss_weight * risk_loss_val
+
+                optim.zero_grad()
+                batch_loss.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optim.step()
+
+                g_pos_last = goodness(
+                    layers_pos[-1], batch.batch, temperature=goodness_temp
+                ).mean().item()
+                g_neg_h_last = goodness(
+                    layers_neg_h[-1], batch.batch, temperature=goodness_temp
+                ).mean().item()
+                g_neg_t_last = goodness(
+                    layers_neg_t[-1], batch.batch, temperature=goodness_temp
+                ).mean().item()
+
+                total_loss += batch_loss.item()
+                total_pos += g_pos_last
+                total_neg += (g_neg_h_last + g_neg_t_last) / 2
+                if hall_active:
+                    hall_hardness_sum += (g_neg_h_last - g_pos_last)
+                    hall_hardness_count += 1
+                energy_penalty_sum += float(energy_penalty_val) if energy_penalty_weight > 0 else 0.0
+                if risk_loss_val is not None and risk_loss_val != 0.0:
+                    risk_loss_sum += float(risk_loss_val)
+                    risk_batches += 1
+            elif ff_layerwise:
                 x_in = x
                 layer_losses = 0.0
                 layer_gpos = 0.0
@@ -644,6 +960,31 @@ def main() -> int:
                 g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
 
                 loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                energy_penalty_val = 0.0
+                if energy_penalty_weight > 0:
+                    energy_penalty_val = h_pos.pow(2).mean()
+                    loss = loss + energy_penalty_weight * energy_penalty_val
+
+                risk_loss_val = 0.0
+                if risk_head is not None and risk_targets is not None:
+                    graph_idx = batch.graph_idx
+                    if not torch.is_tensor(graph_idx):
+                        graph_idx = torch.tensor(graph_idx)
+                    idx_list = graph_idx.tolist()
+                    target_vals = [
+                        risk_targets[i] if risk_targets[i] is not None else float("nan")
+                        for i in idx_list
+                    ]
+                    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
+                    mask = torch.isfinite(target)
+                    if mask.any():
+                        embed = global_mean_pool(h_pos, batch.batch)
+                        pred = risk_head(embed).squeeze(-1)
+                        if risk_loss_type == "mse":
+                            risk_loss_val = F.mse_loss(pred[mask], target[mask])
+                        else:
+                            risk_loss_val = F.smooth_l1_loss(pred[mask], target[mask])
+                        loss = loss + risk_loss_weight * risk_loss_val
                 optim.zero_grad()
                 loss.backward()
                 if grad_clip and grad_clip > 0:
@@ -656,11 +997,17 @@ def main() -> int:
                 if hall_active:
                     hall_hardness_sum += (g_neg.mean().item() - g_pos.mean().item())
                     hall_hardness_count += 1
+                energy_penalty_sum += float(energy_penalty_val) if energy_penalty_weight > 0 else 0.0
+                if risk_loss_val is not None and risk_loss_val != 0.0:
+                    risk_loss_sum += float(risk_loss_val)
+                    risk_batches += 1
             batches += 1
 
         hall_ratio = hall_used / total_used if total_used else 0.0
         gate_ratio = hall_gated / total_used if total_used else 0.0
         hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
+        energy_penalty_epoch = energy_penalty_sum / batches if batches else 0.0
+        risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
         # Progress bar only; metrics are saved to CSV/plots.
 
         if log_csv:
@@ -668,7 +1015,8 @@ def main() -> int:
                 f.write(
                     f"{epoch},{total_loss / batches:.6f},"
                     f"{total_pos / batches:.6f},{total_neg / batches:.6f},"
-                    f"{hall_ratio:.4f},{gate_ratio:.4f},{hall_hardness:.6f}\n"
+                    f"{hall_ratio:.4f},{gate_ratio:.4f},{hall_hardness:.6f},"
+                    f"{energy_penalty_epoch:.6f},{risk_loss_epoch:.6f}\n"
                 )
 
     if save_model:
@@ -692,6 +1040,10 @@ def main() -> int:
                 plt.plot(df["epoch"], df["gate_ratio"], label="gate_ratio")
             if "hall_hardness" in df.columns:
                 plt.plot(df["epoch"], df["hall_hardness"], label="hall_hardness")
+            if "energy_penalty" in df.columns:
+                plt.plot(df["epoch"], df["energy_penalty"], label="energy_penalty")
+            if "risk_loss" in df.columns:
+                plt.plot(df["epoch"], df["risk_loss"], label="risk_loss")
             plt.xlabel("Epoch")
             plt.ylabel("Value")
             plt.legend()
