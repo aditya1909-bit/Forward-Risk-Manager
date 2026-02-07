@@ -93,6 +93,12 @@ Set `neg_mode = "hallucinate"` in `configs/default.toml` to enable gradient-asce
 
 Tune the `hallucinate_*` fields in the config to control steps, learning rate, and penalty weights.
 
+Temporal negatives are also supported:
+```
+neg_mode = "time_flip"
+```
+This flips the time window while keeping summary features unchanged (for `window_plus_summary`), teaching the model the arrow of time.
+
 ## Feature Mode
 `feature_mode = "window_plus_summary"` appends summary indicators to the raw return window:
 - Realized volatility
@@ -281,9 +287,24 @@ Generate a scenario book from multiple windows:
 python scripts/scenario_book.py --config configs/default.toml --num-scenarios 10 --out reports/scenario_book.csv
 ```
 
+Constrained “dreaming” (pick a ticker that exists in your graphs; e.g., MDY):
+```bash
+python scripts/scenario_book.py --config configs/default.toml \
+  --num-scenarios 10 \
+  --target-ticker MDY \
+  --target-drop -0.10 \
+  --constraint-weight 10.0
+```
+
 Generate a stress test report (portfolio-level metrics + plot):
 ```bash
 python scripts/stress_test_report.py --csv reports/scenario_book.csv --out-csv reports/stress_test_report.csv --out-plot reports/stress_test_report.png
+```
+
+## Goodness Backtest
+Check whether low goodness predicts higher forward volatility/drawdown:
+```bash
+python scripts/goodness_backtest.py --config configs/default.toml --ticker MDY --horizons 5,21
 ```
 
 Generate a sweep summary report (top-K + Pareto):

@@ -79,6 +79,8 @@ def _make_negatives(
     use_mode,
     noise_std,
     hall_cfg: HallucinationConfig,
+    window_len: int | None = None,
+    summary_dim: int = 0,
 ):
     if use_mode == "hallucinate":
         return hallucinate_negative(
@@ -90,7 +92,14 @@ def _make_negatives(
             hall_cfg,
             edge_weight=edge_weight,
         )
-    return make_negative(x, batch, mode=use_mode, noise_std=noise_std)
+    return make_negative(
+        x,
+        batch,
+        mode=use_mode,
+        noise_std=noise_std,
+        window_len=window_len,
+        summary_dim=summary_dim,
+    )
 
 
 def _sync(device: torch.device) -> None:
@@ -100,7 +109,17 @@ def _sync(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
-def _eval_ff_metrics(model, loader, goodness_temp, goodness_target, neg_mode, noise_std, hall_cfg):
+def _eval_ff_metrics(
+    model,
+    loader,
+    goodness_temp,
+    goodness_target,
+    neg_mode,
+    noise_std,
+    hall_cfg,
+    window_len: int | None = None,
+    summary_dim: int = 0,
+):
     model.eval()
     gpos = []
     gneg = []
@@ -123,6 +142,8 @@ def _eval_ff_metrics(model, loader, goodness_temp, goodness_target, neg_mode, no
                 neg_mode,
                 noise_std,
                 hall_cfg,
+                window_len=window_len,
+                summary_dim=summary_dim,
             )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
@@ -221,6 +242,8 @@ def _benchmark_ff(
                         "hallucinate" if (use_mode == "hallucinate" and li == 0) else "shuffle",
                         config["noise_std"],
                         hall_cfg,
+                        window_len=config.get("window_len"),
+                        summary_dim=config.get("summary_dim", 0),
                     )
                     h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                     g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
@@ -245,6 +268,8 @@ def _benchmark_ff(
                     use_mode,
                     config["noise_std"],
                     hall_cfg,
+                    window_len=config.get("window_len"),
+                    summary_dim=config.get("summary_dim", 0),
                 )
                 h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                 g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
@@ -270,6 +295,8 @@ def _benchmark_ff(
         config["eval_neg_mode"],
         config["noise_std"],
         hall_cfg,
+        window_len=config.get("window_len"),
+        summary_dim=config.get("summary_dim", 0),
     )
     warm = int(config.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
@@ -363,6 +390,8 @@ def _benchmark_backprop(graphs, device, config):
                 use_mode,
                 config["noise_std"],
                 hall_cfg,
+                window_len=config.get("window_len"),
+                summary_dim=config.get("summary_dim", 0),
             )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             z_neg = global_mean_pool(h_neg, batch.batch)
@@ -410,6 +439,8 @@ def _benchmark_backprop(graphs, device, config):
                 config["eval_neg_mode"],
                 config["noise_std"],
                 hall_cfg,
+                window_len=config.get("window_len"),
+                summary_dim=config.get("summary_dim", 0),
             )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             z_neg = global_mean_pool(h_neg, batch.batch)
@@ -455,6 +486,7 @@ def main() -> int:
     cfg = _load_config(args.config)
     train_cfg = cfg.get("train", {})
     bench_cfg = cfg.get("benchmark", {})
+    build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
     payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
@@ -466,6 +498,11 @@ def main() -> int:
         torch.set_num_threads(int(train_cfg["torch_num_threads"]))
     if train_cfg.get("torch_num_interop_threads"):
         torch.set_num_interop_threads(int(train_cfg["torch_num_interop_threads"]))
+
+    feature_mode = build_cfg.get("feature_mode", "window")
+    window_len = int(build_cfg.get("window", 20))
+    returns_len = window_len if feature_mode in ("window", "window_plus_summary") else 1
+    summary_dim = 5 if feature_mode == "window_plus_summary" else 0
 
     config = {
         "epochs": int(bench_cfg.get("epochs", 5)),
@@ -501,6 +538,8 @@ def main() -> int:
         "hall_node_fraction": float(train_cfg.get("hallucinate_node_fraction", 0.5)),
         "hall_node_min": int(train_cfg.get("hallucinate_node_min", 20)),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
+        "window_len": int(returns_len),
+        "summary_dim": int(summary_dim),
     }
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]

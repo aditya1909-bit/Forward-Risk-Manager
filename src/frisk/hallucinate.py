@@ -57,6 +57,8 @@ def hallucinate_negative(
     config: HallucinationConfig,
     edge_weight: Optional[torch.Tensor] = None,
     forward_fn=None,
+    constraint_fn=None,
+    force_indices: Optional[list[int]] = None,
 ) -> torch.Tensor:
     # Freeze model params during hallucination steps
     req_grad = [p.requires_grad for p in model.parameters()]
@@ -87,6 +89,8 @@ def hallucinate_negative(
                 mask[idx[perm]] = True
         else:
             mask = torch.ones(x0.size(0), device=x0.device, dtype=torch.bool)
+        if force_indices:
+            mask[torch.tensor(force_indices, device=x0.device, dtype=torch.long)] = True
         mask = mask[:, None]
 
         for _ in range(config.steps):
@@ -108,6 +112,8 @@ def hallucinate_negative(
                 + config.std_weight * std_pen
                 + config.corr_weight * corr_pen
             )
+            if constraint_fn is not None:
+                loss = loss + constraint_fn(x_var)
 
             opt.zero_grad()
             loss.backward()

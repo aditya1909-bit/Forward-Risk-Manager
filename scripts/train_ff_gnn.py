@@ -9,8 +9,10 @@ import tomllib
 import os
 
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_mean_pool
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +61,8 @@ def _try_batch_size(
     goodness_target,
     goodness_temp,
     hall_cfg: HallucinationConfig,
+    window_len: int | None,
+    summary_dim: int,
 ):
     loader = DataLoader(
         graphs,
@@ -84,7 +88,14 @@ def _try_batch_size(
             edge_weight=edge_weight,
         )
     else:
-        x_neg = make_negative(x, batch.batch, mode=neg_mode, noise_std=noise_std)
+        x_neg = make_negative(
+            x,
+            batch.batch,
+            mode=neg_mode,
+            noise_std=noise_std,
+            window_len=window_len,
+            summary_dim=summary_dim,
+        )
     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
     g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
     loss = ff_loss(g_pos, g_neg, target=goodness_target)
@@ -111,7 +122,17 @@ def main() -> int:
     parser.add_argument("--goodness-target", type=float, default=argparse.SUPPRESS)
     parser.add_argument(
         "--neg-mode",
-        choices=["shuffle", "noise", "shuffle+noise", "hallucinate", "schedule", "mix"],
+        choices=[
+            "shuffle",
+            "noise",
+            "shuffle+noise",
+            "time_flip",
+            "shuffle+time_flip",
+            "time_flip+noise",
+            "hallucinate",
+            "schedule",
+            "mix",
+        ],
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--noise-std", type=float, default=argparse.SUPPRESS)
@@ -134,6 +155,7 @@ def main() -> int:
 
     cfg = _load_config(args.config)
     section = cfg.get("train", {})
+    build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = _get_setting(args, section, "graphs", None)
     if not graphs_path:
@@ -194,6 +216,10 @@ def main() -> int:
     layerwise_hall_corr = _get_setting(args, section, "layerwise_hall_corr", 0.0)
     layerwise_hall_mean = _get_setting(args, section, "layerwise_hall_mean", hall_mean)
     layerwise_hall_std = _get_setting(args, section, "layerwise_hall_std", hall_std)
+    feature_mode = build_cfg.get("feature_mode", "window")
+    window_len = int(build_cfg.get("window", 20))
+    returns_len = window_len if feature_mode in ("window", "window_plus_summary") else 1
+    summary_dim = 5 if feature_mode == "window_plus_summary" else 0
 
     def _hall_cfg_for_epoch(epoch: int, corr_override: float | None = None, mean_override: float | None = None, std_override: float | None = None) -> HallucinationConfig:
         if not hall_curr_enabled:
@@ -361,6 +387,8 @@ def main() -> int:
                     goodness_target,
                     goodness_temp,
                     hall_cfg,
+                    returns_len,
+                    summary_dim,
                 )
                 best_bs = test_bs
                 test_bs = int(test_bs * auto_tune_factor)
@@ -393,6 +421,8 @@ def main() -> int:
                         goodness_target,
                         goodness_temp,
                         hall_cfg,
+                        returns_len,
+                        summary_dim,
                     )
                     best_bs = test_bs
                     break
@@ -520,6 +550,8 @@ def main() -> int:
                             batch.batch,
                             mode=layerwise_neg_mode,
                             noise_std=layerwise_noise_std,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
                         )
                     total_used += 1
 
@@ -530,7 +562,14 @@ def main() -> int:
                         ).mean().item()
                         g_pos_probe = g_pos.mean().item()
                         if g_neg_probe > g_pos_probe + neg_gate_margin:
-                            x_neg = make_negative(x_in, batch.batch, mode="shuffle", noise_std=noise_std)
+                            x_neg = make_negative(
+                                x_in,
+                                batch.batch,
+                                mode="shuffle",
+                                noise_std=noise_std,
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
                             hall_used -= 1
                             hall_gated += 1
                             hall_active = False
@@ -573,7 +612,14 @@ def main() -> int:
                     )
                     hall_used += 1
                 else:
-                    x_neg = make_negative(x, batch.batch, mode=use_mode, noise_std=noise_std)
+                    x_neg = make_negative(
+                        x,
+                        batch.batch,
+                        mode=use_mode,
+                        noise_std=noise_std,
+                        window_len=returns_len,
+                        summary_dim=summary_dim,
+                    )
                 total_used += 1
 
                 if use_mode == "hallucinate":
@@ -583,7 +629,14 @@ def main() -> int:
                     ).mean().item()
                     g_pos_probe = g_pos.mean().item()
                     if g_neg_probe > g_pos_probe + neg_gate_margin:
-                        x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=noise_std)
+                        x_neg = make_negative(
+                            x,
+                            batch.batch,
+                            mode="shuffle",
+                            noise_std=noise_std,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
+                        )
                         hall_used -= 1
                         hall_gated += 1
                         hall_active = False

@@ -87,6 +87,8 @@ def _make_negatives(
     noise_std,
     hall_cfg: HallucinationConfig,
     forward_fn=None,
+    window_len: int | None = None,
+    summary_dim: int = 0,
 ):
     if use_mode == "hallucinate":
         return hallucinate_negative(
@@ -99,10 +101,27 @@ def _make_negatives(
             edge_weight=edge_weight,
             forward_fn=forward_fn,
         )
-    return make_negative(x, batch, mode=use_mode, noise_std=noise_std)
+    return make_negative(
+        x,
+        batch,
+        mode=use_mode,
+        noise_std=noise_std,
+        window_len=window_len,
+        summary_dim=summary_dim,
+    )
 
 
-def _eval_ff_metrics(model, loader, goodness_temp, goodness_target, neg_mode, noise_std, hall_cfg):
+def _eval_ff_metrics(
+    model,
+    loader,
+    goodness_temp,
+    goodness_target,
+    neg_mode,
+    noise_std,
+    hall_cfg,
+    window_len: int | None = None,
+    summary_dim: int = 0,
+):
     model.eval()
     gpos = []
     gneg = []
@@ -125,6 +144,8 @@ def _eval_ff_metrics(model, loader, goodness_temp, goodness_target, neg_mode, no
                 neg_mode,
                 noise_std,
                 hall_cfg,
+                window_len=window_len,
+                summary_dim=summary_dim,
             )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
@@ -221,30 +242,34 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                         forward_fn = lambda x_var, li=li: model.forward_layer(
                             x_var, batch.edge_index, edge_weight, li
                         )
-                        x_neg = _make_negatives(
-                            model,
-                            x_in,
-                            batch.batch,
-                            batch.edge_index,
-                            getattr(batch, "edge_attr", None),
-                            edge_weight,
-                            layer_mode,
-                            cfg["noise_std"],
-                            hall_cfg_layer,
-                            forward_fn=forward_fn,
-                        )
+                    x_neg = _make_negatives(
+                        model,
+                        x_in,
+                        batch.batch,
+                        batch.edge_index,
+                        getattr(batch, "edge_attr", None),
+                        edge_weight,
+                        layer_mode,
+                        cfg["noise_std"],
+                        hall_cfg_layer,
+                        forward_fn=forward_fn,
+                        window_len=cfg.get("window_len"),
+                        summary_dim=cfg.get("summary_dim", 0),
+                    )
                     else:
-                        x_neg = _make_negatives(
-                            model,
-                            x_in,
-                            batch.batch,
-                            batch.edge_index,
-                            getattr(batch, "edge_attr", None),
-                            edge_weight,
-                            cfg["layerwise_neg_mode"],
-                            cfg["layerwise_noise_std"],
-                            hall_cfg,
-                        )
+                    x_neg = _make_negatives(
+                        model,
+                        x_in,
+                        batch.batch,
+                        batch.edge_index,
+                        getattr(batch, "edge_attr", None),
+                        edge_weight,
+                        cfg["layerwise_neg_mode"],
+                        cfg["layerwise_noise_std"],
+                        hall_cfg,
+                        window_len=cfg.get("window_len"),
+                        summary_dim=cfg.get("summary_dim", 0),
+                    )
 
                     if layer_mode == "hallucinate":
                         h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
@@ -279,6 +304,8 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                     use_mode,
                     cfg["noise_std"],
                     hall_cfg,
+                    window_len=cfg.get("window_len"),
+                    summary_dim=cfg.get("summary_dim", 0),
                 )
 
                 if use_mode == "hallucinate":
@@ -314,6 +341,8 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         cfg["eval_neg_mode"],
         cfg["noise_std"],
         hall_cfg,
+        window_len=cfg.get("window_len"),
+        summary_dim=cfg.get("summary_dim", 0),
     )
     warm = int(cfg.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
@@ -367,6 +396,7 @@ def main() -> int:
     cfg = _load_config(args.config)
     train_cfg = cfg.get("train", {})
     sweep_cfg = cfg.get(args.section, {})
+    build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
     device_str = str(train_cfg.get("device", "cpu"))
@@ -374,6 +404,11 @@ def main() -> int:
     neg_mode_val = sweep_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))
     if isinstance(neg_mode_val, list):
         neg_mode_val = neg_mode_val[0] if neg_mode_val else "shuffle"
+
+    feature_mode = build_cfg.get("feature_mode", "window")
+    window_len = int(build_cfg.get("window", 20))
+    returns_len = window_len if feature_mode in ("window", "window_plus_summary") else 1
+    summary_dim = 5 if feature_mode == "window_plus_summary" else 0
 
     base = {
         "epochs": int(sweep_cfg.get("epochs", 3)),
@@ -415,6 +450,8 @@ def main() -> int:
         "layerwise_hall_corr": float(train_cfg.get("layerwise_hall_corr", 0.0)),
         "layerwise_hall_mean": float(train_cfg.get("layerwise_hall_mean", train_cfg.get("hallucinate_mean", 0.01))),
         "layerwise_hall_std": float(train_cfg.get("layerwise_hall_std", train_cfg.get("hallucinate_std", 0.01))),
+        "window_len": int(returns_len),
+        "summary_dim": int(summary_dim),
     }
 
     modes = sweep_cfg.get("modes", ["ff_layerwise", "ff_e2e"])
