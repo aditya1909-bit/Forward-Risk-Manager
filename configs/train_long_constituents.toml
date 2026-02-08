@@ -7,11 +7,11 @@ feature_mode = "window_plus_summary_fund"
 
 [train]
 graphs = "data/processed_long/graphs_constituents.pt"
-epochs = 200
-batch_size = 32
+epochs = 100
+batch_size = 128
 lr = 0.001
 hidden_dim = 128
-num_layers = 3
+num_layers = 2
 dropout = 0.1
 goodness_target = 2.0
 goodness_temp = 0.25
@@ -32,7 +32,7 @@ log_csv = "reports/ff_train_long_constituents.csv"
 plot_path = "reports/ff_train_long_constituents.png"
 save_model = "runs/ff_model_long_constituents.pt"
 auto_tune_batch = true
-auto_tune_max_batch = 32
+auto_tune_max_batch = 128
 auto_tune_factor = 2
 auto_tune_min_batch = 1
 neg_warmup_epochs = 10

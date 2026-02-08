@@ -836,9 +836,10 @@ def main() -> int:
                 if hall_active:
                     hall_hardness_sum += (g_neg_h_last - g_pos_last)
                     hall_hardness_count += 1
-                energy_penalty_sum += float(energy_penalty_val) if energy_penalty_weight > 0 else 0.0
+                if energy_penalty_weight > 0:
+                    energy_penalty_sum += float(energy_penalty_val.detach())
                 if risk_loss_val is not None and risk_loss_val != 0.0:
-                    risk_loss_sum += float(risk_loss_val)
+                    risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
             elif ff_layerwise:
                 x_in = x
