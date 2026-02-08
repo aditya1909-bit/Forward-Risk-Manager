@@ -1,6 +1,8 @@
 # Data
 /data/raw/
 /data/processed/
+/data/raw_merged/
+/data/processed_long/
 
 # Python
 __pycache__/

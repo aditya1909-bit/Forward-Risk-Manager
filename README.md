@@ -331,6 +331,34 @@ Generate a sweep summary report (top-K + Pareto):
 python scripts/ff_sweep_summary.py --csv reports/ff_sweep.csv --out reports/ff_sweep_summary.txt
 ```
 
+## Long-History Data (2000–2024)
+If your raw exports are split into year buckets under `data/raw/`, merge + clean them:
+
+```bash
+python scripts/merge_raw_years.py --raw-root data/raw --out-dir data/raw_merged
+```
+
+These exports are already tidy (date/ticker columns), so you can use `data/raw_merged` directly.
+
+Build graphs in two modes:
+
+```bash
+# Constituents only (2011+)
+python scripts/build_graphs.py --config configs/long_constituents.toml
+
+# All tickers (full history)
+python scripts/build_graphs.py --config configs/long_alltickers.toml
+```
+
+The constituents config enables forward-fill (`membership_fill = "ffill"`) with a max gap of 63 days to reduce missing windows. You can disable by removing those settings.
+
+Train against each graph set:
+
+```bash
+python scripts/train_ff_gnn.py --config configs/train_long_constituents.toml
+python scripts/train_ff_gnn.py --config configs/train_long_alltickers.toml
+```
+
 ## Sweep Parallelism Auto-Tuner
 Find the fastest sweep parallelism settings on your Mac:
 

@@ -44,7 +44,10 @@ def make_negative(
         flipped = torch.flip(w, dims=[1])
         if summary_dim > 0:
             s = tensor[:, window_len : window_len + summary_dim]
-            return torch.cat([flipped, s], dim=1)
+            rest = tensor[:, window_len + summary_dim :]
+            if rest.numel() == 0:
+                return torch.cat([flipped, s], dim=1)
+            return torch.cat([flipped, s, rest], dim=1)
         return torch.cat([flipped, tensor[:, window_len:]], dim=1)
 
     for gid in graph_ids:

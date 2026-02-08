@@ -1,0 +1,25 @@
+[build_graphs]
+prices = "data/raw_merged/prices.csv"
+constituents = "data/raw_merged/constituents.csv"
+fundamentals = "data/raw_merged/fundamentals.csv"
+out = "data/processed_long/graphs_alltickers.pt"
+membership_mode = "all"
+start_date = "2000-01-03"
+window = 20
+step = 1
+top_k = 5
+corr_threshold = ""
+min_nodes = 50
+feature_mode = "window_plus_summary_fund"
+rsi_period = 14
+mdy_ticker = "MDY"
+normalize = true
+symmetric = true
+edge_norm = true
+edge_weight_mode = "abs"
+include_tickers = ["MDY"]
+workers = 7
+parallel_backend = "threadpool"
+joblib_prefer = "threads"
+joblib_n_jobs = 0
+progress = true

@@ -2,6 +2,7 @@
 prices = "data/processed/prices.csv"
 constituents = "data/processed/constituents.csv"
 out = "data/processed/graphs.pt"
+membership_mode = "constituents"
 window = 20
 step = 1
 top_k = 5

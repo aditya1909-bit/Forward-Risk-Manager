@@ -391,7 +391,7 @@ def main() -> int:
 
     window = int(build_cfg.get("window", 20))
     feature_mode = build_cfg.get("feature_mode", "window")
-    returns_len = window if feature_mode in ("window", "window_plus_summary") else 1
+    returns_len = window if feature_mode in ("window", "window_plus_summary", "window_plus_summary_fund") else 1
 
     model = GCNEncoder(
         in_dim=graphs[0].x.shape[1],

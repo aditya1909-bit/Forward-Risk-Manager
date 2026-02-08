@@ -10,7 +10,15 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.data import load_prices, compute_log_returns_and_volume, load_constituents, build_membership_map
+from frisk.data import (
+    load_prices,
+    compute_log_returns_and_volume,
+    load_constituents,
+    build_membership_map,
+    build_membership_map_ffill,
+    build_membership_map_all,
+    load_fundamentals,
+)
 from frisk.graph_builder import GraphBuildConfig, build_rolling_corr_graphs
 
 
@@ -39,6 +47,9 @@ def main() -> int:
     parser.add_argument(
         "--constituents", help="Path to data/processed/constituents.csv", default=argparse.SUPPRESS
     )
+    parser.add_argument(
+        "--fundamentals", help="Optional fundamentals CSV", default=argparse.SUPPRESS
+    )
     parser.add_argument("--out", help="Output .pt file", default=argparse.SUPPRESS)
     parser.add_argument("--window", type=int, help="Rolling window size in days", default=argparse.SUPPRESS)
     parser.add_argument("--step", type=int, help="Step size between windows", default=argparse.SUPPRESS)
@@ -48,8 +59,26 @@ def main() -> int:
     )
     parser.add_argument("--min-nodes", type=int, help="Minimum nodes per graph", default=argparse.SUPPRESS)
     parser.add_argument(
+        "--membership-mode",
+        choices=["constituents", "all"],
+        default=argparse.SUPPRESS,
+        help="Use constituents membership or include all tickers per date",
+    )
+    parser.add_argument(
+        "--membership-fill",
+        choices=["none", "ffill"],
+        default=argparse.SUPPRESS,
+        help="Fill missing membership dates (ffill) when using constituents",
+    )
+    parser.add_argument(
+        "--membership-max-gap-days",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Max gap in days allowed for membership forward-fill",
+    )
+    parser.add_argument(
         "--feature-mode",
-        choices=["window", "last", "window_plus_summary"],
+        choices=["window", "last", "window_plus_summary", "window_plus_summary_fund"],
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--rsi-period", type=int, default=argparse.SUPPRESS)
@@ -64,6 +93,16 @@ def main() -> int:
         "--include-tickers",
         help="Comma-separated tickers to force-include in every graph (e.g., MDY)",
         default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--start-date",
+        default=argparse.SUPPRESS,
+        help="Filter start date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=argparse.SUPPRESS,
+        help="Filter end date (YYYY-MM-DD)",
     )
     parser.add_argument(
         "--workers",
@@ -101,10 +140,11 @@ def main() -> int:
 
     prices_path = _get_setting(args, section, "prices", None)
     constituents_path = _get_setting(args, section, "constituents", None)
+    fundamentals_path = _get_setting(args, section, "fundamentals", None)
     out_path = _get_setting(args, section, "out", "data/processed/graphs.pt")
 
-    if not prices_path or not constituents_path:
-        raise ValueError("Provide --prices and --constituents (or set them in config).")
+    if not prices_path:
+        raise ValueError("Provide --prices (or set it in config).")
 
     window = _get_setting(args, section, "window", 20)
     step = _get_setting(args, section, "step", 1)
@@ -118,6 +158,11 @@ def main() -> int:
     edge_weight_mode = _get_setting(args, section, "edge_weight_mode", "abs")
     normalize = _get_setting(args, section, "normalize", True)
     symmetric = _get_setting(args, section, "symmetric", True)
+    membership_mode = _get_setting(args, section, "membership_mode", "constituents")
+    membership_fill = _get_setting(args, section, "membership_fill", "none")
+    membership_max_gap_days = _get_setting(args, section, "membership_max_gap_days", None)
+    start_date = _get_setting(args, section, "start_date", "")
+    end_date = _get_setting(args, section, "end_date", "")
     include_tickers = _get_setting(args, section, "include_tickers", [])
     workers = _get_setting(args, section, "workers", 1)
     parallel_backend = _get_setting(args, section, "parallel_backend", "threadpool")
@@ -147,8 +192,49 @@ def main() -> int:
 
     prices = load_prices(Path(prices_path))
     returns, volume = compute_log_returns_and_volume(prices)
-    constituents = load_constituents(Path(constituents_path))
-    membership_map = build_membership_map(constituents, extra_tickers=include_tickers)
+    if start_date:
+        returns = returns[returns.index >= start_date]
+        if volume is not None:
+            volume = volume[volume.index >= start_date]
+    if end_date:
+        returns = returns[returns.index <= end_date]
+        if volume is not None:
+            volume = volume[volume.index <= end_date]
+
+    if membership_mode == "all":
+        membership_map = build_membership_map_all(returns, extra_tickers=include_tickers)
+    else:
+        if not constituents_path:
+            raise ValueError("Provide --constituents (or set it in config).")
+        constituents = load_constituents(Path(constituents_path))
+        if start_date:
+            constituents = constituents[constituents["date"] >= start_date]
+        if end_date:
+            constituents = constituents[constituents["date"] <= end_date]
+        if membership_fill == "ffill":
+            membership_map, fill_stats = build_membership_map_ffill(
+                constituents,
+                list(returns.index),
+                extra_tickers=include_tickers,
+                max_gap_days=membership_max_gap_days,
+            )
+            print(
+                "Membership ffill:",
+                f"source_dates={fill_stats['source_dates']}",
+                f"filled_dates={fill_stats['filled_dates']}",
+                f"gap_dropped={fill_stats['gap_dropped']}",
+                f"max_gap_days={membership_max_gap_days}",
+            )
+        else:
+            membership_map = build_membership_map(constituents, extra_tickers=include_tickers)
+
+    fundamentals = None
+    if fundamentals_path:
+        fundamentals = load_fundamentals(Path(fundamentals_path))
+        if start_date:
+            fundamentals = fundamentals[fundamentals["date"] >= start_date]
+        if end_date:
+            fundamentals = fundamentals[fundamentals["date"] <= end_date]
 
     cfg = GraphBuildConfig(
         window=window,
@@ -170,6 +256,7 @@ def main() -> int:
         volume,
         membership_map,
         cfg,
+        fundamentals=fundamentals,
         num_workers=workers,
         parallel_backend=parallel_backend,
         joblib_prefer=joblib_prefer,

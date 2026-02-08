@@ -242,34 +242,34 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                         forward_fn = lambda x_var, li=li: model.forward_layer(
                             x_var, batch.edge_index, edge_weight, li
                         )
-                    x_neg = _make_negatives(
-                        model,
-                        x_in,
-                        batch.batch,
-                        batch.edge_index,
-                        getattr(batch, "edge_attr", None),
-                        edge_weight,
-                        layer_mode,
-                        cfg["noise_std"],
-                        hall_cfg_layer,
-                        forward_fn=forward_fn,
-                        window_len=cfg.get("window_len"),
-                        summary_dim=cfg.get("summary_dim", 0),
-                    )
+                        x_neg = _make_negatives(
+                            model,
+                            x_in,
+                            batch.batch,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            edge_weight,
+                            layer_mode,
+                            cfg["noise_std"],
+                            hall_cfg_layer,
+                            forward_fn=forward_fn,
+                            window_len=cfg.get("window_len"),
+                            summary_dim=cfg.get("summary_dim", 0),
+                        )
                     else:
-                    x_neg = _make_negatives(
-                        model,
-                        x_in,
-                        batch.batch,
-                        batch.edge_index,
-                        getattr(batch, "edge_attr", None),
-                        edge_weight,
-                        cfg["layerwise_neg_mode"],
-                        cfg["layerwise_noise_std"],
-                        hall_cfg,
-                        window_len=cfg.get("window_len"),
-                        summary_dim=cfg.get("summary_dim", 0),
-                    )
+                        x_neg = _make_negatives(
+                            model,
+                            x_in,
+                            batch.batch,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            edge_weight,
+                            cfg["layerwise_neg_mode"],
+                            cfg["layerwise_noise_std"],
+                            hall_cfg,
+                            window_len=cfg.get("window_len"),
+                            summary_dim=cfg.get("summary_dim", 0),
+                        )
 
                     if layer_mode == "hallucinate":
                         h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
@@ -407,8 +407,13 @@ def main() -> int:
 
     feature_mode = build_cfg.get("feature_mode", "window")
     window_len = int(build_cfg.get("window", 20))
-    returns_len = window_len if feature_mode in ("window", "window_plus_summary") else 1
-    summary_dim = 5 if feature_mode == "window_plus_summary" else 0
+    returns_len = window_len if feature_mode in ("window", "window_plus_summary", "window_plus_summary_fund") else 1
+    if feature_mode == "window_plus_summary":
+        summary_dim = 5
+    elif feature_mode == "window_plus_summary_fund":
+        summary_dim = 10
+    else:
+        summary_dim = 0
 
     base = {
         "epochs": int(sweep_cfg.get("epochs", 3)),

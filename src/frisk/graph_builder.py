@@ -10,6 +10,8 @@ from tqdm import tqdm
 from torch_geometric.data import Data
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 
+FUND_COLS = ["sector_code", "market_cap", "pe_ratio", "debt_equity", "pb_ratio"]
+
 
 @dataclass
 class GraphBuildConfig:
@@ -18,7 +20,7 @@ class GraphBuildConfig:
     top_k: int | None = 10
     corr_threshold: float | None = None
     min_nodes: int = 50
-    feature_mode: str = "window"  # "window", "last", "window_plus_summary"
+    feature_mode: str = "window"  # "window", "last", "window_plus_summary", "window_plus_summary_fund"
     normalize: bool = True
     symmetric: bool = True
     rsi_period: int = 14
@@ -150,6 +152,32 @@ def _safe_corr_matrix(window_df: pd.DataFrame) -> np.ndarray:
     return corr
 
 
+def _prepare_fundamentals_panel(
+    fundamentals: pd.DataFrame | None,
+    dates: List[str],
+) -> tuple[pd.DataFrame | None, List[str]]:
+    if fundamentals is None or fundamentals.empty:
+        return None, []
+    cols = [c for c in FUND_COLS if c in fundamentals.columns]
+    if not cols:
+        return None, []
+    df = fundamentals[["date", "ticker"] + cols].dropna(subset=["date", "ticker"]).copy()
+    df = df.sort_values(["ticker", "date"])
+    frames = []
+    for ticker, g in df.groupby("ticker"):
+        g = g.drop_duplicates("date").set_index("date").sort_index()
+        g = g.reindex(dates, method="ffill")
+        g["ticker"] = ticker
+        frames.append(g.reset_index())
+    if not frames:
+        return None, cols
+    panel = pd.concat(frames, ignore_index=True)
+    panel = panel.set_index(["date", "ticker"]).sort_index()
+    # Ensure unique index (date, ticker)
+    panel = panel[~panel.index.duplicated(keep="last")]
+    return panel, cols
+
+
 def _build_node_features(
     window_df: pd.DataFrame,
     volume_df: pd.DataFrame | None,
@@ -157,12 +185,13 @@ def _build_node_features(
     normalize: bool,
     mdy_ticker: str,
     rsi_period: int,
+    fund_features: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     if feature_mode == "window":
         values = window_df.to_numpy().T
     elif feature_mode == "last":
         values = window_df.iloc[-1].to_numpy()[:, None]
-    elif feature_mode == "window_plus_summary":
+    elif feature_mode in ("window_plus_summary", "window_plus_summary_fund"):
         values = window_df.to_numpy().T
     else:
         raise ValueError(f"Unknown feature_mode: {feature_mode}")
@@ -174,13 +203,27 @@ def _build_node_features(
         ret_std = np.nanstd(values, axis=1, keepdims=True) + 1e-8
         values = (values - ret_mean) / ret_std
 
-    if feature_mode == "window_plus_summary":
+    if feature_mode in ("window_plus_summary", "window_plus_summary_fund"):
         summary = _compute_summary_features(window_df, volume_df, mdy_ticker, rsi_period)
         if normalize:
             s_mean = np.nanmean(summary, axis=0, keepdims=True)
             s_std = np.nanstd(summary, axis=0, keepdims=True) + 1e-8
             summary = (summary - s_mean) / s_std
         values = np.concatenate([values, summary], axis=1)
+
+    if feature_mode == "window_plus_summary_fund" and fund_features is not None:
+        fund = fund_features.copy()
+        # Fill missing fundamentals with per-column median (or zero if all missing)
+        med = np.nanmedian(fund, axis=0)
+        med = np.where(np.isnan(med), 0.0, med)
+        inds = np.where(np.isnan(fund))
+        if inds[0].size:
+            fund[inds] = np.take(med, inds[1])
+        if normalize:
+            f_mean = np.nanmean(fund, axis=0, keepdims=True)
+            f_std = np.nanstd(fund, axis=0, keepdims=True) + 1e-8
+            fund = (fund - f_mean) / f_std
+        values = np.concatenate([values, fund], axis=1)
 
     return values, ret_mean, ret_std
 
@@ -192,6 +235,8 @@ def _window_to_graph_data(
     volume: pd.DataFrame | None,
     membership_map: Dict[str, List[str]],
     config: GraphBuildConfig,
+    fund_panel: pd.DataFrame | None,
+    fund_cols: List[str],
 ):
     end_date = dates[end_idx]
     members = membership_map.get(end_date)
@@ -208,6 +253,8 @@ def _window_to_graph_data(
     window_df = window_df[cols].dropna(axis=1, how="any")
     if window_volume is not None:
         window_volume = window_volume[window_df.columns]
+    # Use the post-dropna columns for all downstream alignment
+    cols = list(window_df.columns)
     if window_df.shape[1] < config.min_nodes:
         return None, "min_nodes"
 
@@ -216,6 +263,26 @@ def _window_to_graph_data(
     if len(src) == 0:
         return None, "no_edges"
 
+    fund_features = None
+    if config.feature_mode == "window_plus_summary_fund" and fund_panel is not None:
+        try:
+            fund_slice = fund_panel.loc[end_date]
+        except KeyError:
+            fund_slice = None
+        if fund_slice is not None and fund_cols:
+            if isinstance(fund_slice, pd.Series):
+                fund_slice = fund_slice.to_frame().T
+            if fund_slice.index.has_duplicates:
+                fund_slice = fund_slice.groupby(level=0).last()
+            fund_slice = fund_slice.reindex(cols, axis=0)
+            try:
+                fund_features = fund_slice[fund_cols].to_numpy()
+            except KeyError:
+                fund_features = None
+            if fund_features is not None and fund_features.shape[0] != len(cols):
+                # Fallback: skip fundamentals for this window if misaligned
+                fund_features = None
+
     x, ret_mean, ret_std = _build_node_features(
         window_df,
         window_volume,
@@ -223,6 +290,7 @@ def _window_to_graph_data(
         config.normalize,
         config.mdy_ticker,
         config.rsi_period,
+        fund_features,
     )
     return (end_date, list(window_df.columns), src, dst, w, x, ret_mean, ret_std), "ok"
 
@@ -232,6 +300,7 @@ def build_rolling_corr_graphs(
     volume: pd.DataFrame | None,
     membership_map: Dict[str, List[str]],
     config: GraphBuildConfig,
+    fundamentals: pd.DataFrame | None = None,
     num_workers: int = 1,
     parallel_backend: str | None = "threadpool",
     joblib_prefer: str = "threads",
@@ -239,6 +308,7 @@ def build_rolling_corr_graphs(
     progress: bool = True,
 ) -> Tuple[List[Data], List[str], List[List[str]], Dict[str, int]]:
     dates = list(returns.index)
+    fund_panel, fund_cols = _prepare_fundamentals_panel(fundamentals, dates)
     graphs: List[Data] = []
     graph_dates: List[str] = []
     node_tickers: List[List[str]] = []
@@ -254,7 +324,16 @@ def build_rolling_corr_graphs(
     end_indices = list(range(config.window - 1, len(dates), config.step))
 
     def _task(end_idx: int):
-        return _window_to_graph_data(end_idx, dates, returns, volume, membership_map, config)
+        return _window_to_graph_data(
+            end_idx,
+            dates,
+            returns,
+            volume,
+            membership_map,
+            config,
+            fund_panel,
+            fund_cols,
+        )
 
     backend = (parallel_backend or "threadpool").lower()
     use_parallel = num_workers is not None and num_workers > 1 and backend not in ("none", "serial")

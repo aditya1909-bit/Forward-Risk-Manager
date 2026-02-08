@@ -338,8 +338,16 @@ def main() -> int:
     layerwise_hall_std = _get_setting(args, section, "layerwise_hall_std", hall_std)
     feature_mode = build_cfg.get("feature_mode", "window")
     window_len = int(build_cfg.get("window", 20))
-    returns_len = window_len if feature_mode in ("window", "window_plus_summary") else 1
-    summary_dim = 5 if feature_mode == "window_plus_summary" else 0
+    if feature_mode in ("window", "window_plus_summary", "window_plus_summary_fund"):
+        returns_len = window_len
+    else:
+        returns_len = 1
+    if feature_mode == "window_plus_summary":
+        summary_dim = 5
+    elif feature_mode == "window_plus_summary_fund":
+        summary_dim = 10
+    else:
+        summary_dim = 0
 
     energy_penalty_weight = float(_get_setting(args, section, "energy_penalty_weight", 0.0))
     energy_penalty_mode = _get_setting(args, section, "energy_penalty_mode", "last")

@@ -71,3 +71,107 @@ def build_membership_map(
                     members.append(t)
                     seen.add(t)
     return membership
+
+
+def _apply_extra_tickers(members: List[str], extra_tickers: List[str] | None) -> List[str]:
+    if not extra_tickers:
+        return members
+    extra = [t.upper().strip() for t in extra_tickers if t]
+    seen = set(members)
+    for t in extra:
+        if t not in seen:
+            members.append(t)
+            seen.add(t)
+    return members
+
+
+def build_membership_map_ffill(
+    constituents: pd.DataFrame,
+    dates: List[str],
+    extra_tickers: List[str] | None = None,
+    max_gap_days: int | None = None,
+) -> tuple[Dict[str, List[str]], Dict[str, int]]:
+    grouped = constituents.groupby("date")["ticker"].apply(list)
+    members_by_date = grouped.to_dict()
+    stats = {
+        "source_dates": len(members_by_date),
+        "filled_dates": 0,
+        "gap_dropped": 0,
+    }
+    membership: Dict[str, List[str]] = {}
+    current: List[str] | None = None
+    last_date: str | None = None
+    for date in dates:
+        if date in members_by_date:
+            members = list(dict.fromkeys(members_by_date[date]))
+            members = _apply_extra_tickers(members, extra_tickers)
+            membership[date] = members
+            current = members
+            last_date = date
+            continue
+        if current is None or last_date is None:
+            continue
+        if max_gap_days is not None:
+            gap = (pd.to_datetime(date) - pd.to_datetime(last_date)).days
+            if gap > max_gap_days:
+                stats["gap_dropped"] += 1
+                continue
+        stats["filled_dates"] += 1
+        membership[date] = list(current)
+    return membership, stats
+
+
+def build_membership_map_all(
+    returns: pd.DataFrame,
+    extra_tickers: List[str] | None = None,
+) -> Dict[str, List[str]]:
+    tickers = [t for t in returns.columns if t]
+    if extra_tickers:
+        extra = [t.upper().strip() for t in extra_tickers if t]
+        for t in extra:
+            if t not in tickers:
+                tickers.append(t)
+    members = tickers
+    membership = {str(date): members for date in returns.index}
+    return membership
+
+
+def _parse_debt_equity(value: str) -> float | None:
+    if not value or not isinstance(value, str):
+        return None
+    # format like "1Y:0.210245;3M:0.453478"
+    parts = value.split(";")
+    parsed = {}
+    for part in parts:
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        try:
+            parsed[k.strip()] = float(v)
+        except ValueError:
+            continue
+    if "1Y" in parsed:
+        return parsed["1Y"]
+    if "3M" in parsed:
+        return parsed["3M"]
+    return None
+
+
+def load_fundamentals(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "date" not in df.columns:
+        raise ValueError("fundamentals.csv must include a 'date' column")
+    if "ticker" not in df.columns:
+        raise ValueError("fundamentals.csv must include a 'ticker' column")
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+    if "sector_code" in df.columns:
+        df["sector_code"] = pd.to_numeric(df["sector_code"], errors="coerce")
+    for col in ("market_cap", "pe_ratio", "pb_ratio"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "debt_equity" in df.columns:
+        df["debt_equity"] = df["debt_equity"].apply(_parse_debt_equity)
+    df = df.dropna(subset=["date", "ticker"])
+    return df
