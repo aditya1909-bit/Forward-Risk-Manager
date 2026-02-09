@@ -82,6 +82,8 @@ def main() -> int:
     price_col = "adj_close" if "adj_close" in prices.columns else "close"
     px = prices.set_index("date")[price_col].astype(float)
     logret = np.log(px).diff().dropna()
+    if logret.index.has_duplicates:
+        logret = logret[~logret.index.duplicated(keep="last")]
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
     records = []
@@ -91,6 +93,10 @@ def main() -> int:
         if dt not in logret.index:
             continue
         idx = logret.index.get_loc(dt)
+        if isinstance(idx, slice):
+            idx = idx.start
+        elif isinstance(idx, (np.ndarray, list)):
+            idx = int(idx[0])
 
         data = graphs[i]
         h = model(data.x, data.edge_index, edge_weight=getattr(data, "edge_weight", None))
