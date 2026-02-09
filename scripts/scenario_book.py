@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from dataclasses import replace
 import random
 import sys
 import tomllib
@@ -117,6 +118,48 @@ def main() -> int:
         type=float,
         default=None,
         help="Override hallucination node fraction",
+    )
+    parser.add_argument(
+        "--hall-init-noise",
+        type=float,
+        default=None,
+        help="Override hallucination init noise scale",
+    )
+    parser.add_argument(
+        "--min-hall-delta",
+        type=float,
+        default=0.0,
+        help="Minimum mean abs delta between real and hallucinated returns (0 disables)",
+    )
+    parser.add_argument(
+        "--hall-retry-limit",
+        type=int,
+        default=2,
+        help="Max retries to regenerate hallucination if delta too small",
+    )
+    parser.add_argument(
+        "--hall-retry-lr-mult",
+        type=float,
+        default=1.5,
+        help="LR multiplier per retry when delta too small",
+    )
+    parser.add_argument(
+        "--hall-retry-steps-inc",
+        type=int,
+        default=2,
+        help="Step increment per retry when delta too small",
+    )
+    parser.add_argument(
+        "--hall-retry-clamp-inc",
+        type=float,
+        default=0.5,
+        help="Clamp std increment per retry when delta too small",
+    )
+    parser.add_argument(
+        "--hall-retry-node-inc",
+        type=float,
+        default=0.1,
+        help="Node fraction increment per retry when delta too small",
     )
     parser.add_argument(
         "--adaptive",
@@ -327,6 +370,13 @@ def main() -> int:
     _maybe_override("hall_std_weight", "--hall-std-weight", float)
     _maybe_override("hall_clamp_std", "--hall-clamp-std", float)
     _maybe_override("hall_node_fraction", "--hall-node-fraction", float)
+    _maybe_override("hall_init_noise", "--hall-init-noise", float)
+    _maybe_override("min_hall_delta", "--min-hall-delta", float)
+    _maybe_override("hall_retry_limit", "--hall-retry-limit", int)
+    _maybe_override("hall_retry_lr_mult", "--hall-retry-lr-mult", float)
+    _maybe_override("hall_retry_steps_inc", "--hall-retry-steps-inc", int)
+    _maybe_override("hall_retry_clamp_inc", "--hall-retry-clamp-inc", float)
+    _maybe_override("hall_retry_node_inc", "--hall-retry-node-inc", float)
 
     if args.target_ticker:
         args.target_ticker = args.target_ticker.strip().upper()
@@ -435,6 +485,9 @@ def main() -> int:
         if args.hall_node_fraction is not None
         else float(train_cfg.get("hallucinate_node_fraction", 1.0)),
         node_min=int(train_cfg.get("hallucinate_node_min", 1)),
+        init_noise=float(args.hall_init_noise)
+        if args.hall_init_noise is not None
+        else float(train_cfg.get("hallucinate_init_noise", 0.0)),
     )
 
     out = Path(args.out)
@@ -497,22 +550,54 @@ def main() -> int:
 
                 constraint_fn = _constraint
 
-            x_neg = hallucinate_negative(
-                model,
-                data.x,
-                data.edge_index,
-                getattr(data, "edge_attr", None),
-                torch.zeros(data.num_nodes, dtype=torch.long),
-                hcfg,
-                edge_weight=getattr(data, "edge_weight", None),
-                constraint_fn=constraint_fn,
-                force_indices=force_indices,
-            )
+            attempt = 0
+            hcfg_local = hcfg
+            while True:
+                x_neg = hallucinate_negative(
+                    model,
+                    data.x,
+                    data.edge_index,
+                    getattr(data, "edge_attr", None),
+                    torch.zeros(data.num_nodes, dtype=torch.long),
+                    hcfg_local,
+                    edge_weight=getattr(data, "edge_weight", None),
+                    constraint_fn=constraint_fn,
+                    force_indices=force_indices,
+                )
 
-            if ret_mean is not None and ret_std is not None:
-                neg_returns = x_neg[:, :returns_len] * ret_std + ret_mean
-            else:
-                neg_returns = x_neg[:, :returns_len]
+                if ret_mean is not None and ret_std is not None:
+                    neg_returns = x_neg[:, :returns_len] * ret_std + ret_mean
+                else:
+                    neg_returns = x_neg[:, :returns_len]
+
+                if args.min_hall_delta <= 0:
+                    break
+
+                delta = float(torch.mean(torch.abs(neg_returns - pos_returns)).item())
+                if delta >= args.min_hall_delta or attempt >= args.hall_retry_limit:
+                    if delta < args.min_hall_delta and attempt >= args.hall_retry_limit:
+                        print(
+                            f"scenario {scenario_id} {date}: "
+                            f"delta={delta:.4f} < {args.min_hall_delta} after {attempt} retries"
+                        )
+                    break
+
+                attempt += 1
+                new_steps = hcfg_local.steps + args.hall_retry_steps_inc
+                new_lr = hcfg_local.lr * args.hall_retry_lr_mult
+                new_clamp = (
+                    None
+                    if hcfg_local.clamp_std is None
+                    else hcfg_local.clamp_std + args.hall_retry_clamp_inc
+                )
+                new_node_fraction = min(1.0, hcfg_local.node_fraction + args.hall_retry_node_inc)
+                hcfg_local = replace(
+                    hcfg_local,
+                    steps=new_steps,
+                    lr=new_lr,
+                    clamp_std=new_clamp,
+                    node_fraction=new_node_fraction,
+                )
 
             pos_returns = pos_returns.numpy()
             neg_returns = neg_returns.detach().numpy()

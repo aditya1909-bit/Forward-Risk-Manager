@@ -155,7 +155,7 @@ def main() -> int:
     rsi_period = _get_setting(args, section, "rsi_period", 14)
     mdy_ticker = _get_setting(args, section, "mdy_ticker", "MDY")
     edge_norm = _get_setting(args, section, "edge_norm", True)
-    edge_weight_mode = _get_setting(args, section, "edge_weight_mode", "abs")
+    edge_weight_mode = _get_setting(args, section, "edge_weight_mode", "raw")
     normalize = _get_setting(args, section, "normalize", True)
     symmetric = _get_setting(args, section, "symmetric", True)
     membership_mode = _get_setting(args, section, "membership_mode", "constituents")

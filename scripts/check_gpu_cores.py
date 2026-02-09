@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import platform
 import re
 import subprocess
 
@@ -31,20 +32,55 @@ def _parse_cpu_cores(text: str) -> str | None:
 
 
 def main() -> int:
-    print("Querying system_profiler (this may take a few seconds)...")
-    gpu_text = _run(["system_profiler", "SPDisplaysDataType"])
-    gpu_entries = _parse_gpu_cores(gpu_text)
-    if gpu_entries:
-        print("GPU cores:")
-        for model, cores in gpu_entries:
-            print(f"  {model}: {cores}")
-    else:
-        print("GPU core count not found in SPDisplaysDataType.")
+    system = platform.system()
+    if system == "Darwin":
+        print("Querying system_profiler (this may take a few seconds)...")
+        gpu_text = _run(["system_profiler", "SPDisplaysDataType"])
+        gpu_entries = _parse_gpu_cores(gpu_text)
+        if gpu_entries:
+            print("GPU cores:")
+            for model, cores in gpu_entries:
+                print(f"  {model}: {cores}")
+        else:
+            print("GPU core count not found in SPDisplaysDataType.")
 
-    cpu_text = _run(["system_profiler", "SPHardwareDataType"])
-    cpu_cores = _parse_cpu_cores(cpu_text)
-    if cpu_cores:
-        print(f"CPU cores (for reference): {cpu_cores}")
+        cpu_text = _run(["system_profiler", "SPHardwareDataType"])
+        cpu_cores = _parse_cpu_cores(cpu_text)
+        if cpu_cores:
+            print(f"CPU cores (for reference): {cpu_cores}")
+        return 0
+
+    if system == "Linux":
+        print("Querying nvidia-smi...")
+        try:
+            text = _run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total,driver_version",
+                    "--format=csv,noheader",
+                ]
+            )
+        except FileNotFoundError:
+            print("nvidia-smi not found. No NVIDIA GPU detected.")
+        except subprocess.CalledProcessError as exc:
+            print(f"nvidia-smi failed: {exc}")
+        else:
+            rows = [line.strip() for line in text.splitlines() if line.strip()]
+            if rows:
+                print("NVIDIA GPUs:")
+                for i, row in enumerate(rows):
+                    print(f"  {i}: {row}")
+            else:
+                print("No NVIDIA GPUs reported by nvidia-smi.")
+        try:
+            cpu_cores = _run(["nproc"]).strip()
+            if cpu_cores:
+                print(f"CPU cores (for reference): {cpu_cores}")
+        except Exception:
+            pass
+        return 0
+
+    print(f"Unsupported platform: {system}")
     return 0
 
 

@@ -5,18 +5,37 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
+
+def _segment_logsumexp(
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+) -> torch.Tensor:
+    max_vals = torch.full((num_segments,), -torch.inf, device=values.device, dtype=values.dtype)
+    if hasattr(max_vals, "scatter_reduce_"):
+        max_vals.scatter_reduce_(0, segment_ids, values, reduce="amax", include_self=True)
+    else:
+        for gid in range(num_segments):
+            mask = segment_ids == gid
+            if mask.any():
+                max_vals[gid] = values[mask].max()
+    shifted = torch.exp(values - max_vals.index_select(0, segment_ids))
+    sum_vals = torch.zeros(num_segments, device=values.device, dtype=values.dtype)
+    sum_vals.index_add_(0, segment_ids, shifted)
+    return max_vals + torch.log(sum_vals.clamp_min(1e-12))
+
+
 def goodness(h: torch.Tensor, batch: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    h2 = h * h
-    # per-node energy
-    node_energy = h2.mean(dim=1)
-    # log-sum-exp per graph (smooth max)
-    g_list = []
-    for gid in batch.unique():
-        idx = (batch == gid).nonzero(as_tuple=False).view(-1)
-        e = node_energy[idx]
-        g = temperature * torch.logsumexp(e / temperature, dim=0)
-        g_list.append(g)
-    return torch.stack(g_list, dim=0)
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if h.numel() == 0:
+        return torch.empty(0, device=h.device, dtype=h.dtype)
+
+    node_energy = (h * h).mean(dim=1)
+    _, segment_ids = torch.unique(batch, sorted=True, return_inverse=True)
+    scaled = node_energy / temperature
+    lse = _segment_logsumexp(scaled, segment_ids, int(segment_ids.max().item()) + 1)
+    return temperature * lse
 
 
 def make_negative(
@@ -35,7 +54,9 @@ def make_negative(
     summary_dim: int = 0,
 ) -> torch.Tensor:
     out = x.clone()
-    graph_ids = batch.unique()
+    if out.numel() == 0:
+        return out
+    batch_idx = batch if batch.device == out.device else batch.to(out.device)
 
     def _time_flip(tensor: torch.Tensor) -> torch.Tensor:
         if window_len is None:
@@ -50,17 +71,25 @@ def make_negative(
             return torch.cat([flipped, s, rest], dim=1)
         return torch.cat([flipped, tensor[:, window_len:]], dim=1)
 
-    for gid in graph_ids:
-        idx = (batch == gid).nonzero(as_tuple=False).view(-1)
-        if idx.numel() == 0:
-            continue
-        if mode in ("time_flip", "shuffle+time_flip", "time_flip+noise"):
-            out[idx] = _time_flip(out[idx])
-        if mode in ("shuffle", "shuffle+noise", "shuffle+time_flip"):
-            perm = torch.randperm(idx.numel(), device=x.device)
-            out[idx] = out[idx][perm]
-        if mode in ("noise", "shuffle+noise", "time_flip+noise") and noise_std > 0:
-            out[idx] = out[idx] + noise_std * torch.randn_like(out[idx])
+    if mode in ("time_flip", "shuffle+time_flip", "time_flip+noise"):
+        out = _time_flip(out)
+
+    if mode in ("shuffle", "shuffle+noise", "shuffle+time_flip"):
+        # Group-preserving shuffle: each node is reassigned to another node in the same graph.
+        rand = torch.rand(batch_idx.numel(), device=out.device, dtype=torch.float64)
+        try:
+            order = torch.argsort(batch_idx, stable=True)
+            shuffled = torch.argsort(batch_idx.to(torch.float64) + rand, stable=True)
+        except TypeError:
+            order = torch.argsort(batch_idx)
+            shuffled = torch.argsort(batch_idx.to(torch.float64) + rand)
+
+        source_for_dest = torch.empty_like(order)
+        source_for_dest[order] = shuffled
+        out = out.index_select(0, source_for_dest)
+
+    if mode in ("noise", "shuffle+noise", "time_flip+noise") and noise_std > 0:
+        out = out + noise_std * torch.randn_like(out)
     return out
 
 

@@ -26,7 +26,7 @@ class GraphBuildConfig:
     rsi_period: int = 14
     mdy_ticker: str = "MDY"
     edge_norm: bool = True
-    edge_weight_mode: str = "abs"
+    edge_weight_mode: str = "raw"
 
 
 def _select_edges(
@@ -97,6 +97,21 @@ def _compute_rsi(returns: np.ndarray, period: int) -> np.ndarray:
     rs = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return rsi
+
+
+def _signed_gcn_norm(
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    num_nodes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Preserve signed edge weights while normalizing by absolute weighted degree.
+    row = edge_index[0]
+    col = edge_index[1]
+    deg = torch.zeros(num_nodes, dtype=edge_weight.dtype, device=edge_weight.device)
+    deg.scatter_add_(0, row, edge_weight.abs())
+    deg_inv_sqrt = deg.clamp(min=1e-12).pow(-0.5)
+    edge_weight = deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
+    return edge_index, edge_weight
 
 
 def _compute_summary_features(
@@ -434,9 +449,14 @@ def build_rolling_corr_graphs(
         elif config.edge_weight_mode == "ones":
             edge_weight = torch.ones_like(edge_weight)
         if config.edge_norm:
-            edge_index, edge_weight = gcn_norm(
-                edge_index, edge_weight, num_nodes=len(tickers), add_self_loops=False
-            )
+            if config.edge_weight_mode == "raw":
+                edge_index, edge_weight = _signed_gcn_norm(
+                    edge_index, edge_weight, num_nodes=len(tickers)
+                )
+            else:
+                edge_index, edge_weight = gcn_norm(
+                    edge_index, edge_weight, num_nodes=len(tickers), add_self_loops=False
+                )
 
         x_tensor = torch.from_numpy(x).float()
         data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(tickers))

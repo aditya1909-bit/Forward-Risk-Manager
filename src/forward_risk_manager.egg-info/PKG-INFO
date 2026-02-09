@@ -1,3 +1,11 @@
+Metadata-Version: 2.4
+Name: forward-risk-manager
+Version: 0.1.0
+Summary: Forward-Forward GNN risk modeling tools
+License: UNLICENSED
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
 # Forward Risk Manager
 
 This repo starts with a data conversion pipeline from QuantConnect Research exports into tidy CSVs that are easy to feed into PyTorch/PyG.

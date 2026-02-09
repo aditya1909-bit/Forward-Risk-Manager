@@ -21,6 +21,7 @@ sys.path.append(str(ROOT / "src"))
 from frisk.models import GCNEncoder
 from frisk.ff import goodness, make_negative, ff_loss
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.device import resolve_device, sync_device
 
 
 def _load_config(path: str) -> dict:
@@ -35,25 +36,32 @@ def _set_seed(seed: int) -> None:
 
 
 def _choose_device(device: str) -> torch.device:
-    if device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available")
-        return torch.device("cuda")
-    if device == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS requested but not available")
-        return torch.device("mps")
-    return torch.device("cpu")
+    return resolve_device(device)
 
 
-def _split_graphs(graphs, eval_frac: float = 0.2, seed: int = 7):
-    rng = random.Random(seed)
-    idx = list(range(len(graphs)))
-    rng.shuffle(idx)
-    cut = int(len(idx) * (1 - eval_frac))
-    train = [graphs[i] for i in idx[:cut]]
-    evals = [graphs[i] for i in idx[cut:]]
-    return train, evals
+def _split_graphs(
+    graphs,
+    eval_frac: float = 0.2,
+    seed: int = 7,
+    split_mode: str = "chronological",
+):
+    n = len(graphs)
+    if n < 2:
+        raise ValueError("Need at least 2 graphs to create train/eval splits.")
+    cut = int(n * (1 - eval_frac))
+    cut = max(1, min(n - 1, cut))
+
+    mode = str(split_mode).strip().lower()
+    if mode in ("chronological", "chrono", "time"):
+        return graphs[:cut], graphs[cut:]
+    if mode in ("random", "shuffle"):
+        rng = random.Random(seed)
+        idx = list(range(n))
+        rng.shuffle(idx)
+        train = [graphs[i] for i in idx[:cut]]
+        evals = [graphs[i] for i in idx[cut:]]
+        return train, evals
+    raise ValueError(f"Unknown split_mode: {split_mode}. Expected chronological or random.")
 
 
 def _get_use_mode(epoch: int, neg_mode: str, warmup: int, mix_start: float, mix_end: float, ramp: int):
@@ -103,10 +111,7 @@ def _make_negatives(
 
 
 def _sync(device: torch.device) -> None:
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    if device.type == "mps" and torch.backends.mps.is_available():
-        torch.mps.synchronize()
+    sync_device(device)
 
 
 def _eval_ff_metrics(
@@ -125,26 +130,46 @@ def _eval_ff_metrics(
     gneg = []
     acc_num = 0
     acc_den = 0
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(next(model.parameters()).device)
-            x = batch.x
-            edge_weight = getattr(batch, "edge_weight", None)
+    for batch in loader:
+        batch = batch.to(next(model.parameters()).device)
+        x = batch.x
+        edge_weight = getattr(batch, "edge_weight", None)
+        with torch.no_grad():
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
-            x_neg = _make_negatives(
-                model,
-                x,
-                batch.batch,
-                batch.edge_index,
-                getattr(batch, "edge_attr", None),
-                edge_weight,
-                neg_mode,
-                noise_std,
-                hall_cfg,
-                window_len=window_len,
-                summary_dim=summary_dim,
-            )
+
+        if neg_mode == "hallucinate":
+            with torch.enable_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    neg_mode,
+                    noise_std,
+                    hall_cfg,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+        else:
+            with torch.no_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    neg_mode,
+                    noise_std,
+                    hall_cfg,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+
+        with torch.no_grad():
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
             pred_pos = (g_pos > goodness_target)
@@ -157,13 +182,109 @@ def _eval_ff_metrics(
     return float(np.mean(gpos)), float(np.mean(gneg)), float(acc)
 
 
+def _calibrate_goodness_target(
+    model,
+    loader,
+    goodness_temp,
+    default_target,
+    neg_mode,
+    noise_std,
+    hall_cfg,
+    window_len: int | None = None,
+    summary_dim: int = 0,
+    max_batches: int = 0,
+    quantiles: int = 31,
+):
+    model.eval()
+    pos_vals = []
+    neg_vals = []
+    for batch_idx, batch in enumerate(loader):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
+        batch = batch.to(next(model.parameters()).device)
+        x = batch.x
+        edge_weight = getattr(batch, "edge_weight", None)
+        with torch.no_grad():
+            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+
+        if neg_mode == "hallucinate":
+            with torch.enable_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    neg_mode,
+                    noise_std,
+                    hall_cfg,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+        else:
+            with torch.no_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    neg_mode,
+                    noise_std,
+                    hall_cfg,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+
+        with torch.no_grad():
+            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+
+        pos_vals.append(g_pos.detach().cpu())
+        neg_vals.append(g_neg.detach().cpu())
+
+    if not pos_vals or not neg_vals:
+        return float(default_target), 0.0
+
+    pos_all = torch.cat(pos_vals)
+    neg_all = torch.cat(neg_vals)
+    vals = torch.cat([pos_all, neg_all])
+    qn = max(5, int(quantiles))
+    qs = torch.linspace(0.02, 0.98, steps=qn)
+    cands = torch.quantile(vals, qs).unique()
+    if cands.numel() == 0:
+        return float(default_target), 0.0
+
+    best_target = float(default_target)
+    best_acc = -1.0
+    for t in cands.tolist():
+        t = float(t)
+        acc = 0.5 * (
+            float((pos_all > t).float().mean().item())
+            + float((neg_all <= t).float().mean().item())
+        )
+        if acc > best_acc:
+            best_acc = acc
+            best_target = t
+
+    return best_target, best_acc
+
+
 def _benchmark_ff(
     graphs,
     device,
     config,
     layerwise: bool,
 ):
-    train_graphs, eval_graphs = _split_graphs(graphs, eval_frac=config["eval_frac"], seed=config["seed"])
+    train_graphs, eval_graphs = _split_graphs(
+        graphs,
+        eval_frac=config["eval_frac"],
+        seed=config["seed"],
+        split_mode=config.get("split_mode", "chronological"),
+    )
     loader_kwargs = {
         "batch_size": config["batch_size"],
         "shuffle": True,
@@ -287,11 +408,35 @@ def _benchmark_ff(
         dt = time.perf_counter() - t0
         epoch_times.append((dt, graphs_seen))
 
+    target_eval = float(config["goodness_target"])
+    target_cal_acc = 0.0
+    if bool(config.get("calibrate_target", True)):
+        calib_loader = DataLoader(
+            train_graphs, batch_size=config["batch_size"], shuffle=False
+        )
+        target_eval, target_cal_acc = _calibrate_goodness_target(
+            model,
+            calib_loader,
+            config["goodness_temp"],
+            config["goodness_target"],
+            config["eval_neg_mode"],
+            config["noise_std"],
+            hall_cfg,
+            window_len=config.get("window_len"),
+            summary_dim=config.get("summary_dim", 0),
+            max_batches=int(config.get("calibrate_batches", 0)),
+            quantiles=int(config.get("calibrate_quantiles", 31)),
+        )
+        print(
+            "calibrated goodness_target="
+            f"{target_eval:.4f} (train-cal acc={target_cal_acc:.4f})"
+        )
+
     gpos, gneg, acc = _eval_ff_metrics(
         model,
         eval_loader,
         config["goodness_temp"],
-        config["goodness_target"],
+        target_eval,
         config["eval_neg_mode"],
         config["noise_std"],
         hall_cfg,
@@ -309,11 +454,18 @@ def _benchmark_ff(
         "eval_g_neg": gneg,
         "eval_sep": gpos - gneg,
         "eval_acc": acc,
+        "goodness_target_eval": target_eval,
+        "target_cal_acc": target_cal_acc,
     }
 
 
 def _benchmark_backprop(graphs, device, config):
-    train_graphs, eval_graphs = _split_graphs(graphs, eval_frac=config["eval_frac"], seed=config["seed"])
+    train_graphs, eval_graphs = _split_graphs(
+        graphs,
+        eval_frac=config["eval_frac"],
+        seed=config["seed"],
+        split_mode=config.get("split_mode", "chronological"),
+    )
     loader_kwargs = {
         "batch_size": config["batch_size"],
         "shuffle": True,
@@ -420,28 +572,47 @@ def _benchmark_backprop(graphs, device, config):
     gpos = []
     gneg = []
     eval_losses = []
-    with torch.no_grad():
-        for batch in eval_loader:
-            batch = batch.to(device)
-            edge_weight = getattr(batch, "edge_weight", None)
-            x = batch.x
+    for batch in eval_loader:
+        batch = batch.to(device)
+        edge_weight = getattr(batch, "edge_weight", None)
+        x = batch.x
+        with torch.no_grad():
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
             z_pos = global_mean_pool(h_pos, batch.batch)
             y_pos = torch.ones(z_pos.size(0), device=device)
 
-            x_neg = _make_negatives(
-                model,
-                x,
-                batch.batch,
-                batch.edge_index,
-                getattr(batch, "edge_attr", None),
-                edge_weight,
-                config["eval_neg_mode"],
-                config["noise_std"],
-                hall_cfg,
-                window_len=config.get("window_len"),
-                summary_dim=config.get("summary_dim", 0),
-            )
+        if config["eval_neg_mode"] == "hallucinate":
+            with torch.enable_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    config["eval_neg_mode"],
+                    config["noise_std"],
+                    hall_cfg,
+                    window_len=config.get("window_len"),
+                    summary_dim=config.get("summary_dim", 0),
+                )
+        else:
+            with torch.no_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    config["eval_neg_mode"],
+                    config["noise_std"],
+                    hall_cfg,
+                    window_len=config.get("window_len"),
+                    summary_dim=config.get("summary_dim", 0),
+                )
+
+        with torch.no_grad():
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             z_neg = global_mean_pool(h_neg, batch.batch)
             y_neg = torch.zeros(z_neg.size(0), device=device)
@@ -492,7 +663,7 @@ def main() -> int:
     payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
     graphs = payload["graphs"]
 
-    device = _choose_device(train_cfg.get("device", "cpu"))
+    device = _choose_device(train_cfg.get("device", "auto"))
     _set_seed(int(train_cfg.get("seed", 7)))
     if train_cfg.get("torch_num_threads"):
         torch.set_num_threads(int(train_cfg["torch_num_threads"]))
@@ -532,6 +703,7 @@ def main() -> int:
         "pin_memory": bool(train_cfg.get("dataloader_pin_memory", False)),
         "multiprocessing_context": str(train_cfg.get("dataloader_mp_context", "")),
         "eval_frac": float(bench_cfg.get("eval_frac", 0.2)),
+        "split_mode": str(bench_cfg.get("split_mode", "chronological")),
         "seed": int(train_cfg.get("seed", 7)),
         "hall_steps": int(train_cfg.get("hallucinate_steps", 3)),
         "hall_lr": float(train_cfg.get("hallucinate_lr", 0.03)),
@@ -543,6 +715,9 @@ def main() -> int:
         "hall_node_fraction": float(train_cfg.get("hallucinate_node_fraction", 0.5)),
         "hall_node_min": int(train_cfg.get("hallucinate_node_min", 20)),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
+        "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
+        "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
+        "calibrate_quantiles": int(bench_cfg.get("calibrate_quantiles", 31)),
         "window_len": int(returns_len),
         "summary_dim": int(summary_dim),
     }

@@ -21,11 +21,28 @@ sys.path.append(str(ROOT / "src"))
 from frisk.models import GCNEncoder
 from frisk.ff import goodness, make_negative, ff_loss
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.device import resolve_device, sync_device
+
+_GRAPH_CACHE: dict[str, list] = {}
 
 
 def _load_config(path: str) -> dict:
     with Path(path).open("rb") as f:
         return tomllib.load(f)
+
+
+def _load_graphs_cached(graphs_path: str):
+    key = str(Path(graphs_path).resolve())
+    graphs = _GRAPH_CACHE.get(key)
+    if graphs is not None:
+        return graphs
+    try:
+        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(Path(graphs_path), map_location="cpu")
+    graphs = payload["graphs"]
+    _GRAPH_CACHE[key] = graphs
+    return graphs
 
 
 def _set_seed(seed: int) -> None:
@@ -35,32 +52,121 @@ def _set_seed(seed: int) -> None:
 
 
 def _choose_device(device: str) -> torch.device:
-    if device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available")
-        return torch.device("cuda")
-    if device == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS requested but not available")
-        return torch.device("mps")
-    return torch.device("cpu")
+    return resolve_device(device)
 
 
 def _sync(device: torch.device) -> None:
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    if device.type == "mps" and torch.backends.mps.is_available():
-        torch.mps.synchronize()
+    sync_device(device)
 
 
-def _split_graphs(graphs, eval_frac: float, seed: int):
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _uniq_values(values, *, as_int: bool = False) -> list:
+    out = []
+    seen = set()
+    for v in values:
+        if as_int:
+            val = int(round(float(v)))
+            key = ("i", val)
+        else:
+            val = float(v)
+            key = ("f", round(val, 8))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(val)
+    return out
+
+
+def _auto_expand_combos(base: dict, sweep_cfg: dict) -> list[dict]:
+    seed = int(sweep_cfg.get("auto_expand_seed", int(base.get("seed", 7)) + 97))
+    max_runs = int(sweep_cfg.get("auto_expand_size", 12))
+    if max_runs <= 0:
+        return [{}]
+
+    temp = float(base.get("goodness_temp", 1.0))
+    target = float(base.get("goodness_target", 1.0))
+    mix_end = float(base.get("neg_mix_end", 0.7))
+    gate_margin = float(base.get("neg_gate_margin", 1.0))
+    hall_steps = int(base.get("hall_steps", 6))
+    hall_lr = float(base.get("hall_lr", 0.05))
+    hall_frac = float(base.get("hall_node_fraction", 0.4))
+
+    candidates = {
+        "goodness_temp": _uniq_values(
+            [_clamp(temp * 0.8, 0.05, 2.0), temp, _clamp(temp * 1.2, 0.05, 2.0)]
+        ),
+        "goodness_target": _uniq_values(
+            [_clamp(target * 0.85, 0.1, 12.0), target, _clamp(target * 1.1, 0.1, 12.0)]
+        ),
+        "neg_mix_end": _uniq_values(
+            [_clamp(mix_end - 0.15, 0.1, 0.98), mix_end, _clamp(mix_end + 0.1, 0.1, 0.98)]
+        ),
+        "neg_gate_margin": _uniq_values(
+            [
+                _clamp(gate_margin - 0.3, 0.05, 3.0),
+                gate_margin,
+                _clamp(gate_margin + 0.3, 0.05, 3.0),
+            ]
+        ),
+        "hall_steps": _uniq_values(
+            [max(2, hall_steps - 2), hall_steps, min(18, hall_steps + 2)],
+            as_int=True,
+        ),
+        "hall_lr": _uniq_values(
+            [_clamp(hall_lr * 0.7, 0.001, 0.25), hall_lr, _clamp(hall_lr * 1.4, 0.001, 0.25)]
+        ),
+        "hall_node_fraction": _uniq_values(
+            [
+                _clamp(hall_frac - 0.15, 0.1, 1.0),
+                hall_frac,
+                _clamp(hall_frac + 0.15, 0.1, 1.0),
+            ]
+        ),
+    }
+
+    keys = list(candidates.keys())
+    all_combos = [
+        dict(zip(keys, vals)) for vals in itertools.product(*(candidates[k] for k in keys))
+    ]
     rng = random.Random(seed)
-    idx = list(range(len(graphs)))
-    rng.shuffle(idx)
-    cut = int(len(idx) * (1 - eval_frac))
-    train = [graphs[i] for i in idx[:cut]]
-    evals = [graphs[i] for i in idx[cut:]]
-    return train, evals
+    rng.shuffle(all_combos)
+
+    baseline = {k: base[k] for k in keys}
+    picked = all_combos[:max_runs]
+    if baseline not in picked:
+        if picked:
+            picked = [baseline] + picked[:-1]
+        else:
+            picked = [baseline]
+    return picked
+
+
+def _split_graphs(
+    graphs,
+    eval_frac: float,
+    seed: int,
+    split_mode: str = "chronological",
+):
+    n = len(graphs)
+    if n < 2:
+        raise ValueError("Need at least 2 graphs to create train/eval splits.")
+    cut = int(n * (1 - eval_frac))
+    cut = max(1, min(n - 1, cut))
+
+    mode = str(split_mode).strip().lower()
+    if mode in ("chronological", "chrono", "time"):
+        return graphs[:cut], graphs[cut:]
+    if mode in ("random", "shuffle"):
+        rng = random.Random(seed)
+        idx = list(range(n))
+        rng.shuffle(idx)
+        train = [graphs[i] for i in idx[:cut]]
+        evals = [graphs[i] for i in idx[cut:]]
+        return train, evals
+    raise ValueError(f"Unknown split_mode: {split_mode}. Expected chronological or random.")
 
 
 def _get_use_mode(epoch: int, neg_mode: str, warmup: int, mix_start: float, mix_end: float, ramp: int):
@@ -127,26 +233,46 @@ def _eval_ff_metrics(
     gneg = []
     acc_num = 0
     acc_den = 0
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(next(model.parameters()).device)
-            x = batch.x
-            edge_weight = getattr(batch, "edge_weight", None)
+    for batch in loader:
+        batch = batch.to(next(model.parameters()).device)
+        x = batch.x
+        edge_weight = getattr(batch, "edge_weight", None)
+        with torch.no_grad():
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
-            x_neg = _make_negatives(
-                model,
-                x,
-                batch.batch,
-                batch.edge_index,
-                getattr(batch, "edge_attr", None),
-                edge_weight,
-                neg_mode,
-                noise_std,
-                hall_cfg,
-                window_len=window_len,
-                summary_dim=summary_dim,
-            )
+
+        if neg_mode == "hallucinate":
+            with torch.enable_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    neg_mode,
+                    noise_std,
+                    hall_cfg,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+        else:
+            with torch.no_grad():
+                x_neg = _make_negatives(
+                    model,
+                    x,
+                    batch.batch,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    neg_mode,
+                    noise_std,
+                    hall_cfg,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+
+        with torch.no_grad():
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
             pred_pos = (g_pos > goodness_target)
@@ -160,7 +286,12 @@ def _eval_ff_metrics(
 
 
 def _run_ff_trial(graphs, device, cfg, layerwise: bool):
-    train_graphs, eval_graphs = _split_graphs(graphs, cfg["eval_frac"], cfg["seed"])
+    train_graphs, eval_graphs = _split_graphs(
+        graphs,
+        cfg["eval_frac"],
+        cfg["seed"],
+        cfg.get("split_mode", "chronological"),
+    )
     loader_kwargs = {
         "batch_size": cfg["batch_size"],
         "shuffle": True,
@@ -375,11 +506,7 @@ def _run_trial_worker(args):
         torch.set_num_interop_threads(int(worker_interop_threads))
     _set_seed(seed)
     device = _choose_device(device_str)
-    try:
-        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(Path(graphs_path), map_location="cpu")
-    graphs = payload["graphs"]
+    graphs = _load_graphs_cached(graphs_path)
     return _run_ff_trial(graphs, device, cfg, layerwise=layerwise)
 
 
@@ -399,7 +526,7 @@ def main() -> int:
     build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
-    device_str = str(train_cfg.get("device", "cpu"))
+    device_str = str(train_cfg.get("device", "auto"))
 
     neg_mode_val = sweep_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))
     if isinstance(neg_mode_val, list):
@@ -437,6 +564,7 @@ def main() -> int:
         "pin_memory": bool(train_cfg.get("dataloader_pin_memory", False)),
         "multiprocessing_context": str(train_cfg.get("dataloader_mp_context", "")),
         "eval_frac": float(sweep_cfg.get("eval_frac", 0.2)),
+        "split_mode": str(sweep_cfg.get("split_mode", "chronological")),
         "seed": int(sweep_cfg.get("seed", train_cfg.get("seed", 7))),
         "hall_steps": int(train_cfg.get("hallucinate_steps", 3)),
         "hall_lr": float(train_cfg.get("hallucinate_lr", 0.03)),
@@ -473,6 +601,18 @@ def main() -> int:
         "max_runs",
         "timing_warmup_epochs",
         "eval_neg_mode",
+        "top_k",
+        "auto_expand",
+        "auto_expand_size",
+        "auto_expand_seed",
+        "speed_weight",
+        "parallel_workers",
+        "parallel_backend",
+        "parallel_mp_context",
+        "parallel_force_cpu",
+        "worker_torch_threads",
+        "worker_torch_interop_threads",
+        "worker_loader_workers",
     }
 
     grid_keys = []
@@ -487,6 +627,14 @@ def main() -> int:
             base[k] = v
 
     combos = [dict(zip(grid_keys, vals)) for vals in itertools.product(*grid_vals)] if grid_keys else [{}]
+    auto_expand = bool(sweep_cfg.get("auto_expand", True))
+    if auto_expand and not grid_keys:
+        combos = _auto_expand_combos(base, sweep_cfg)
+        print(
+            f"Auto-expanded sweep grid: {len(combos)} trials "
+            "(set [sweep] auto_expand=false to disable)"
+        )
+
     max_runs = sweep_cfg.get("max_runs", None)
     if max_runs is not None:
         combos = combos[: int(max_runs)]
@@ -643,6 +791,20 @@ def main() -> int:
                     pbar.update(1)
     pbar.close()
 
+    if results:
+        speed_weight = float(sweep_cfg.get("speed_weight", 0.35))
+        speed_weight = _clamp(speed_weight, 0.0, 1.0)
+        seps = [float(r.get("eval_sep", 0.0)) for r in results]
+        speeds = [float(r.get("graphs_per_s", 0.0)) for r in results]
+        sep_min, sep_max = min(seps), max(seps)
+        spd_min, spd_max = min(speeds), max(speeds)
+        sep_den = sep_max - sep_min
+        spd_den = spd_max - spd_min
+        for r in results:
+            sep_norm = 0.0 if sep_den <= 0 else (float(r.get("eval_sep", 0.0)) - sep_min) / sep_den
+            speed_norm = 0.0 if spd_den <= 0 else (float(r.get("graphs_per_s", 0.0)) - spd_min) / spd_den
+            r["score"] = (1.0 - speed_weight) * sep_norm + speed_weight * speed_norm
+
     out_path = Path(sweep_cfg.get("out_csv", "reports/ff_sweep.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     import csv
@@ -656,12 +818,18 @@ def main() -> int:
 
     if results:
         best = max(results, key=lambda r: r.get("eval_sep", float("-inf")))
+        best_score = max(results, key=lambda r: r.get("score", float("-inf")))
         top_k = int(sweep_cfg.get("top_k", 10))
         ranked = sorted(results, key=lambda r: r.get("eval_sep", float("-inf")), reverse=True)
+        ranked_score = sorted(results, key=lambda r: r.get("score", float("-inf")), reverse=True)
         print(f"Wrote {out_path}")
         print(f"Best by eval_sep: {best}")
+        print(f"Best by composite score: {best_score}")
         print(f"Top {top_k} by eval_sep:")
         for r in ranked[:top_k]:
+            print(r)
+        print(f"Top {top_k} by composite score:")
+        for r in ranked_score[:top_k]:
             print(r)
     else:
         print("No sweep results produced.")

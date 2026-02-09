@@ -6,9 +6,9 @@ from pathlib import Path
 import random
 import sys
 import tomllib
-import os
 import csv
 import math
+import hashlib
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +23,9 @@ sys.path.append(str(ROOT / "src"))
 from frisk.models import GCNEncoder
 from frisk.ff import goodness, make_negative, ff_loss
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
+
+_RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 
 
 def _load_config(path: str | None) -> dict:
@@ -52,13 +55,67 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def _compute_risk_targets(
     prices_path: str,
     ticker: str,
     dates: list[str],
     horizon: int,
     standardize: bool,
+    cache_dir: str | None = "runs/cache",
 ) -> tuple[list[float | None], float, float]:
+    prices_file = Path(prices_path)
+    try:
+        st = prices_file.stat()
+        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        file_sig = "missing"
+    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha1(
+        "|".join(
+            [
+                str(prices_file.resolve()),
+                str(ticker).upper(),
+                str(horizon),
+                str(int(bool(standardize))),
+                file_sig,
+                dates_hash,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+    cached = _RISK_TARGET_MEM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cache_path: Path | None = None
+    if cache_dir:
+        cache_path = Path(cache_dir) / f"risk_targets_{cache_key}.pt"
+        if cache_path.exists():
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                targets = payload["targets"]
+                mean = float(payload["mean"])
+                std = float(payload["std"])
+                result = (targets, mean, std)
+                _RISK_TARGET_MEM_CACHE[cache_key] = result
+                return result
+            except Exception:
+                pass
+
     prices: list[tuple[str, float]] = []
     with Path(prices_path).open() as f:
         r = csv.DictReader(f)
@@ -119,7 +176,15 @@ def _compute_risk_targets(
 
     if standardize:
         targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
-    return targets, mean, std
+    result = (targets, mean, std)
+    _RISK_TARGET_MEM_CACHE[cache_key] = result
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
+        except Exception:
+            pass
+    return result
 
 
 def _try_batch_size(
@@ -219,7 +284,8 @@ def _try_batch_size(
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main() -> int:
@@ -249,7 +315,7 @@ def main() -> int:
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--noise-std", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default=argparse.SUPPRESS)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--loader-workers", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--auto-tune-batch", action="store_true", default=argparse.SUPPRESS)
@@ -286,7 +352,7 @@ def main() -> int:
     temp_sweep = _get_setting(args, section, "temp_sweep", "")
     neg_mode = _get_setting(args, section, "neg_mode", "shuffle")
     noise_std = _get_setting(args, section, "noise_std", 0.05)
-    device_choice = _get_setting(args, section, "device", "cpu")
+    device_choice = _get_setting(args, section, "device", "auto")
     seed = _get_setting(args, section, "seed", 7)
     loader_workers = _get_setting(args, section, "loader_workers", 0)
     dataloader_persistent = _get_setting(args, section, "dataloader_persistent_workers", True)
@@ -327,10 +393,26 @@ def main() -> int:
     hall_clamp = _get_setting(args, section, "hallucinate_clamp_std", 3.0)
     hall_node_fraction = _get_setting(args, section, "hallucinate_node_fraction", 1.0)
     hall_node_min = _get_setting(args, section, "hallucinate_node_min", 1)
+    hall_init_noise = _get_setting(args, section, "hallucinate_init_noise", 0.0)
+    hall_min_delta = _get_setting(args, section, "hallucinate_min_delta", 0.0)
+    hall_fallback_noise = _get_setting(args, section, "hallucinate_fallback_noise", 1.0)
     hall_curriculum = section.get("hallucinate_curriculum", {})
     hall_curr_enabled = bool(hall_curriculum.get("enabled", False))
     hall_curr_start = int(hall_curriculum.get("start_epoch", 1))
     hall_curr_ramp = int(hall_curriculum.get("ramp_epochs", 1))
+
+    def _sync_hall_curriculum_end() -> None:
+        if not hall_curr_enabled:
+            return
+        hall_curriculum["steps_end"] = int(hall_steps)
+        hall_curriculum["lr_end"] = float(hall_lr)
+        hall_curriculum["l2_end"] = float(hall_l2)
+        hall_curriculum["mean_end"] = float(hall_mean)
+        hall_curriculum["std_end"] = float(hall_std)
+        hall_curriculum["corr_end"] = float(hall_corr)
+        hall_curriculum["node_fraction_end"] = float(hall_node_fraction)
+        hall_curriculum["node_min_end"] = int(hall_node_min)
+
     layerwise_neg_mode = _get_setting(args, section, "layerwise_neg_mode", "shuffle")
     layerwise_noise_std = _get_setting(args, section, "layerwise_noise_std", noise_std)
     layerwise_hall_corr = _get_setting(args, section, "layerwise_hall_corr", 0.0)
@@ -358,6 +440,32 @@ def main() -> int:
     risk_loss_weight = float(_get_setting(args, section, "risk_loss_weight", 0.1))
     risk_loss_type = _get_setting(args, section, "risk_loss_type", "huber")
     risk_standardize = bool(_get_setting(args, section, "risk_standardize", True))
+    risk_cache_dir = _get_setting(args, section, "risk_cache_dir", "runs/cache")
+
+    adaptive_hall_enabled = _to_bool(_get_setting(args, section, "adaptive_hallucination", True))
+    adaptive_hall_close_high = float(_get_setting(args, section, "adaptive_hall_close_high", 0.75))
+    adaptive_hall_hardness_low = float(_get_setting(args, section, "adaptive_hall_hardness_low", -0.2))
+    adaptive_hall_hardness_high = float(_get_setting(args, section, "adaptive_hall_hardness_high", 0.4))
+    adaptive_hall_lr_mult = float(_get_setting(args, section, "adaptive_hall_lr_mult", 1.15))
+    adaptive_hall_lr_max = float(_get_setting(args, section, "adaptive_hall_lr_max", 0.2))
+    adaptive_hall_steps_inc = int(_get_setting(args, section, "adaptive_hall_steps_inc", 1))
+    adaptive_hall_steps_max = int(_get_setting(args, section, "adaptive_hall_steps_max", 16))
+    adaptive_hall_node_inc = float(_get_setting(args, section, "adaptive_hall_node_inc", 0.05))
+    adaptive_hall_reg_mult = float(_get_setting(args, section, "adaptive_hall_reg_mult", 0.9))
+    adaptive_hall_reg_min = float(_get_setting(args, section, "adaptive_hall_reg_min", 0.001))
+    adaptive_hall_min_delta_mult = float(_get_setting(args, section, "adaptive_hall_min_delta_mult", 0.9))
+    adaptive_hall_min_delta_min = float(_get_setting(args, section, "adaptive_hall_min_delta_min", 0.005))
+    adaptive_mix_step = float(_get_setting(args, section, "adaptive_mix_step", 0.05))
+    adaptive_gate_margin_step = float(_get_setting(args, section, "adaptive_gate_margin_step", 0.05))
+    adaptive_gate_margin_min = float(_get_setting(args, section, "adaptive_gate_margin_min", 0.1))
+    adaptive_gate_margin_max = float(_get_setting(args, section, "adaptive_gate_margin_max", 2.5))
+
+    adaptive_target_enabled = _to_bool(_get_setting(args, section, "adaptive_goodness_target", True))
+    adaptive_target_warmup = int(_get_setting(args, section, "adaptive_goodness_target_warmup", 5))
+    adaptive_target_alpha = float(_get_setting(args, section, "adaptive_goodness_target_alpha", 0.15))
+    adaptive_target_margin = float(_get_setting(args, section, "adaptive_goodness_target_margin", 0.0))
+    adaptive_target_min = float(_get_setting(args, section, "adaptive_goodness_target_min", 0.1))
+    adaptive_target_max = float(_get_setting(args, section, "adaptive_goodness_target_max", 10.0))
 
     def _hall_cfg_for_epoch(epoch: int, corr_override: float | None = None, mean_override: float | None = None, std_override: float | None = None) -> HallucinationConfig:
         if not hall_curr_enabled:
@@ -372,6 +480,7 @@ def main() -> int:
                 goodness_temp=goodness_temp,
                 node_fraction=hall_node_fraction,
                 node_min=hall_node_min,
+                init_noise=hall_init_noise,
             )
 
         if epoch < hall_curr_start:
@@ -410,6 +519,7 @@ def main() -> int:
             goodness_temp=goodness_temp,
             node_fraction=node_fraction,
             node_min=node_min,
+            init_noise=hall_init_noise,
         )
 
     set_seed(seed)
@@ -417,16 +527,7 @@ def main() -> int:
         torch.set_num_threads(int(torch_num_threads))
     if torch_num_interop_threads:
         torch.set_num_interop_threads(int(torch_num_interop_threads))
-    if device_choice == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available")
-        device = torch.device("cuda")
-    elif device_choice == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS requested but not available")
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device = resolve_device(device_choice)
 
     try:
         payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
@@ -441,11 +542,10 @@ def main() -> int:
     for i, g in enumerate(graphs):
         setattr(g, "graph_idx", i)
 
+    print(f"device request: {device_choice}")
     print(f"device: {device}")
-    print(f"mps built: {torch.backends.mps.is_built()}")
-    print(f"mps available: {torch.backends.mps.is_available()}")
-    fallback = os.getenv("PYTORCH_ENABLE_MPS_FALLBACK", "1") != "0"
-    print(f"mps fallback enabled: {fallback}")
+    for key, value in collect_device_diagnostics().items():
+        print(f"{key}: {value}")
     print(
         f"neg_mode: {neg_mode} | batch_size: {batch_size} | loader_workers: {loader_workers}"
     )
@@ -477,12 +577,26 @@ def main() -> int:
             f"lr {lr_start}->{lr_end}, "
             f"node_fraction {frac_start}->{frac_end}"
         )
+        _sync_hall_curriculum_end()
     if neg_mode in ("schedule", "mix"):
         print(f"neg_warmup_epochs: {neg_warmup_epochs}")
     if neg_mode == "mix":
         print(
             f"neg_mix_start: {neg_mix_start} | neg_mix_end: {neg_mix_end} | "
             f"neg_mix_ramp_epochs: {neg_mix_ramp_epochs}"
+        )
+    if adaptive_hall_enabled:
+        print(
+            "adaptive_hallucination: "
+            f"close_high={adaptive_hall_close_high}, "
+            f"hardness_low={adaptive_hall_hardness_low}, "
+            f"hardness_high={adaptive_hall_hardness_high}"
+        )
+    if adaptive_target_enabled:
+        print(
+            "adaptive_goodness_target: "
+            f"warmup={adaptive_target_warmup}, alpha={adaptive_target_alpha}, "
+            f"range=[{adaptive_target_min}, {adaptive_target_max}]"
         )
     print(
         "auto_tune_batch: "
@@ -517,6 +631,7 @@ def main() -> int:
                     dates=dates,
                     horizon=risk_horizon,
                     standardize=risk_standardize,
+                    cache_dir=str(risk_cache_dir) if risk_cache_dir else None,
                 )
             except Exception as exc:
                 print(f"risk_head disabled: {exc}")
@@ -548,8 +663,8 @@ def main() -> int:
 
     hall_cfg = _hall_cfg_for_epoch(hall_curr_start if hall_curr_enabled else 1)
 
-    if auto_tune and device.type == "mps":
-        print("Auto-tuning batch size for MPS...")
+    if auto_tune and device.type in ("cuda", "mps"):
+        print(f"Auto-tuning batch size for {device.type.upper()}...")
         test_bs = batch_size
         best_bs = None
         while test_bs <= auto_tune_max:
@@ -579,11 +694,7 @@ def main() -> int:
                     break
                 raise
             finally:
-                if device.type == "mps":
-                    try:
-                        torch.mps.empty_cache()
-                    except Exception:
-                        pass
+                empty_device_cache(device)
 
         if best_bs is None:
             test_bs = max(auto_tune_min, int(batch_size / auto_tune_factor))
@@ -598,13 +709,13 @@ def main() -> int:
                         loader_workers,
                         neg_mode,
                         noise_std,
-                    goodness_target,
-                    goodness_temp,
-                    hall_cfg,
-                    returns_len,
-                    summary_dim,
-                    ff_multiscale,
-                )
+                        goodness_target,
+                        goodness_temp,
+                        hall_cfg,
+                        returns_len,
+                        summary_dim,
+                        ff_multiscale,
+                    )
                     best_bs = test_bs
                     break
                 except RuntimeError as exc:
@@ -613,11 +724,7 @@ def main() -> int:
                         continue
                     raise
                 finally:
-                    if device.type == "mps":
-                        try:
-                            torch.mps.empty_cache()
-                        except Exception:
-                            pass
+                    empty_device_cache(device)
 
         if best_bs is not None and best_bs != batch_size:
             print(f"Auto-tune selected batch_size={best_bs}")
@@ -647,7 +754,9 @@ def main() -> int:
         with log_path.open("w") as f:
             f.write(
                 "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
-                "energy_penalty,risk_loss\n"
+                "hall_close_ratio,energy_penalty,risk_loss,goodness_target_used,"
+                "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
+                "hall_node_fraction_used\n"
             )
 
     epoch_iter = tqdm(
@@ -659,6 +768,9 @@ def main() -> int:
     )
     for epoch in epoch_iter:
         model.train()
+        epoch_goodness_target = float(goodness_target)
+        epoch_neg_mix_end = float(neg_mix_end)
+        epoch_neg_gate_margin = float(neg_gate_margin)
         hall_cfg = _hall_cfg_for_epoch(epoch)
         hall_cfg_layer = _hall_cfg_for_epoch(
             epoch,
@@ -666,6 +778,9 @@ def main() -> int:
             mean_override=layerwise_hall_mean,
             std_override=layerwise_hall_std,
         )
+        epoch_hall_lr = float(hall_cfg.lr)
+        epoch_hall_steps = int(hall_cfg.steps)
+        epoch_hall_node_fraction = float(hall_cfg.node_fraction)
         total_loss = 0.0
         total_pos = 0.0
         total_neg = 0.0
@@ -677,6 +792,8 @@ def main() -> int:
         hall_used = 0
         total_used = 0
         hall_gated = 0
+        hall_close_count = 0
+        hall_close_total = 0
         hall_hardness_sum = 0.0
         hall_hardness_count = 0
 
@@ -720,6 +837,21 @@ def main() -> int:
                         hall_cfg,
                         edge_weight=edge_weight,
                     )
+                    if hall_min_delta and hall_min_delta > 0:
+                        delta = (
+                            x_neg_hall[:, :returns_len] - x[:, :returns_len]
+                        ).abs().mean()
+                        hall_close_total += 1
+                        if float(delta) < hall_min_delta:
+                            hall_close_count += 1
+                            x_neg_hall = make_negative(
+                                x,
+                                batch.batch,
+                                mode="shuffle+noise",
+                                noise_std=max(float(noise_std), float(hall_fallback_noise)),
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
                     hall_used += 1
                 else:
                     x_neg_hall = make_negative(
@@ -849,7 +981,7 @@ def main() -> int:
                 for li in range(len(model.layers)):
                     layer_mode = use_mode
                     if use_mode == "hallucinate" and li > 0:
-                        layer_mode = "hallucinate"
+                        layer_mode = "shuffle"
                     h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
                     g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
@@ -868,6 +1000,21 @@ def main() -> int:
                             edge_weight=edge_weight,
                             forward_fn=forward_fn,
                         )
+                        if hall_min_delta and hall_min_delta > 0:
+                            delta = (
+                                x_neg[:, :returns_len] - x_in[:, :returns_len]
+                            ).abs().mean()
+                            hall_close_total += 1
+                            if float(delta) < hall_min_delta:
+                                hall_close_count += 1
+                                x_neg = make_negative(
+                                    x_in,
+                                    batch.batch,
+                                    mode="shuffle+noise",
+                                    noise_std=max(float(layerwise_noise_std), float(hall_fallback_noise)),
+                                    window_len=returns_len,
+                                    summary_dim=summary_dim,
+                                )
                         hall_used += 1
                     else:
                         x_neg = make_negative(
@@ -935,6 +1082,19 @@ def main() -> int:
                         hall_cfg,
                         edge_weight=edge_weight,
                     )
+                    if hall_min_delta and hall_min_delta > 0:
+                        delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
+                        hall_close_total += 1
+                        if float(delta) < hall_min_delta:
+                            hall_close_count += 1
+                            x_neg = make_negative(
+                                x,
+                                batch.batch,
+                                mode="shuffle+noise",
+                                noise_std=max(float(noise_std), float(hall_fallback_noise)),
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
                     hall_used += 1
                 else:
                     x_neg = make_negative(
@@ -1006,26 +1166,118 @@ def main() -> int:
                 if hall_active:
                     hall_hardness_sum += (g_neg.mean().item() - g_pos.mean().item())
                     hall_hardness_count += 1
-                energy_penalty_sum += float(energy_penalty_val) if energy_penalty_weight > 0 else 0.0
+                if energy_penalty_weight > 0:
+                    energy_penalty_sum += float(energy_penalty_val.detach())
                 if risk_loss_val is not None and risk_loss_val != 0.0:
-                    risk_loss_sum += float(risk_loss_val)
+                    risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
             batches += 1
 
         hall_ratio = hall_used / total_used if total_used else 0.0
         gate_ratio = hall_gated / total_used if total_used else 0.0
+        hall_close_ratio = hall_close_count / hall_close_total if hall_close_total else 0.0
         hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
         energy_penalty_epoch = energy_penalty_sum / batches if batches else 0.0
         risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
-        # Progress bar only; metrics are saved to CSV/plots.
+        epoch_loss = total_loss / batches if batches else 0.0
+        epoch_pos = total_pos / batches if batches else 0.0
+        epoch_neg = total_neg / batches if batches else 0.0
+
+        target_updated = False
+        if adaptive_target_enabled and batches and epoch >= adaptive_target_warmup:
+            midpoint = 0.5 * (epoch_pos + epoch_neg) + adaptive_target_margin
+            new_target = _clamp(
+                (1.0 - adaptive_target_alpha) * goodness_target
+                + adaptive_target_alpha * midpoint,
+                adaptive_target_min,
+                adaptive_target_max,
+            )
+            if abs(new_target - goodness_target) > 1e-8:
+                goodness_target = new_target
+                target_updated = True
+
+        adapt_event = ""
+        if (
+            adaptive_hall_enabled
+            and hall_used > 0
+            and neg_mode in ("hallucinate", "schedule", "mix")
+        ):
+            needs_harder = (
+                hall_close_ratio >= adaptive_hall_close_high
+                or hall_hardness <= adaptive_hall_hardness_low
+            )
+            too_hard = (
+                hall_close_ratio < adaptive_hall_close_high
+                and hall_hardness >= adaptive_hall_hardness_high
+            )
+
+            if needs_harder:
+                hall_steps = int(_clamp(float(hall_steps + adaptive_hall_steps_inc), 1.0, float(adaptive_hall_steps_max)))
+                hall_lr = _clamp(hall_lr * adaptive_hall_lr_mult, 1e-4, adaptive_hall_lr_max)
+                hall_mean = _clamp(hall_mean * adaptive_hall_reg_mult, adaptive_hall_reg_min, 5.0)
+                hall_std = _clamp(hall_std * adaptive_hall_reg_mult, adaptive_hall_reg_min, 5.0)
+                hall_corr = _clamp(hall_corr * adaptive_hall_reg_mult, adaptive_hall_reg_min, 5.0)
+                hall_node_fraction = _clamp(hall_node_fraction + adaptive_hall_node_inc, 0.0, 1.0)
+                if hall_min_delta > 0:
+                    hall_min_delta = _clamp(
+                        hall_min_delta * adaptive_hall_min_delta_mult,
+                        adaptive_hall_min_delta_min,
+                        hall_min_delta,
+                    )
+                neg_gate_margin = _clamp(
+                    neg_gate_margin - adaptive_gate_margin_step,
+                    adaptive_gate_margin_min,
+                    adaptive_gate_margin_max,
+                )
+                if neg_mode == "mix":
+                    neg_mix_end = _clamp(neg_mix_end + adaptive_mix_step, neg_mix_start, 0.98)
+                _sync_hall_curriculum_end()
+                adapt_event = "harder_neg"
+            elif too_hard:
+                hall_lr = _clamp(hall_lr / max(adaptive_hall_lr_mult, 1e-6), 1e-4, adaptive_hall_lr_max)
+                hall_mean = _clamp(
+                    hall_mean / max(adaptive_hall_reg_mult, 1e-6),
+                    adaptive_hall_reg_min,
+                    5.0,
+                )
+                hall_std = _clamp(
+                    hall_std / max(adaptive_hall_reg_mult, 1e-6),
+                    adaptive_hall_reg_min,
+                    5.0,
+                )
+                hall_corr = _clamp(
+                    hall_corr / max(adaptive_hall_reg_mult, 1e-6),
+                    adaptive_hall_reg_min,
+                    5.0,
+                )
+                hall_node_fraction = _clamp(hall_node_fraction - adaptive_hall_node_inc, 0.0, 1.0)
+                neg_gate_margin = _clamp(
+                    neg_gate_margin + adaptive_gate_margin_step,
+                    adaptive_gate_margin_min,
+                    adaptive_gate_margin_max,
+                )
+                if neg_mode == "mix":
+                    neg_mix_end = _clamp(neg_mix_end - adaptive_mix_step, neg_mix_start, 0.98)
+                _sync_hall_curriculum_end()
+                adapt_event = "easier_neg"
+
+        if adapt_event or target_updated:
+            print(
+                f"epoch {epoch}: adapt={adapt_event or 'target_only'} "
+                f"target={goodness_target:.3f} mix_end={neg_mix_end:.3f} "
+                f"gate_margin={neg_gate_margin:.3f} hall_steps={hall_steps} "
+                f"hall_lr={hall_lr:.4f} hall_node_fraction={hall_node_fraction:.2f}"
+            )
 
         if log_csv:
             with Path(log_csv).open("a") as f:
                 f.write(
-                    f"{epoch},{total_loss / batches:.6f},"
-                    f"{total_pos / batches:.6f},{total_neg / batches:.6f},"
+                    f"{epoch},{epoch_loss:.6f},"
+                    f"{epoch_pos:.6f},{epoch_neg:.6f},"
                     f"{hall_ratio:.4f},{gate_ratio:.4f},{hall_hardness:.6f},"
-                    f"{energy_penalty_epoch:.6f},{risk_loss_epoch:.6f}\n"
+                    f"{hall_close_ratio:.4f},{energy_penalty_epoch:.6f},{risk_loss_epoch:.6f},"
+                    f"{epoch_goodness_target:.6f},{epoch_neg_mix_end:.6f},{epoch_neg_gate_margin:.6f},"
+                    f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f}\n"
                 )
 
     if save_model:
@@ -1053,6 +1305,10 @@ def main() -> int:
                 plt.plot(df["epoch"], df["energy_penalty"], label="energy_penalty")
             if "risk_loss" in df.columns:
                 plt.plot(df["epoch"], df["risk_loss"], label="risk_loss")
+            if "goodness_target_used" in df.columns:
+                plt.plot(df["epoch"], df["goodness_target_used"], label="goodness_target")
+            if "neg_mix_end_used" in df.columns:
+                plt.plot(df["epoch"], df["neg_mix_end_used"], label="neg_mix_end")
             plt.xlabel("Epoch")
             plt.ylabel("Value")
             plt.legend()

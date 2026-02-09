@@ -19,9 +19,11 @@ sys.path.append(str(ROOT / "src"))
 
 from frisk.models import GCNEncoder
 from frisk.ff import goodness, make_negative, ff_loss
+from frisk.device import resolve_device, sync_device
 
 _THREAD_STATE = {"threads": None, "interop": None}
 _THREAD_WARNED = False
+_GRAPH_CACHE: dict[str, list] = {}
 
 
 def _maybe_set_torch_threads(threads: int | None, interop: int | None) -> None:
@@ -72,6 +74,20 @@ def _load_config(path: str) -> dict:
         return tomllib.load(f)
 
 
+def _load_graphs_cached(graphs_path: str):
+    key = str(Path(graphs_path).resolve())
+    graphs = _GRAPH_CACHE.get(key)
+    if graphs is not None:
+        return graphs
+    try:
+        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(Path(graphs_path), map_location="cpu")
+    graphs = payload["graphs"]
+    _GRAPH_CACHE[key] = graphs
+    return graphs
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -79,22 +95,11 @@ def _set_seed(seed: int) -> None:
 
 
 def _choose_device(device: str) -> torch.device:
-    if device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available")
-        return torch.device("cuda")
-    if device == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS requested but not available")
-        return torch.device("mps")
-    return torch.device("cpu")
+    return resolve_device(device)
 
 
 def _sync(device: torch.device) -> None:
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    if device.type == "mps" and torch.backends.mps.is_available():
-        torch.mps.synchronize()
+    sync_device(device)
 
 
 def _trial_worker(args):
@@ -112,11 +117,7 @@ def _trial_worker(args):
     _maybe_set_torch_threads(worker_threads, worker_interop_threads)
     _set_seed(seed)
     device = _choose_device(device_str)
-    try:
-        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(Path(graphs_path), map_location="cpu")
-    graphs = payload["graphs"]
+    graphs = _load_graphs_cached(graphs_path)
     if sample_graphs and sample_graphs < len(graphs):
         graphs = graphs[:sample_graphs]
 

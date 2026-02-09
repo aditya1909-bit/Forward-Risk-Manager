@@ -20,6 +20,7 @@ class HallucinationConfig:
     goodness_temp: float = 1.0
     node_fraction: float = 1.0
     node_min: int = 1
+    init_noise: float = 0.0
 
 
 def _edge_corr_loss(
@@ -69,11 +70,13 @@ def hallucinate_negative(
         model.eval()
 
         x0 = x.detach()
-        x_var = x0.clone().requires_grad_(True)
-        opt = torch.optim.Adam([x_var], lr=config.lr)
-
         mean0 = x0.mean()
         std0 = x0.std() + 1e-6
+        x_var = x0.clone()
+        if config.init_noise and config.init_noise > 0:
+            x_var = x_var + torch.randn_like(x0) * (config.init_noise * std0)
+        x_var = x_var.detach().requires_grad_(True)
+        opt = torch.optim.Adam([x_var], lr=config.lr)
         if config.clamp_std is not None:
             clamp_min = mean0 - config.clamp_std * std0
             clamp_max = mean0 + config.clamp_std * std0
