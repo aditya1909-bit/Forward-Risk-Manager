@@ -100,6 +100,13 @@ Set `neg_mode = "hallucinate"` in `configs/default.toml` to enable gradient-asce
 - Edge-correlation alignment
 
 Tune the `hallucinate_*` fields in the config to control steps, learning rate, and penalty weights.
+Recommended realism settings (especially for `window_plus_summary_fund`):
+```
+hallucinate_penalty_scope = "returns"
+hallucinate_corr_scope = "returns"
+hallucinate_freeze_non_return_features = true
+```
+These keep optimization focused on return-window channels while holding summary/fundamental channels fixed.
 
 Temporal negatives are also supported:
 ```
@@ -288,7 +295,7 @@ python scripts/plot_hallucination_diagnostics.py --csv reports/hallucination_win
 
 Calibrate hallucinations (KL/JS + tail ratios):
 ```bash
-python scripts/hallucination_calibration.py --csv reports/hallucination_window_all.csv
+python scripts/hallucination_calibration.py --csv reports/scenario_book.csv
 ```
 
 ## Scenario Book + Stress Test Report
@@ -348,7 +355,7 @@ If your raw exports are split into year buckets under `data/raw/`, merge + clean
 python scripts/merge_raw_years.py --raw-root data/raw --out-dir data/raw_merged
 ```
 
-These exports are already tidy (date/ticker columns), so you can use `data/raw_merged` directly.
+The merge script now resolves duplicate `(date,ticker)` price rows by selecting the smoothest per-ticker path across overlapping yearly exports, then deduplicates all merged tables by key.
 
 Build graphs in two modes:
 

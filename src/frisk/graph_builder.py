@@ -126,10 +126,10 @@ def _compute_summary_features(
     momentum = np.nansum(rets, axis=1)
 
     if window_volume is not None:
-        vols = window_volume.to_numpy().T
-        last = vols[:, -1]
+        vols = window_volume.to_numpy(dtype=float).T
+        last = vols[:, -1].astype(float, copy=False)
         mean = np.nanmean(vols, axis=1)
-        vol_shock = np.divide(last, mean, out=np.ones_like(last), where=mean > 0)
+        vol_shock = np.divide(last, mean, out=np.ones(last.shape, dtype=float), where=mean > 0)
     else:
         vol_shock = np.ones(n)
 
@@ -213,7 +213,7 @@ def _build_node_features(
 
     ret_mean = None
     ret_std = None
-    if normalize and feature_mode in ("window", "window_plus_summary"):
+    if normalize and feature_mode in ("window", "window_plus_summary", "window_plus_summary_fund"):
         ret_mean = np.nanmean(values, axis=1, keepdims=True)
         ret_std = np.nanstd(values, axis=1, keepdims=True) + 1e-8
         values = (values - ret_mean) / ret_std

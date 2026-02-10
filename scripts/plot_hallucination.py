@@ -121,6 +121,12 @@ def main() -> int:
         corr_weight=float(train_cfg.get("hallucinate_corr", 0.2)),
         clamp_std=float(train_cfg.get("hallucinate_clamp_std", 3.0)),
         goodness_temp=float(train_cfg.get("goodness_temp", 1.0)),
+        return_slice_len=returns_len,
+        penalty_scope=str(train_cfg.get("hallucinate_penalty_scope", "returns")),
+        corr_scope=str(train_cfg.get("hallucinate_corr_scope", "returns")),
+        freeze_non_return_features=bool(
+            train_cfg.get("hallucinate_freeze_non_return_features", True)
+        ),
     )
 
     x_neg = hallucinate_negative(

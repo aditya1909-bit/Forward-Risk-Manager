@@ -13,11 +13,27 @@ def _load_pairs(path: Path):
     data = {}
     with path.open() as f:
         r = csv.DictReader(f)
+        if not r.fieldnames:
+            raise ValueError("CSV missing header.")
+        if "t" in r.fieldnames:
+            id_col = "t"
+        elif "scenario_id" in r.fieldnames:
+            id_col = "scenario_id"
+        elif "graph_index" in r.fieldnames:
+            id_col = "graph_index"
+        else:
+            raise ValueError("CSV must include one of: t, scenario_id, graph_index")
+
+        ret_cols = [c for c in r.fieldnames if c.startswith("r")]
+        ret_cols = sorted(ret_cols, key=lambda c: int(c[1:]))
+        if not ret_cols:
+            raise ValueError("CSV missing return columns (r0, r1, ...)")
+
         for row in r:
             ticker = row["ticker"]
             series = row["series"]
-            t = int(row["t"])
-            vals = np.array([float(row[f"r{i}"]) for i in range(20)])
+            t = int(row[id_col])
+            vals = np.array([float(row[c]) for c in ret_cols], dtype=float)
             data[(ticker, t, series)] = vals
 
     real_vals = []
@@ -51,7 +67,7 @@ def _kl_js(real, hall, bins=60, eps=1e-8):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calibrate hallucinations vs real distributions.")
-    parser.add_argument("--csv", default="reports/hallucination_window_all.csv", help="Input CSV")
+    parser.add_argument("--csv", default="reports/scenario_book.csv", help="Input CSV")
     parser.add_argument("--out", default="reports/hallucination_calibration.json", help="Output JSON")
     parser.add_argument("--bins", type=int, default=60)
     args = parser.parse_args()

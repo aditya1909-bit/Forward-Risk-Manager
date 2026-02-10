@@ -43,7 +43,7 @@ def _var_cvar(x: np.ndarray, alpha: float = 0.95):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate stress test report from hallucination windows.")
-    parser.add_argument("--csv", default="reports/hallucination_window_all.csv", help="Input CSV")
+    parser.add_argument("--csv", default="reports/scenario_book.csv", help="Input CSV")
     parser.add_argument("--out-csv", default="reports/stress_test_report.csv", help="Output CSV")
     parser.add_argument("--out-plot", default="reports/stress_test_report.png", help="Output PNG")
     args = parser.parse_args()

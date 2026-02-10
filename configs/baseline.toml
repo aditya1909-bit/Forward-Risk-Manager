@@ -72,6 +72,12 @@ hallucinate_corr = 0.15
 hallucinate_clamp_std = 3.0
 hallucinate_node_fraction = 0.5
 hallucinate_node_min = 20
+hallucinate_penalty_scope = "returns"
+hallucinate_corr_scope = "returns"
+hallucinate_freeze_non_return_features = true
+risk_max_abs_logret = 0.5
+adaptive_hall_ratio_high = 0.8
+adaptive_mix_end_max = 0.85
 
 [benchmark]
 epochs = 5

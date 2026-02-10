@@ -327,6 +327,10 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         goodness_temp=cfg["goodness_temp"],
         node_fraction=cfg["hall_node_fraction"],
         node_min=cfg["hall_node_min"],
+        return_slice_len=int(cfg.get("window_len", 0)),
+        penalty_scope=str(cfg.get("hall_penalty_scope", "returns")),
+        corr_scope=str(cfg.get("hall_corr_scope", "returns")),
+        freeze_non_return_features=bool(cfg.get("hall_freeze_non_return", True)),
     )
     hall_cfg_layer = HallucinationConfig(
         steps=cfg["hall_steps"],
@@ -339,6 +343,10 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         goodness_temp=cfg["goodness_temp"],
         node_fraction=cfg["hall_node_fraction"],
         node_min=cfg["hall_node_min"],
+        return_slice_len=int(cfg.get("window_len", 0)),
+        penalty_scope=str(cfg.get("hall_penalty_scope", "returns")),
+        corr_scope=str(cfg.get("hall_corr_scope", "returns")),
+        freeze_non_return_features=bool(cfg.get("hall_freeze_non_return", True)),
     )
 
     epoch_times = []
@@ -575,6 +583,11 @@ def main() -> int:
         "hall_clamp": float(train_cfg.get("hallucinate_clamp_std", 3.0)),
         "hall_node_fraction": float(train_cfg.get("hallucinate_node_fraction", 0.5)),
         "hall_node_min": int(train_cfg.get("hallucinate_node_min", 20)),
+        "hall_penalty_scope": str(train_cfg.get("hallucinate_penalty_scope", "returns")),
+        "hall_corr_scope": str(train_cfg.get("hallucinate_corr_scope", "returns")),
+        "hall_freeze_non_return": bool(
+            train_cfg.get("hallucinate_freeze_non_return_features", True)
+        ),
         "neg_gate_margin": float(train_cfg.get("neg_gate_margin", 1.0)),
         "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "shuffle")),
         "timing_warmup_epochs": int(sweep_cfg.get("timing_warmup_epochs", 1)),

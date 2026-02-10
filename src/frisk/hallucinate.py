@@ -21,15 +21,22 @@ class HallucinationConfig:
     node_fraction: float = 1.0
     node_min: int = 1
     init_noise: float = 0.0
+    return_slice_len: int = 0
+    penalty_scope: str = "returns"  # "returns" or "all"
+    corr_scope: str = "returns"  # "returns" or "all"
+    freeze_non_return_features: bool = True
 
 
 def _edge_corr_loss(
     x: torch.Tensor,
     edge_index: torch.Tensor,
     edge_attr: Optional[torch.Tensor],
+    return_slice_len: int = 0,
 ) -> torch.Tensor:
     if edge_attr is None:
         return torch.tensor(0.0, device=x.device)
+    if return_slice_len and return_slice_len > 0 and x.size(1) >= return_slice_len:
+        x = x[:, :return_slice_len]
     if edge_attr.ndim == 2 and edge_attr.shape[1] == 1:
         w = edge_attr.squeeze(1)
     else:
@@ -70,8 +77,25 @@ def hallucinate_negative(
         model.eval()
 
         x0 = x.detach()
-        mean0 = x0.mean()
-        std0 = x0.std() + 1e-6
+        return_slice_len = int(config.return_slice_len)
+        use_return_scope = (
+            return_slice_len > 0
+            and x0.size(1) >= return_slice_len
+            and str(config.penalty_scope).strip().lower() == "returns"
+        )
+        use_corr_return_scope = (
+            return_slice_len > 0
+            and x0.size(1) >= return_slice_len
+            and str(config.corr_scope).strip().lower() == "returns"
+        )
+
+        if use_return_scope:
+            x0_scope = x0[:, :return_slice_len]
+        else:
+            x0_scope = x0
+
+        mean0 = x0_scope.mean()
+        std0 = x0_scope.std() + 1e-6
         x_var = x0.clone()
         if config.init_noise and config.init_noise > 0:
             x_var = x_var + torch.randn_like(x0) * (config.init_noise * std0)
@@ -103,10 +127,20 @@ def hallucinate_negative(
                 h = model(x_var, edge_index, edge_weight=edge_weight)
             g = goodness(h, batch, temperature=config.goodness_temp).mean()
 
-            l2 = (x_var - x0).pow(2).mean()
-            mean_pen = (x_var.mean() - mean0).pow(2)
-            std_pen = (x_var.std() - std0).pow(2)
-            corr_pen = _edge_corr_loss(x_var, edge_index, edge_attr)
+            if use_return_scope:
+                x_var_scope = x_var[:, :return_slice_len]
+            else:
+                x_var_scope = x_var
+
+            l2 = (x_var_scope - x0_scope).pow(2).mean()
+            mean_pen = (x_var_scope.mean() - mean0).pow(2)
+            std_pen = (x_var_scope.std() - std0).pow(2)
+            corr_pen = _edge_corr_loss(
+                x_var,
+                edge_index,
+                edge_attr,
+                return_slice_len=return_slice_len if use_corr_return_scope else 0,
+            )
 
             loss = (
                 -g
@@ -126,8 +160,15 @@ def hallucinate_negative(
                 with torch.no_grad():
                     x_var.data = torch.where(mask, x_var.data, x0)
 
+            if use_return_scope and config.freeze_non_return_features and x_var.size(1) > return_slice_len:
+                with torch.no_grad():
+                    x_var.data[:, return_slice_len:] = x0[:, return_slice_len:]
+
             if config.clamp_std is not None:
-                x_var.data.clamp_(clamp_min, clamp_max)
+                if use_return_scope:
+                    x_var.data[:, :return_slice_len].clamp_(clamp_min, clamp_max)
+                else:
+                    x_var.data.clamp_(clamp_min, clamp_max)
 
         return x_var.detach()
     finally:

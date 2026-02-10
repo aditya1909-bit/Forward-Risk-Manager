@@ -60,8 +60,10 @@ def test_build_node_features_window_plus_summary_fund():
     )
     # window_len=4, summary=5, fund=5 => 14 features
     assert x.shape == (3, 14)
-    assert ret_mean is None
-    assert ret_std is None
+    assert ret_mean is not None
+    assert ret_std is not None
+    assert ret_mean.shape == (3, 1)
+    assert ret_std.shape == (3, 1)
 
 
 def test_build_rolling_corr_graphs_basic():

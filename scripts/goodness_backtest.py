@@ -35,6 +35,12 @@ def main() -> int:
     parser.add_argument("--prices", default="", help="Override prices.csv path")
     parser.add_argument("--ticker", default="MDY", help="Benchmark ticker (e.g., MDY)")
     parser.add_argument("--horizons", default="5,21", help="Comma-separated horizons (days)")
+    parser.add_argument(
+        "--max-abs-logret",
+        type=float,
+        default=0.5,
+        help="Drop benchmark log-returns with abs(value) above this threshold (<=0 disables).",
+    )
     parser.add_argument("--out-csv", default="reports/goodness_backtest.csv", help="Output CSV")
     parser.add_argument("--out-quantiles", default="reports/goodness_quantiles.csv", help="Quantile CSV")
     parser.add_argument("--out-plot", default="reports/goodness_scatter.png", help="Scatter plot")
@@ -81,9 +87,13 @@ def main() -> int:
 
     price_col = "adj_close" if "adj_close" in prices.columns else "close"
     px = prices.set_index("date")[price_col].astype(float)
+    px = px.replace([np.inf, -np.inf], np.nan).dropna()
+    px = px[px > 0]
+    if px.index.has_duplicates:
+        px = px.groupby(level=0).median()
     logret = np.log(px).diff().dropna()
-    if logret.index.has_duplicates:
-        logret = logret[~logret.index.duplicated(keep="last")]
+    if args.max_abs_logret and args.max_abs_logret > 0:
+        logret = logret[np.abs(logret) <= float(args.max_abs_logret)]
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
     records = []

@@ -320,6 +320,10 @@ def _benchmark_ff(
         goodness_temp=config["goodness_temp"],
         node_fraction=config["hall_node_fraction"],
         node_min=config["hall_node_min"],
+        return_slice_len=int(config.get("window_len", 0)),
+        penalty_scope=str(config.get("hall_penalty_scope", "returns")),
+        corr_scope=str(config.get("hall_corr_scope", "returns")),
+        freeze_non_return_features=bool(config.get("hall_freeze_non_return", True)),
     )
 
     epoch_times = []
@@ -714,6 +718,11 @@ def main() -> int:
         "hall_clamp": float(train_cfg.get("hallucinate_clamp_std", 3.0)),
         "hall_node_fraction": float(train_cfg.get("hallucinate_node_fraction", 0.5)),
         "hall_node_min": int(train_cfg.get("hallucinate_node_min", 20)),
+        "hall_penalty_scope": str(train_cfg.get("hallucinate_penalty_scope", "returns")),
+        "hall_corr_scope": str(train_cfg.get("hallucinate_corr_scope", "returns")),
+        "hall_freeze_non_return": bool(
+            train_cfg.get("hallucinate_freeze_non_return_features", True)
+        ),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
         "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),

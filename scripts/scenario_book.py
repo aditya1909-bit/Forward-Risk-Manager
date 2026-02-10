@@ -488,6 +488,12 @@ def main() -> int:
         init_noise=float(args.hall_init_noise)
         if args.hall_init_noise is not None
         else float(train_cfg.get("hallucinate_init_noise", 0.0)),
+        return_slice_len=returns_len,
+        penalty_scope=str(train_cfg.get("hallucinate_penalty_scope", "returns")),
+        corr_scope=str(train_cfg.get("hallucinate_corr_scope", "returns")),
+        freeze_non_return_features=bool(
+            train_cfg.get("hallucinate_freeze_non_return_features", True)
+        ),
     )
 
     out = Path(args.out)

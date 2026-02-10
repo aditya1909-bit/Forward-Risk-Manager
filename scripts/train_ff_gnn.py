@@ -75,6 +75,7 @@ def _compute_risk_targets(
     dates: list[str],
     horizon: int,
     standardize: bool,
+    max_abs_logret: float,
     cache_dir: str | None = "runs/cache",
 ) -> tuple[list[float | None], float, float]:
     prices_file = Path(prices_path)
@@ -91,6 +92,7 @@ def _compute_risk_targets(
                 str(ticker).upper(),
                 str(horizon),
                 str(int(bool(standardize))),
+                f"{float(max_abs_logret):.8f}",
                 file_sig,
                 dates_hash,
             ]
@@ -116,14 +118,15 @@ def _compute_risk_targets(
             except Exception:
                 pass
 
-    prices: list[tuple[str, float]] = []
+    prices_by_date: dict[str, list[float]] = {}
+    ticker_norm = str(ticker).upper()
     with Path(prices_path).open() as f:
         r = csv.DictReader(f)
         if not r.fieldnames:
             raise ValueError("prices.csv missing header")
         price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
         for row in r:
-            if row.get("ticker") != ticker:
+            if str(row.get("ticker", "")).upper() != ticker_norm:
                 continue
             date = row.get("date")
             if not date:
@@ -135,18 +138,36 @@ def _compute_risk_targets(
                 price = float(val)
             except ValueError:
                 continue
-            prices.append((date, price))
+            if not math.isfinite(price) or price <= 0:
+                continue
+            prices_by_date.setdefault(date, []).append(price)
+    prices: list[tuple[str, float]] = []
+    for date, vals in prices_by_date.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        mid = len(vals_sorted) // 2
+        if len(vals_sorted) % 2 == 1:
+            px = vals_sorted[mid]
+        else:
+            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+        prices.append((date, float(px)))
     if not prices:
         raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
 
     prices.sort(key=lambda x: x[0])
     date_list = [d for d, _ in prices]
     price_list = [p for _, p in prices]
-    returns = [
-        math.log(price_list[i + 1] / price_list[i])
-        for i in range(len(price_list) - 1)
-        if price_list[i] > 0 and price_list[i + 1] > 0
-    ]
+    returns = []
+    clip = float(max_abs_logret)
+    for i in range(len(price_list) - 1):
+        if price_list[i] <= 0 or price_list[i + 1] <= 0:
+            returns.append(0.0)
+            continue
+        ret = math.log(price_list[i + 1] / price_list[i])
+        if clip > 0 and abs(ret) > clip:
+            ret = math.copysign(clip, ret)
+        returns.append(ret)
     idx_map = {d: i for i, d in enumerate(date_list)}
 
     targets: list[float | None] = []
@@ -396,6 +417,19 @@ def main() -> int:
     hall_init_noise = _get_setting(args, section, "hallucinate_init_noise", 0.0)
     hall_min_delta = _get_setting(args, section, "hallucinate_min_delta", 0.0)
     hall_fallback_noise = _get_setting(args, section, "hallucinate_fallback_noise", 1.0)
+    hall_penalty_scope = str(
+        _get_setting(args, section, "hallucinate_penalty_scope", "returns")
+    ).strip().lower()
+    hall_corr_scope = str(
+        _get_setting(args, section, "hallucinate_corr_scope", "returns")
+    ).strip().lower()
+    hall_freeze_non_return = _to_bool(
+        _get_setting(args, section, "hallucinate_freeze_non_return_features", True)
+    )
+    if hall_penalty_scope not in {"all", "returns"}:
+        hall_penalty_scope = "returns"
+    if hall_corr_scope not in {"all", "returns"}:
+        hall_corr_scope = "returns"
     hall_curriculum = section.get("hallucinate_curriculum", {})
     hall_curr_enabled = bool(hall_curriculum.get("enabled", False))
     hall_curr_start = int(hall_curriculum.get("start_epoch", 1))
@@ -441,6 +475,7 @@ def main() -> int:
     risk_loss_type = _get_setting(args, section, "risk_loss_type", "huber")
     risk_standardize = bool(_get_setting(args, section, "risk_standardize", True))
     risk_cache_dir = _get_setting(args, section, "risk_cache_dir", "runs/cache")
+    risk_max_abs_logret = float(_get_setting(args, section, "risk_max_abs_logret", 0.5))
 
     adaptive_hall_enabled = _to_bool(_get_setting(args, section, "adaptive_hallucination", True))
     adaptive_hall_close_high = float(_get_setting(args, section, "adaptive_hall_close_high", 0.75))
@@ -455,7 +490,9 @@ def main() -> int:
     adaptive_hall_reg_min = float(_get_setting(args, section, "adaptive_hall_reg_min", 0.001))
     adaptive_hall_min_delta_mult = float(_get_setting(args, section, "adaptive_hall_min_delta_mult", 0.9))
     adaptive_hall_min_delta_min = float(_get_setting(args, section, "adaptive_hall_min_delta_min", 0.005))
+    adaptive_hall_ratio_high = float(_get_setting(args, section, "adaptive_hall_ratio_high", 0.8))
     adaptive_mix_step = float(_get_setting(args, section, "adaptive_mix_step", 0.05))
+    adaptive_mix_end_max = float(_get_setting(args, section, "adaptive_mix_end_max", 0.85))
     adaptive_gate_margin_step = float(_get_setting(args, section, "adaptive_gate_margin_step", 0.05))
     adaptive_gate_margin_min = float(_get_setting(args, section, "adaptive_gate_margin_min", 0.1))
     adaptive_gate_margin_max = float(_get_setting(args, section, "adaptive_gate_margin_max", 2.5))
@@ -466,6 +503,9 @@ def main() -> int:
     adaptive_target_margin = float(_get_setting(args, section, "adaptive_goodness_target_margin", 0.0))
     adaptive_target_min = float(_get_setting(args, section, "adaptive_goodness_target_min", 0.1))
     adaptive_target_max = float(_get_setting(args, section, "adaptive_goodness_target_max", 10.0))
+    adaptive_mix_end_max = _clamp(adaptive_mix_end_max, 0.0, 0.99)
+    if neg_mode == "mix":
+        neg_mix_end = _clamp(float(neg_mix_end), float(neg_mix_start), adaptive_mix_end_max)
 
     def _hall_cfg_for_epoch(epoch: int, corr_override: float | None = None, mean_override: float | None = None, std_override: float | None = None) -> HallucinationConfig:
         if not hall_curr_enabled:
@@ -481,6 +521,10 @@ def main() -> int:
                 node_fraction=hall_node_fraction,
                 node_min=hall_node_min,
                 init_noise=hall_init_noise,
+                return_slice_len=returns_len,
+                penalty_scope=hall_penalty_scope,
+                corr_scope=hall_corr_scope,
+                freeze_non_return_features=hall_freeze_non_return,
             )
 
         if epoch < hall_curr_start:
@@ -520,6 +564,10 @@ def main() -> int:
             node_fraction=node_fraction,
             node_min=node_min,
             init_noise=hall_init_noise,
+            return_slice_len=returns_len,
+            penalty_scope=hall_penalty_scope,
+            corr_scope=hall_corr_scope,
+            freeze_non_return_features=hall_freeze_non_return,
         )
 
     set_seed(seed)
@@ -557,7 +605,8 @@ def main() -> int:
     if risk_head_enabled:
         print(
             f"risk_head: ticker={risk_ticker} horizon={risk_horizon} "
-            f"weight={risk_loss_weight} type={risk_loss_type} std={risk_standardize}"
+            f"weight={risk_loss_weight} type={risk_loss_type} std={risk_standardize} "
+            f"max_abs_logret={risk_max_abs_logret}"
         )
     if torch_num_threads or torch_num_interop_threads:
         print(
@@ -578,6 +627,11 @@ def main() -> int:
             f"node_fraction {frac_start}->{frac_end}"
         )
         _sync_hall_curriculum_end()
+    print(
+        "hallucination scope: "
+        f"penalty={hall_penalty_scope}, corr={hall_corr_scope}, "
+        f"freeze_non_return={hall_freeze_non_return}, return_slice_len={returns_len}"
+    )
     if neg_mode in ("schedule", "mix"):
         print(f"neg_warmup_epochs: {neg_warmup_epochs}")
     if neg_mode == "mix":
@@ -590,7 +644,9 @@ def main() -> int:
             "adaptive_hallucination: "
             f"close_high={adaptive_hall_close_high}, "
             f"hardness_low={adaptive_hall_hardness_low}, "
-            f"hardness_high={adaptive_hall_hardness_high}"
+            f"hardness_high={adaptive_hall_hardness_high}, "
+            f"ratio_high={adaptive_hall_ratio_high}, "
+            f"mix_end_max={adaptive_mix_end_max}"
         )
     if adaptive_target_enabled:
         print(
@@ -631,6 +687,7 @@ def main() -> int:
                     dates=dates,
                     horizon=risk_horizon,
                     standardize=risk_standardize,
+                    max_abs_logret=risk_max_abs_logret,
                     cache_dir=str(risk_cache_dir) if risk_cache_dir else None,
                 )
             except Exception as exc:
@@ -1202,6 +1259,7 @@ def main() -> int:
             and hall_used > 0
             and neg_mode in ("hallucinate", "schedule", "mix")
         ):
+            hall_overused = hall_ratio >= adaptive_hall_ratio_high
             needs_harder = (
                 hall_close_ratio >= adaptive_hall_close_high
                 or hall_hardness <= adaptive_hall_hardness_low
@@ -1211,7 +1269,26 @@ def main() -> int:
                 and hall_hardness >= adaptive_hall_hardness_high
             )
 
-            if needs_harder:
+            if hall_overused and hall_hardness <= adaptive_hall_hardness_low:
+                hall_node_fraction = _clamp(
+                    hall_node_fraction - adaptive_hall_node_inc,
+                    0.0,
+                    1.0,
+                )
+                neg_gate_margin = _clamp(
+                    neg_gate_margin + adaptive_gate_margin_step,
+                    adaptive_gate_margin_min,
+                    adaptive_gate_margin_max,
+                )
+                if neg_mode == "mix":
+                    neg_mix_end = _clamp(
+                        neg_mix_end - adaptive_mix_step,
+                        neg_mix_start,
+                        adaptive_mix_end_max,
+                    )
+                _sync_hall_curriculum_end()
+                adapt_event = "rebalance_mix"
+            elif needs_harder:
                 hall_steps = int(_clamp(float(hall_steps + adaptive_hall_steps_inc), 1.0, float(adaptive_hall_steps_max)))
                 hall_lr = _clamp(hall_lr * adaptive_hall_lr_mult, 1e-4, adaptive_hall_lr_max)
                 hall_mean = _clamp(hall_mean * adaptive_hall_reg_mult, adaptive_hall_reg_min, 5.0)
@@ -1230,7 +1307,11 @@ def main() -> int:
                     adaptive_gate_margin_max,
                 )
                 if neg_mode == "mix":
-                    neg_mix_end = _clamp(neg_mix_end + adaptive_mix_step, neg_mix_start, 0.98)
+                    neg_mix_end = _clamp(
+                        neg_mix_end + adaptive_mix_step,
+                        neg_mix_start,
+                        adaptive_mix_end_max,
+                    )
                 _sync_hall_curriculum_end()
                 adapt_event = "harder_neg"
             elif too_hard:
@@ -1257,7 +1338,11 @@ def main() -> int:
                     adaptive_gate_margin_max,
                 )
                 if neg_mode == "mix":
-                    neg_mix_end = _clamp(neg_mix_end - adaptive_mix_step, neg_mix_start, 0.98)
+                    neg_mix_end = _clamp(
+                        neg_mix_end - adaptive_mix_step,
+                        neg_mix_start,
+                        adaptive_mix_end_max,
+                    )
                 _sync_hall_curriculum_end()
                 adapt_event = "easier_neg"
 
