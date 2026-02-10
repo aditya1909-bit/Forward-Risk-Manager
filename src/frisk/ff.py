@@ -102,3 +102,95 @@ def ff_loss(
     loss_pos = F.softplus(target - g_pos)
     loss_neg = F.softplus(g_neg - target)
     return (loss_pos + loss_neg).mean()
+
+
+def permute_graph_embeddings(z: torch.Tensor) -> torch.Tensor:
+    if z.ndim != 2:
+        raise ValueError("Expected z to have shape [num_graphs, dim]")
+    n = z.size(0)
+    if n <= 1:
+        return z
+    base = torch.arange(n, device=z.device)
+    perm = base.clone()
+    # Try randomized derangements first; fall back to a deterministic roll.
+    for _ in range(8):
+        candidate = torch.randperm(n, device=z.device)
+        if not torch.any(candidate == base):
+            perm = candidate
+            break
+    else:
+        perm = torch.roll(base, shifts=1, dims=0)
+    return z.index_select(0, perm)
+
+
+def self_contrastive_loss(
+    z_a: torch.Tensor,
+    z_b: torch.Tensor,
+    temperature: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if z_a.ndim != 2 or z_b.ndim != 2:
+        raise ValueError("Expected z_a and z_b to have shape [num_graphs, dim]")
+    if z_a.shape != z_b.shape:
+        raise ValueError("z_a and z_b must have the same shape")
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if z_a.size(0) == 0:
+        zero = torch.zeros((), device=z_a.device, dtype=z_a.dtype)
+        return zero, zero, zero
+
+    z_a_n = F.normalize(z_a, p=2, dim=1)
+    z_b_n = F.normalize(z_b, p=2, dim=1)
+    logits_ab = (z_a_n @ z_b_n.T) / float(temperature)
+    labels = torch.arange(z_a_n.size(0), device=z_a.device, dtype=torch.long)
+    loss = 0.5 * (F.cross_entropy(logits_ab, labels) + F.cross_entropy(logits_ab.T, labels))
+
+    sim = z_a_n @ z_b_n.T
+    pos_sim = sim.diag().mean()
+    if sim.size(0) > 1:
+        mask = ~torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+        neg_sim = sim[mask].mean()
+    else:
+        neg_sim = torch.zeros((), device=sim.device, dtype=sim.dtype)
+    return loss, pos_sim, neg_sim
+
+
+def self_contrastive_retrieval_accuracy(
+    z_a: torch.Tensor,
+    z_b: torch.Tensor,
+) -> torch.Tensor:
+    if z_a.ndim != 2 or z_b.ndim != 2:
+        raise ValueError("Expected z_a and z_b to have shape [num_graphs, dim]")
+    if z_a.shape != z_b.shape:
+        raise ValueError("z_a and z_b must have the same shape")
+    if z_a.size(0) == 0:
+        return torch.zeros((), device=z_a.device, dtype=z_a.dtype)
+
+    z_a_n = F.normalize(z_a, p=2, dim=1)
+    z_b_n = F.normalize(z_b, p=2, dim=1)
+    sim = z_a_n @ z_b_n.T
+    labels = torch.arange(sim.size(0), device=sim.device, dtype=torch.long)
+    acc_ab = (sim.argmax(dim=1) == labels).float().mean()
+    acc_ba = (sim.argmax(dim=0) == labels).float().mean()
+    return 0.5 * (acc_ab + acc_ba)
+
+
+def pairwise_distance_forward_loss(
+    z_pos: torch.Tensor,
+    z_neg: torch.Tensor,
+    margin: float = 0.15,
+) -> torch.Tensor:
+    if z_pos.ndim != 2 or z_neg.ndim != 2:
+        raise ValueError("Expected z_pos and z_neg to have shape [num_graphs, dim]")
+    if z_pos.shape != z_neg.shape:
+        raise ValueError("z_pos and z_neg must have the same shape")
+    if z_pos.size(0) == 0:
+        return torch.zeros((), device=z_pos.device, dtype=z_pos.dtype)
+
+    d_neg = torch.norm(z_pos - z_neg, p=2, dim=1)
+    if z_pos.size(0) == 1:
+        return F.relu(float(margin) - d_neg).mean()
+
+    dist_pp = torch.cdist(z_pos, z_pos, p=2)
+    eye = torch.eye(dist_pp.size(0), dtype=torch.bool, device=dist_pp.device)
+    nearest_pos = dist_pp.masked_fill(eye, float("inf")).min(dim=1).values
+    return F.relu(float(margin) + nearest_pos - d_neg).mean()

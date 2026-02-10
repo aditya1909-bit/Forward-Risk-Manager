@@ -14,3 +14,4 @@ src/frisk/models.py
 tests/test_data.py
 tests/test_ff.py
 tests/test_graph_builder.py
+tests/test_hallucinate.py

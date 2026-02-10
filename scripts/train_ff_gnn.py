@@ -21,7 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import GCNEncoder
-from frisk.ff import goodness, make_negative, ff_loss
+from frisk.ff import (
+    ff_loss,
+    goodness,
+    make_negative,
+    pairwise_distance_forward_loss,
+    permute_graph_embeddings,
+    self_contrastive_loss,
+)
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
 
@@ -208,6 +215,22 @@ def _compute_risk_targets(
     return result
 
 
+def _self_contrastive_batch_loss(
+    h_pos: torch.Tensor,
+    h_view: torch.Tensor,
+    batch: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    z_pos = global_mean_pool(h_pos, batch)
+    z_view = global_mean_pool(h_view, batch)
+    loss, pos_score, neg_score = self_contrastive_loss(
+        z_pos,
+        z_view,
+        temperature=temperature,
+    )
+    return loss, pos_score, neg_score, z_pos, z_view
+
+
 def _try_batch_size(
     graphs,
     model,
@@ -222,6 +245,9 @@ def _try_batch_size(
     window_len: int | None,
     summary_dim: int,
     multiscale: bool,
+    self_contrastive_temp: float,
+    distance_forward_weight: float,
+    distance_forward_margin: float,
 ):
     loader = DataLoader(
         graphs,
@@ -236,68 +262,138 @@ def _try_batch_size(
     edge_weight = getattr(batch, "edge_weight", None)
     if multiscale:
         layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
-        if neg_mode == "hallucinate":
-            x_neg_hall = hallucinate_negative(
-                model,
-                x,
-                batch.edge_index,
-                getattr(batch, "edge_attr", None),
-                batch.batch,
-                hall_cfg,
-                edge_weight=edge_weight,
-            )
+        if neg_mode == "self_contrastive":
+            layers_view = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+            loss = 0.0
+            z_pos_last = None
+            z_neg_last = None
+            for h_pos, h_view in zip(layers_pos, layers_view):
+                sc_loss, _, _, z_pos, z_view = _self_contrastive_batch_loss(
+                    h_pos,
+                    h_view,
+                    batch.batch,
+                    temperature=self_contrastive_temp,
+                )
+                loss = loss + sc_loss
+                z_pos_last = z_pos
+                z_neg_last = permute_graph_embeddings(z_view)
+            loss = loss / max(1, len(layers_pos))
+            if (
+                distance_forward_weight > 0
+                and z_pos_last is not None
+                and z_neg_last is not None
+            ):
+                loss = loss + distance_forward_weight * pairwise_distance_forward_loss(
+                    z_pos_last,
+                    z_neg_last,
+                    margin=distance_forward_margin,
+                )
         else:
-            x_neg_hall = make_negative(
+            if neg_mode == "hallucinate":
+                x_neg_hall = hallucinate_negative(
+                    model,
+                    x,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    batch.batch,
+                    hall_cfg,
+                    edge_weight=edge_weight,
+                )
+            else:
+                x_neg_hall = make_negative(
+                    x,
+                    batch.batch,
+                    mode=neg_mode,
+                    noise_std=noise_std,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+            x_neg_time = make_negative(
                 x,
                 batch.batch,
-                mode=neg_mode,
+                mode="time_flip",
                 noise_std=noise_std,
                 window_len=window_len,
                 summary_dim=summary_dim,
             )
-        x_neg_time = make_negative(
-            x,
-            batch.batch,
-            mode="time_flip",
-            noise_std=noise_std,
-            window_len=window_len,
-            summary_dim=summary_dim,
-        )
-        layers_neg_h = model(x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True)
-        layers_neg_t = model(x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True)
-        loss = 0.0
-        for h_pos, h_neg_h, h_neg_t in zip(layers_pos, layers_neg_h, layers_neg_t):
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
-            g_neg_h = goodness(h_neg_h, batch.batch, temperature=goodness_temp)
-            g_neg_t = goodness(h_neg_t, batch.batch, temperature=goodness_temp)
-            loss = loss + ff_loss(g_pos, g_neg_h, target=goodness_target)
-            loss = loss + ff_loss(g_pos, g_neg_t, target=goodness_target)
-        loss = loss / max(1, len(layers_pos))
+            layers_neg_h = model(
+                x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
+            )
+            layers_neg_t = model(
+                x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
+            )
+            loss = 0.0
+            for h_pos, h_neg_h, h_neg_t in zip(layers_pos, layers_neg_h, layers_neg_t):
+                g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                g_neg_h = goodness(h_neg_h, batch.batch, temperature=goodness_temp)
+                g_neg_t = goodness(h_neg_t, batch.batch, temperature=goodness_temp)
+                loss = loss + ff_loss(g_pos, g_neg_h, target=goodness_target)
+                loss = loss + ff_loss(g_pos, g_neg_t, target=goodness_target)
+            loss = loss / max(1, len(layers_pos))
+            if distance_forward_weight > 0:
+                z_pos = global_mean_pool(layers_pos[-1], batch.batch)
+                z_neg_h = global_mean_pool(layers_neg_h[-1], batch.batch)
+                z_neg_t = global_mean_pool(layers_neg_t[-1], batch.batch)
+                dist_loss_h = pairwise_distance_forward_loss(
+                    z_pos,
+                    z_neg_h,
+                    margin=distance_forward_margin,
+                )
+                dist_loss_t = pairwise_distance_forward_loss(
+                    z_pos,
+                    z_neg_t,
+                    margin=distance_forward_margin,
+                )
+                loss = loss + distance_forward_weight * 0.5 * (dist_loss_h + dist_loss_t)
     else:
         h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-        g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
-        if neg_mode == "hallucinate":
-            x_neg = hallucinate_negative(
-                model,
-                x,
-                batch.edge_index,
-                getattr(batch, "edge_attr", None),
+        if neg_mode == "self_contrastive":
+            h_view = model(x, batch.edge_index, edge_weight=edge_weight)
+            loss, _, _, z_pos, z_view = _self_contrastive_batch_loss(
+                h_pos,
+                h_view,
                 batch.batch,
-                hall_cfg,
-                edge_weight=edge_weight,
+                temperature=self_contrastive_temp,
             )
+            if distance_forward_weight > 0:
+                z_neg = permute_graph_embeddings(z_view)
+                loss = loss + distance_forward_weight * pairwise_distance_forward_loss(
+                    z_pos,
+                    z_neg,
+                    margin=distance_forward_margin,
+                )
         else:
-            x_neg = make_negative(
-                x,
-                batch.batch,
-                mode=neg_mode,
-                noise_std=noise_std,
-                window_len=window_len,
-                summary_dim=summary_dim,
-            )
-        h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-        g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
-        loss = ff_loss(g_pos, g_neg, target=goodness_target)
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+            if neg_mode == "hallucinate":
+                x_neg = hallucinate_negative(
+                    model,
+                    x,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    batch.batch,
+                    hall_cfg,
+                    edge_weight=edge_weight,
+                )
+            else:
+                x_neg = make_negative(
+                    x,
+                    batch.batch,
+                    mode=neg_mode,
+                    noise_std=noise_std,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+            loss = ff_loss(g_pos, g_neg, target=goodness_target)
+            if distance_forward_weight > 0:
+                z_pos = global_mean_pool(h_pos, batch.batch)
+                z_neg = global_mean_pool(h_neg, batch.batch)
+                loss = loss + distance_forward_weight * pairwise_distance_forward_loss(
+                    z_pos,
+                    z_neg,
+                    margin=distance_forward_margin,
+                )
     loss.backward()
     model.zero_grad(set_to_none=True)
 
@@ -332,6 +428,7 @@ def main() -> int:
             "hallucinate",
             "schedule",
             "mix",
+            "self_contrastive",
         ],
         default=argparse.SUPPRESS,
     )
@@ -395,12 +492,18 @@ def main() -> int:
     neg_mix_ramp_epochs = _get_setting(args, section, "neg_mix_ramp_epochs", 10)
     neg_gate_margin = _get_setting(args, section, "neg_gate_margin", 0.1)
     grad_clip = _get_setting(args, section, "grad_clip", 1.0)
+    self_contrastive_temp = float(_get_setting(args, section, "self_contrastive_temp", 0.2))
+    distance_forward_weight = float(_get_setting(args, section, "distance_forward_weight", 0.0))
+    distance_forward_margin = float(_get_setting(args, section, "distance_forward_margin", 0.15))
     ff_layerwise = _get_setting(args, section, "ff_layerwise", False) or getattr(
         args, "ff_layerwise", False
     )
     ff_multiscale = _get_setting(args, section, "ff_multiscale", False) or getattr(
         args, "ff_multiscale", False
     )
+    if neg_mode == "self_contrastive" and ff_layerwise:
+        print("self_contrastive mode requires end-to-end FF; disabling ff_layerwise.")
+        ff_layerwise = False
     if ff_multiscale and ff_layerwise:
         print("ff_multiscale enabled; disabling ff_layerwise.")
         ff_layerwise = False
@@ -503,6 +606,12 @@ def main() -> int:
     adaptive_target_margin = float(_get_setting(args, section, "adaptive_goodness_target_margin", 0.0))
     adaptive_target_min = float(_get_setting(args, section, "adaptive_goodness_target_min", 0.1))
     adaptive_target_max = float(_get_setting(args, section, "adaptive_goodness_target_max", 10.0))
+    self_contrastive_temp = _clamp(self_contrastive_temp, 1e-4, 10.0)
+    distance_forward_weight = max(0.0, float(distance_forward_weight))
+    distance_forward_margin = max(0.0, float(distance_forward_margin))
+    if neg_mode == "self_contrastive" and adaptive_target_enabled:
+        print("adaptive_goodness_target disabled for self_contrastive mode.")
+        adaptive_target_enabled = False
     adaptive_mix_end_max = _clamp(adaptive_mix_end_max, 0.0, 0.99)
     if neg_mode == "mix":
         neg_mix_end = _clamp(float(neg_mix_end), float(neg_mix_start), adaptive_mix_end_max)
@@ -607,6 +716,13 @@ def main() -> int:
             f"risk_head: ticker={risk_ticker} horizon={risk_horizon} "
             f"weight={risk_loss_weight} type={risk_loss_type} std={risk_standardize} "
             f"max_abs_logret={risk_max_abs_logret}"
+        )
+    if neg_mode == "self_contrastive":
+        print(f"self_contrastive_temp: {self_contrastive_temp}")
+    if distance_forward_weight > 0:
+        print(
+            "distance_forward: "
+            f"weight={distance_forward_weight}, margin={distance_forward_margin}"
         )
     if torch_num_threads or torch_num_interop_threads:
         print(
@@ -741,6 +857,9 @@ def main() -> int:
                     returns_len,
                     summary_dim,
                     ff_multiscale,
+                    self_contrastive_temp,
+                    distance_forward_weight,
+                    distance_forward_margin,
                 )
                 best_bs = test_bs
                 test_bs = int(test_bs * auto_tune_factor)
@@ -772,6 +891,9 @@ def main() -> int:
                         returns_len,
                         summary_dim,
                         ff_multiscale,
+                        self_contrastive_temp,
+                        distance_forward_weight,
+                        distance_forward_margin,
                     )
                     best_bs = test_bs
                     break
@@ -811,7 +933,7 @@ def main() -> int:
         with log_path.open("w") as f:
             f.write(
                 "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
-                "hall_close_ratio,energy_penalty,risk_loss,goodness_target_used,"
+                "hall_close_ratio,energy_penalty,risk_loss,dist_forward_loss,goodness_target_used,"
                 "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
                 "hall_node_fraction_used\n"
             )
@@ -845,6 +967,7 @@ def main() -> int:
         energy_penalty_sum = 0.0
         risk_loss_sum = 0.0
         risk_batches = 0
+        dist_forward_sum = 0.0
 
         hall_used = 0
         total_used = 0
@@ -882,95 +1005,158 @@ def main() -> int:
 
             if ff_multiscale:
                 layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                hall_active = False
+                dist_loss_val = 0.0
 
-                hall_active = use_mode == "hallucinate"
-                if use_mode == "hallucinate":
-                    x_neg_hall = hallucinate_negative(
-                        model,
-                        x,
-                        batch.edge_index,
-                        getattr(batch, "edge_attr", None),
-                        batch.batch,
-                        hall_cfg,
-                        edge_weight=edge_weight,
-                    )
-                    if hall_min_delta and hall_min_delta > 0:
-                        delta = (
-                            x_neg_hall[:, :returns_len] - x[:, :returns_len]
-                        ).abs().mean()
-                        hall_close_total += 1
-                        if float(delta) < hall_min_delta:
-                            hall_close_count += 1
-                            x_neg_hall = make_negative(
-                                x,
-                                batch.batch,
-                                mode="shuffle+noise",
-                                noise_std=max(float(noise_std), float(hall_fallback_noise)),
-                                window_len=returns_len,
-                                summary_dim=summary_dim,
-                            )
-                    hall_used += 1
+                if use_mode == "self_contrastive":
+                    total_used += 1
+                    layers_view = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    batch_loss = 0.0
+                    g_pos_last = 0.0
+                    g_neg_last = 0.0
+                    z_pos_last = None
+                    z_neg_last = None
+                    for h_p, h_v in zip(layers_pos, layers_view):
+                        sc_loss, pos_score, neg_score, z_pos, z_view = _self_contrastive_batch_loss(
+                            h_p,
+                            h_v,
+                            batch.batch,
+                            temperature=self_contrastive_temp,
+                        )
+                        batch_loss = batch_loss + sc_loss
+                        g_pos_last = float(pos_score.detach())
+                        g_neg_last = float(neg_score.detach())
+                        z_pos_last = z_pos
+                        z_neg_last = permute_graph_embeddings(z_view)
+                    batch_loss = batch_loss / max(1, len(layers_pos))
+                    if (
+                        distance_forward_weight > 0
+                        and z_pos_last is not None
+                        and z_neg_last is not None
+                    ):
+                        dist_loss_val = pairwise_distance_forward_loss(
+                            z_pos_last,
+                            z_neg_last,
+                            margin=distance_forward_margin,
+                        )
+                        batch_loss = batch_loss + distance_forward_weight * dist_loss_val
                 else:
-                    x_neg_hall = make_negative(
-                        x,
-                        batch.batch,
-                        mode=use_mode,
-                        noise_std=noise_std,
-                        window_len=returns_len,
-                        summary_dim=summary_dim,
-                    )
-                total_used += 1
-
-                x_neg_time = make_negative(
-                    x,
-                    batch.batch,
-                    mode="time_flip",
-                    noise_std=noise_std,
-                    window_len=returns_len,
-                    summary_dim=summary_dim,
-                )
-
-                layers_neg_h = model(
-                    x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
-                )
-                layers_neg_t = model(
-                    x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
-                )
-
-                if use_mode == "hallucinate":
-                    g_pos_probe = goodness(
-                        layers_pos[-1], batch.batch, temperature=goodness_temp
-                    ).mean().item()
-                    g_neg_probe = goodness(
-                        layers_neg_h[-1], batch.batch, temperature=goodness_temp
-                    ).mean().item()
-                    if g_neg_probe > g_pos_probe + neg_gate_margin:
+                    hall_active = use_mode == "hallucinate"
+                    if use_mode == "hallucinate":
+                        x_neg_hall = hallucinate_negative(
+                            model,
+                            x,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            batch.batch,
+                            hall_cfg,
+                            edge_weight=edge_weight,
+                        )
+                        if hall_min_delta and hall_min_delta > 0:
+                            delta = (
+                                x_neg_hall[:, :returns_len] - x[:, :returns_len]
+                            ).abs().mean()
+                            hall_close_total += 1
+                            if float(delta) < hall_min_delta:
+                                hall_close_count += 1
+                                x_neg_hall = make_negative(
+                                    x,
+                                    batch.batch,
+                                    mode="shuffle+noise",
+                                    noise_std=max(float(noise_std), float(hall_fallback_noise)),
+                                    window_len=returns_len,
+                                    summary_dim=summary_dim,
+                                )
+                        hall_used += 1
+                    else:
                         x_neg_hall = make_negative(
                             x,
                             batch.batch,
-                            mode="shuffle",
+                            mode=use_mode,
                             noise_std=noise_std,
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
-                        hall_used -= 1
-                        hall_gated += 1
-                        hall_active = False
-                        layers_neg_h = model(
-                            x_neg_hall,
-                            batch.edge_index,
-                            edge_weight=edge_weight,
-                            return_all=True,
-                        )
+                    total_used += 1
 
-                batch_loss = 0.0
-                for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
-                    g_p = goodness(h_p, batch.batch, temperature=goodness_temp)
-                    g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp)
-                    g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp)
-                    batch_loss += ff_loss(g_p, g_n_h, target=goodness_target)
-                    batch_loss += ff_loss(g_p, g_n_t, target=goodness_target)
-                batch_loss = batch_loss / max(1, len(layers_pos))
+                    x_neg_time = make_negative(
+                        x,
+                        batch.batch,
+                        mode="time_flip",
+                        noise_std=noise_std,
+                        window_len=returns_len,
+                        summary_dim=summary_dim,
+                    )
+
+                    layers_neg_h = model(
+                        x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
+                    )
+                    layers_neg_t = model(
+                        x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
+                    )
+
+                    if use_mode == "hallucinate":
+                        g_pos_probe = goodness(
+                            layers_pos[-1], batch.batch, temperature=goodness_temp
+                        ).mean().item()
+                        g_neg_probe = goodness(
+                            layers_neg_h[-1], batch.batch, temperature=goodness_temp
+                        ).mean().item()
+                        if g_neg_probe > g_pos_probe + neg_gate_margin:
+                            x_neg_hall = make_negative(
+                                x,
+                                batch.batch,
+                                mode="shuffle",
+                                noise_std=noise_std,
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
+                            hall_used -= 1
+                            hall_gated += 1
+                            hall_active = False
+                            layers_neg_h = model(
+                                x_neg_hall,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                                return_all=True,
+                            )
+
+                    batch_loss = 0.0
+                    for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
+                        g_p = goodness(h_p, batch.batch, temperature=goodness_temp)
+                        g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp)
+                        g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp)
+                        batch_loss += ff_loss(g_p, g_n_h, target=goodness_target)
+                        batch_loss += ff_loss(g_p, g_n_t, target=goodness_target)
+                    batch_loss = batch_loss / max(1, len(layers_pos))
+
+                    if distance_forward_weight > 0:
+                        z_pos = global_mean_pool(layers_pos[-1], batch.batch)
+                        z_neg_h = global_mean_pool(layers_neg_h[-1], batch.batch)
+                        z_neg_t = global_mean_pool(layers_neg_t[-1], batch.batch)
+                        dist_loss_h = pairwise_distance_forward_loss(
+                            z_pos,
+                            z_neg_h,
+                            margin=distance_forward_margin,
+                        )
+                        dist_loss_t = pairwise_distance_forward_loss(
+                            z_pos,
+                            z_neg_t,
+                            margin=distance_forward_margin,
+                        )
+                        dist_loss_val = 0.5 * (dist_loss_h + dist_loss_t)
+                        batch_loss = batch_loss + distance_forward_weight * dist_loss_val
+
+                    g_pos_last = goodness(
+                        layers_pos[-1], batch.batch, temperature=goodness_temp
+                    ).mean().item()
+                    g_neg_h_last = goodness(
+                        layers_neg_h[-1], batch.batch, temperature=goodness_temp
+                    ).mean().item()
+                    g_neg_t_last = goodness(
+                        layers_neg_t[-1], batch.batch, temperature=goodness_temp
+                    ).mean().item()
+                    g_neg_last = (g_neg_h_last + g_neg_t_last) / 2.0
 
                 energy_penalty_val = 0.0
                 if energy_penalty_weight > 0:
@@ -1009,27 +1195,19 @@ def main() -> int:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optim.step()
 
-                g_pos_last = goodness(
-                    layers_pos[-1], batch.batch, temperature=goodness_temp
-                ).mean().item()
-                g_neg_h_last = goodness(
-                    layers_neg_h[-1], batch.batch, temperature=goodness_temp
-                ).mean().item()
-                g_neg_t_last = goodness(
-                    layers_neg_t[-1], batch.batch, temperature=goodness_temp
-                ).mean().item()
-
                 total_loss += batch_loss.item()
                 total_pos += g_pos_last
-                total_neg += (g_neg_h_last + g_neg_t_last) / 2
+                total_neg += g_neg_last
                 if hall_active:
-                    hall_hardness_sum += (g_neg_h_last - g_pos_last)
+                    hall_hardness_sum += (g_neg_last - g_pos_last)
                     hall_hardness_count += 1
                 if energy_penalty_weight > 0:
                     energy_penalty_sum += float(energy_penalty_val.detach())
                 if risk_loss_val is not None and risk_loss_val != 0.0:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
+                if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
+                    dist_forward_sum += float(dist_loss_val.detach())
             elif ff_layerwise:
                 x_in = x
                 layer_losses = 0.0
@@ -1126,66 +1304,101 @@ def main() -> int:
                 total_neg += layer_gneg / len(model.layers)
             else:
                 h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                hall_active = False
+                dist_loss_val = 0.0
 
-                hall_active = use_mode == "hallucinate"
-                if use_mode == "hallucinate":
-                    x_neg = hallucinate_negative(
-                        model,
-                        x,
-                        batch.edge_index,
-                        getattr(batch, "edge_attr", None),
+                if use_mode == "self_contrastive":
+                    total_used += 1
+                    h_view = model(x, batch.edge_index, edge_weight=edge_weight)
+                    loss, pos_score, neg_score, z_pos, z_view = _self_contrastive_batch_loss(
+                        h_pos,
+                        h_view,
                         batch.batch,
-                        hall_cfg,
-                        edge_weight=edge_weight,
+                        temperature=self_contrastive_temp,
                     )
-                    if hall_min_delta and hall_min_delta > 0:
-                        delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
-                        hall_close_total += 1
-                        if float(delta) < hall_min_delta:
-                            hall_close_count += 1
-                            x_neg = make_negative(
-                                x,
-                                batch.batch,
-                                mode="shuffle+noise",
-                                noise_std=max(float(noise_std), float(hall_fallback_noise)),
-                                window_len=returns_len,
-                                summary_dim=summary_dim,
-                            )
-                    hall_used += 1
+                    g_pos_val = float(pos_score.detach())
+                    g_neg_val = float(neg_score.detach())
+                    if distance_forward_weight > 0:
+                        z_neg_dist = permute_graph_embeddings(z_view)
+                        dist_loss_val = pairwise_distance_forward_loss(
+                            z_pos,
+                            z_neg_dist,
+                            margin=distance_forward_margin,
+                        )
+                        loss = loss + distance_forward_weight * dist_loss_val
                 else:
-                    x_neg = make_negative(
-                        x,
-                        batch.batch,
-                        mode=use_mode,
-                        noise_std=noise_std,
-                        window_len=returns_len,
-                        summary_dim=summary_dim,
-                    )
-                total_used += 1
+                    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
-                if use_mode == "hallucinate":
-                    h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                    g_neg_probe = goodness(
-                        h_neg_probe, batch.batch, temperature=goodness_temp
-                    ).mean().item()
-                    g_pos_probe = g_pos.mean().item()
-                    if g_neg_probe > g_pos_probe + neg_gate_margin:
+                    hall_active = use_mode == "hallucinate"
+                    if use_mode == "hallucinate":
+                        x_neg = hallucinate_negative(
+                            model,
+                            x,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            batch.batch,
+                            hall_cfg,
+                            edge_weight=edge_weight,
+                        )
+                        if hall_min_delta and hall_min_delta > 0:
+                            delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
+                            hall_close_total += 1
+                            if float(delta) < hall_min_delta:
+                                hall_close_count += 1
+                                x_neg = make_negative(
+                                    x,
+                                    batch.batch,
+                                    mode="shuffle+noise",
+                                    noise_std=max(float(noise_std), float(hall_fallback_noise)),
+                                    window_len=returns_len,
+                                    summary_dim=summary_dim,
+                                )
+                        hall_used += 1
+                    else:
                         x_neg = make_negative(
                             x,
                             batch.batch,
-                            mode="shuffle",
+                            mode=use_mode,
                             noise_std=noise_std,
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
-                        hall_used -= 1
-                        hall_gated += 1
-                        hall_active = False
-                h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+                    total_used += 1
 
-                loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                    if use_mode == "hallucinate":
+                        h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        g_neg_probe = goodness(
+                            h_neg_probe, batch.batch, temperature=goodness_temp
+                        ).mean().item()
+                        g_pos_probe = g_pos.mean().item()
+                        if g_neg_probe > g_pos_probe + neg_gate_margin:
+                            x_neg = make_negative(
+                                x,
+                                batch.batch,
+                                mode="shuffle",
+                                noise_std=noise_std,
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
+                            hall_used -= 1
+                            hall_gated += 1
+                            hall_active = False
+                    h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+
+                    loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                    g_pos_val = g_pos.mean().item()
+                    g_neg_val = g_neg.mean().item()
+                    if distance_forward_weight > 0:
+                        z_pos = global_mean_pool(h_pos, batch.batch)
+                        z_neg = global_mean_pool(h_neg, batch.batch)
+                        dist_loss_val = pairwise_distance_forward_loss(
+                            z_pos,
+                            z_neg,
+                            margin=distance_forward_margin,
+                        )
+                        loss = loss + distance_forward_weight * dist_loss_val
+
                 energy_penalty_val = 0.0
                 if energy_penalty_weight > 0:
                     energy_penalty_val = h_pos.pow(2).mean()
@@ -1218,16 +1431,18 @@ def main() -> int:
                 optim.step()
 
                 total_loss += loss.item()
-                total_pos += g_pos.mean().item()
-                total_neg += g_neg.mean().item()
+                total_pos += g_pos_val
+                total_neg += g_neg_val
                 if hall_active:
-                    hall_hardness_sum += (g_neg.mean().item() - g_pos.mean().item())
+                    hall_hardness_sum += (g_neg_val - g_pos_val)
                     hall_hardness_count += 1
                 if energy_penalty_weight > 0:
                     energy_penalty_sum += float(energy_penalty_val.detach())
                 if risk_loss_val is not None and risk_loss_val != 0.0:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
+                if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
+                    dist_forward_sum += float(dist_loss_val.detach())
             batches += 1
 
         hall_ratio = hall_used / total_used if total_used else 0.0
@@ -1236,6 +1451,7 @@ def main() -> int:
         hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
         energy_penalty_epoch = energy_penalty_sum / batches if batches else 0.0
         risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
+        dist_forward_epoch = dist_forward_sum / batches if batches else 0.0
         epoch_loss = total_loss / batches if batches else 0.0
         epoch_pos = total_pos / batches if batches else 0.0
         epoch_neg = total_neg / batches if batches else 0.0
@@ -1361,6 +1577,7 @@ def main() -> int:
                     f"{epoch_pos:.6f},{epoch_neg:.6f},"
                     f"{hall_ratio:.4f},{gate_ratio:.4f},{hall_hardness:.6f},"
                     f"{hall_close_ratio:.4f},{energy_penalty_epoch:.6f},{risk_loss_epoch:.6f},"
+                    f"{dist_forward_epoch:.6f},"
                     f"{epoch_goodness_target:.6f},{epoch_neg_mix_end:.6f},{epoch_neg_gate_margin:.6f},"
                     f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f}\n"
                 )
@@ -1390,6 +1607,8 @@ def main() -> int:
                 plt.plot(df["epoch"], df["energy_penalty"], label="energy_penalty")
             if "risk_loss" in df.columns:
                 plt.plot(df["epoch"], df["risk_loss"], label="risk_loss")
+            if "dist_forward_loss" in df.columns:
+                plt.plot(df["epoch"], df["dist_forward_loss"], label="dist_forward")
             if "goodness_target_used" in df.columns:
                 plt.plot(df["epoch"], df["goodness_target_used"], label="goodness_target")
             if "neg_mix_end_used" in df.columns:

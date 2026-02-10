@@ -185,14 +185,28 @@ neg_mix_end = 0.7
 neg_mix_ramp_epochs = 20
 ```
 
+Or switch to self-contrastive FF (no explicit synthetic negatives):
+```
+neg_mode = "self_contrastive"
+self_contrastive_temp = 0.2
+```
+
 Stability add-ons:
 - `neg_gate_margin`: if hallucinated negatives are too strong (`g_neg > g_pos + margin`), fall back to shuffle for that batch.
 - `grad_clip`: gradient norm clipping to reduce instability.
+
+Distance-forward auxiliary loss (graph-level pairwise margin):
+```
+distance_forward_weight = 0.05
+distance_forward_margin = 0.15
+```
+This is applied in end-to-end FF mode (`ff_e2e` / non-layerwise) and can be combined with either synthetic negatives or `self_contrastive`.
 
 ## Training Plots
 Set `log_csv` and `plot_path` in `configs/default.toml` to write a CSV of per-epoch metrics and a PNG plot.
 Recommended publishable location: `reports/ff_train.csv` and `reports/ff_train.png`.
 The CSV now includes `hall_hardness` (avg `g_neg - g_pos` for hallucinated batches).
+It also includes `dist_forward_loss` when distance-forward auxiliary training is enabled.
 
 ## Baseline Config
 The current tuned baseline is stored at `configs/baseline.toml`.
@@ -230,12 +244,13 @@ epochs = 5
 batch_size = 32
 eval_frac = 0.2
 neg_mode = "mix"
-eval_neg_mode = "shuffle"
+eval_neg_mode = "auto"
 timing_warmup_epochs = 1
 out_csv = "reports/benchmark.csv"
 ```
 
 The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_acc`, `eval_g_pos`, `eval_g_neg`, and `eval_sep`.
+If `eval_neg_mode = "auto"` with `neg_mode = "self_contrastive"`, benchmarking reports contrastive metrics (`eval_sc_loss`, `eval_sc_pos`, `eval_sc_neg`, `eval_sc_gap`, `eval_sc_acc`) and maps `eval_sep/eval_acc` to that objective.
 
 The script also writes a speed-vs-separation plot:
 ```
@@ -297,6 +312,7 @@ Calibrate hallucinations (KL/JS + tail ratios):
 ```bash
 python scripts/hallucination_calibration.py --csv reports/scenario_book.csv
 ```
+Add `--target-ticker` for focused diagnostics and `--out-by-ticker` for per-ticker calibration tables.
 
 ## Scenario Book + Stress Test Report
 Generate a scenario book from multiple windows:
@@ -310,6 +326,8 @@ You can also set defaults in `configs/default.toml`:
 num_scenarios = 50
 target_ticker = "MDY"
 target_drop = -0.10
+constraint_mode = "exact"
+constraint_tolerance = 0.01
 constraint_weight = 20.0
 adaptive = true
 target_hit_rate = 0.6
@@ -336,6 +354,7 @@ Generate a stress test report (portfolio-level metrics + plot):
 ```bash
 python scripts/stress_test_report.py --csv reports/scenario_book.csv --out-csv reports/stress_test_report.csv --out-plot reports/stress_test_report.png
 ```
+Add `--target-ticker` to produce `all`, `target`, and `non_target` scope diagnostics.
 
 ## Goodness Backtest
 Check whether low goodness predicts higher forward volatility/drawdown:

@@ -51,6 +51,42 @@ def _sample_ticker_preview(tickers_list, max_items=20):
     return ", ".join(preview) + suffix
 
 
+def _constraint_diff(
+    cum_return: torch.Tensor,
+    target_drop: float,
+    mode: str,
+    tolerance: float = 0.0,
+) -> torch.Tensor:
+    tol = max(0.0, float(tolerance))
+    if mode == "exact":
+        diff = cum_return - float(target_drop)
+        if tol > 0:
+            diff = torch.sign(diff) * torch.relu(torch.abs(diff) - tol)
+        return diff
+    if mode == "at_least":
+        if target_drop < 0:
+            # For downside targets, allow returns <= target+tol.
+            return torch.relu(cum_return - (float(target_drop) + tol))
+        # For upside targets, allow returns >= target-tol.
+        return torch.relu((float(target_drop) - tol) - cum_return)
+    raise ValueError(f"Unknown constraint mode: {mode}")
+
+
+def _constraint_hit(
+    hall_minus_target: float,
+    target_drop: float,
+    mode: str,
+    tolerance: float,
+) -> bool:
+    tol = max(0.0, float(tolerance))
+    d = float(hall_minus_target)
+    if mode == "exact":
+        return abs(d) <= tol
+    if target_drop < 0:
+        return d <= tol
+    return d >= -tol
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a scenario book of hallucinated windows.")
     parser.add_argument("--config", required=True, help="Path to TOML config")
@@ -70,6 +106,12 @@ def main() -> int:
         type=float,
         default=10.0,
         help="Penalty weight for the constraint",
+    )
+    parser.add_argument(
+        "--constraint-tolerance",
+        type=float,
+        default=0.01,
+        help="Tolerance band for constraint objective (used by exact mode).",
     )
     parser.add_argument(
         "--hall-steps",
@@ -289,7 +331,7 @@ def main() -> int:
     parser.add_argument(
         "--constraint-mode",
         choices=["exact", "at_least"],
-        default="at_least",
+        default="exact",
         help="Exact match or at-least constraint",
     )
     parser.add_argument(
@@ -326,7 +368,13 @@ def main() -> int:
         if isinstance(val, list):
             val = ",".join(str(x) for x in val)
         if cast:
-            val = cast(val)
+            if cast is bool:
+                if isinstance(val, str):
+                    val = val.strip().lower() in ("1", "true", "yes", "y", "on")
+                else:
+                    val = bool(val)
+            else:
+                val = cast(val)
         setattr(args, key, val)
 
     _maybe_override("num_scenarios", "--num-scenarios", int)
@@ -336,6 +384,7 @@ def main() -> int:
     _maybe_override("target_ticker", "--target-ticker")
     _maybe_override("target_drop", "--target-drop", float)
     _maybe_override("constraint_weight", "--constraint-weight", float)
+    _maybe_override("constraint_tolerance", "--constraint-tolerance", float)
     _maybe_override("constraint_mode", "--constraint-mode")
     _maybe_override("max_tickers", "--max-tickers", int)
     _maybe_override("diag_out", "--diag-out")
@@ -545,13 +594,12 @@ def main() -> int:
                     else:
                         rets = x_var[idx, :returns_len]
                     cum = torch.exp(rets.sum()) - 1.0
-                    if args.constraint_mode == "at_least":
-                        if args.target_drop < 0:
-                            diff = torch.relu(cum - args.target_drop)
-                        else:
-                            diff = torch.relu(args.target_drop - cum)
-                    else:
-                        diff = cum - args.target_drop
+                    diff = _constraint_diff(
+                        cum,
+                        args.target_drop,
+                        args.constraint_mode,
+                        args.constraint_tolerance,
+                    )
                     return constraint_weight * diff.pow(2)
 
                 constraint_fn = _constraint
@@ -623,10 +671,21 @@ def main() -> int:
                         "graph_index": idx,
                         "date": date,
                         "ticker": args.target_ticker,
+                        "constraint_mode": args.constraint_mode,
+                        "constraint_tolerance": float(args.constraint_tolerance),
                         "target_drop": args.target_drop,
                         "real_cum_return": real_cum,
                         "hall_cum_return": hall_cum,
                         "hall_minus_target": diff,
+                        "abs_error": abs(diff),
+                        "hit": int(
+                            _constraint_hit(
+                                diff,
+                                args.target_drop,
+                                args.constraint_mode,
+                                args.target_tolerance,
+                            )
+                        ),
                     }
                 )
 
@@ -669,6 +728,9 @@ def main() -> int:
             hall_cfg.clamp_std,
         )
         attempt += 1
+        clamp_display = (
+            f"{hall_cfg.clamp_std:.2f}" if hall_cfg.clamp_std is not None else "none"
+        )
         print(
             "adaptive attempt "
             f"{attempt}/{max_steps} | "
@@ -680,7 +742,7 @@ def main() -> int:
             f"hall_corr={hall_cfg.corr_weight:.3f} | "
             f"hall_mean={hall_cfg.mean_weight:.4f} | "
             f"hall_std={hall_cfg.std_weight:.4f} | "
-            f"hall_clamp={hall_cfg.clamp_std:.2f}"
+            f"hall_clamp={clamp_display}"
         )
         scenario_rows, diag_rows = _run_once(hall_cfg, constraint_weight)
         final_rows = scenario_rows
@@ -690,21 +752,45 @@ def main() -> int:
             break
 
         diffs = [row["hall_minus_target"] for row in diag_rows]
-        hits = sum(1 for d in diffs if abs(d) <= args.target_tolerance)
+        abs_diffs = [abs(d) for d in diffs]
+        hits = sum(
+            1
+            for d in diffs
+            if _constraint_hit(
+                d,
+                args.target_drop,
+                args.constraint_mode,
+                args.target_tolerance,
+            )
+        )
         hit_rate = hits / len(diffs)
         mean_diff = sum(diffs) / len(diffs)
         med_diff = sorted(diffs)[len(diffs) // 2]
+        mean_abs = sum(abs_diffs) / len(abs_diffs)
+        med_abs = sorted(abs_diffs)[len(abs_diffs) // 2]
+        p90_abs = float(np.quantile(np.array(abs_diffs), 0.9))
         print(
             "constraint summary: "
             f"hit_rate={hits}/{len(diffs)} ({hit_rate:.1%}) | "
-            f"mean_diff={mean_diff:.4f} | median_diff={med_diff:.4f}"
+            f"mean_diff={mean_diff:.4f} | median_diff={med_diff:.4f} | "
+            f"mean_abs={mean_abs:.4f} | median_abs={med_abs:.4f} | p90_abs={p90_abs:.4f}"
         )
         if hit_rate >= args.target_hit_rate:
             print("Target hit rate reached.")
             break
 
         # Adaptive adjustments
-        if mean_diff > args.target_tolerance:
+        if args.constraint_mode == "exact":
+            needs_harder = mean_diff > args.target_tolerance
+            too_hard = mean_diff < -args.target_tolerance
+        elif args.target_drop < 0:
+            needs_harder = mean_diff > args.target_tolerance
+            too_hard = mean_diff < -args.target_tolerance
+        else:
+            needs_harder = mean_diff < -args.target_tolerance
+            too_hard = mean_diff > args.target_tolerance
+
+        if needs_harder:
             constraint_weight = min(
                 constraint_weight * args.adapt_constraint_mult,
                 args.adapt_max_constraint,
@@ -718,8 +804,12 @@ def main() -> int:
             hall_cfg.node_fraction = min(
                 1.0, hall_cfg.node_fraction + args.adapt_hall_node_inc
             )
-            hall_cfg.clamp_std = min(hall_cfg.clamp_std + args.adapt_hall_clamp_inc, args.adapt_max_clamp_std)
-        elif mean_diff < -args.target_tolerance:
+            if hall_cfg.clamp_std is not None:
+                hall_cfg.clamp_std = min(
+                    hall_cfg.clamp_std + args.adapt_hall_clamp_inc,
+                    args.adapt_max_clamp_std,
+                )
+        elif too_hard:
             constraint_weight = max(
                 constraint_weight / args.adapt_constraint_mult, 1.0
             )
@@ -730,7 +820,18 @@ def main() -> int:
             hall_cfg.std_weight = min(hall_cfg.std_weight / args.adapt_hall_std_mult, 0.2)
             hall_cfg.corr_weight = min(hall_cfg.corr_weight / args.adapt_hall_corr_mult, 1.0)
             hall_cfg.node_fraction = max(0.1, hall_cfg.node_fraction - args.adapt_hall_node_inc)
-            hall_cfg.clamp_std = max(1.0, hall_cfg.clamp_std - args.adapt_hall_clamp_inc)
+            if hall_cfg.clamp_std is not None:
+                hall_cfg.clamp_std = max(
+                    1.0,
+                    hall_cfg.clamp_std - args.adapt_hall_clamp_inc,
+                )
+        elif mean_abs > args.target_tolerance:
+            # Centered but noisy around target: increase precision pressure.
+            constraint_weight = min(
+                constraint_weight * (1.0 + 0.5 * (args.adapt_constraint_mult - 1.0)),
+                args.adapt_max_constraint,
+            )
+            hall_cfg.steps = min(hall_cfg.steps + 1, args.adapt_max_steps)
         else:
             # mean diff close to target but hit rate low -> increase diversity slightly
             hall_cfg.steps = min(hall_cfg.steps + 1, args.adapt_max_steps)
@@ -774,10 +875,14 @@ def main() -> int:
                     "graph_index",
                     "date",
                     "ticker",
+                    "constraint_mode",
+                    "constraint_tolerance",
                     "target_drop",
                     "real_cum_return",
                     "hall_cum_return",
                     "hall_minus_target",
+                    "abs_error",
+                    "hit",
                 ],
             )
             w.writeheader()
@@ -785,15 +890,29 @@ def main() -> int:
                 w.writerow(row)
         print(f"Wrote {diag_path}")
         diffs = [row["hall_minus_target"] for row in final_diag]
+        abs_diffs = [abs(d) for d in diffs]
         if diffs:
-            hits = sum(1 for d in diffs if abs(d) <= args.target_tolerance)
+            hits = sum(
+                1
+                for d in diffs
+                if _constraint_hit(
+                    d,
+                    args.target_drop,
+                    args.constraint_mode,
+                    args.target_tolerance,
+                )
+            )
             hit_rate = hits / len(diffs)
             mean_diff = sum(diffs) / len(diffs)
             med_diff = sorted(diffs)[len(diffs) // 2]
+            mean_abs = sum(abs_diffs) / len(abs_diffs)
+            med_abs = sorted(abs_diffs)[len(abs_diffs) // 2]
+            p90_abs = float(np.quantile(np.array(abs_diffs), 0.9))
             print(
                 "constraint summary: "
                 f"hit_rate={hits}/{len(diffs)} ({hit_rate:.1%}) | "
-                f"mean_diff={mean_diff:.4f} | median_diff={med_diff:.4f}"
+                f"mean_diff={mean_diff:.4f} | median_diff={med_diff:.4f} | "
+                f"mean_abs={mean_abs:.4f} | median_abs={med_abs:.4f} | p90_abs={p90_abs:.4f}"
             )
 
     print(f"Wrote {out}")

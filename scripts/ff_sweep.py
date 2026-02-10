@@ -13,13 +13,22 @@ import numpy as np
 import torch
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_mean_pool
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import GCNEncoder
-from frisk.ff import goodness, make_negative, ff_loss
+from frisk.ff import (
+    ff_loss,
+    goodness,
+    make_negative,
+    pairwise_distance_forward_loss,
+    permute_graph_embeddings,
+    self_contrastive_loss,
+    self_contrastive_retrieval_accuracy,
+)
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import resolve_device, sync_device
 
@@ -182,6 +191,13 @@ def _get_use_mode(epoch: int, neg_mode: str, warmup: int, mix_start: float, mix_
     return neg_mode
 
 
+def _resolve_mode(eval_mode: str, train_mode: str) -> str:
+    mode = str(eval_mode).strip().lower()
+    if mode in ("", "auto"):
+        return str(train_mode).strip().lower()
+    return mode
+
+
 def _make_negatives(
     model,
     x,
@@ -196,6 +212,8 @@ def _make_negatives(
     window_len: int | None = None,
     summary_dim: int = 0,
 ):
+    if use_mode == "self_contrastive":
+        use_mode = "shuffle"
     if use_mode == "hallucinate":
         return hallucinate_negative(
             model,
@@ -217,6 +235,22 @@ def _make_negatives(
     )
 
 
+def _self_contrastive_step(
+    h_pos: torch.Tensor,
+    h_view: torch.Tensor,
+    batch: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    z_pos = global_mean_pool(h_pos, batch)
+    z_view = global_mean_pool(h_view, batch)
+    loss, pos_score, neg_score = self_contrastive_loss(
+        z_pos,
+        z_view,
+        temperature=temperature,
+    )
+    return loss, pos_score, neg_score, z_pos, z_view
+
+
 def _eval_ff_metrics(
     model,
     loader,
@@ -225,9 +259,53 @@ def _eval_ff_metrics(
     neg_mode,
     noise_std,
     hall_cfg,
+    sc_temp: float = 0.2,
     window_len: int | None = None,
     summary_dim: int = 0,
 ):
+    eval_mode = str(neg_mode).strip().lower()
+    if eval_mode == "self_contrastive":
+        prev_mode = model.training
+        model.train()
+        sc_losses = []
+        sc_pos = []
+        sc_neg = []
+        sc_acc = []
+        for batch in loader:
+            batch = batch.to(next(model.parameters()).device)
+            x = batch.x
+            edge_weight = getattr(batch, "edge_weight", None)
+            with torch.no_grad():
+                h_a = model(x, batch.edge_index, edge_weight=edge_weight)
+                h_b = model(x, batch.edge_index, edge_weight=edge_weight)
+                z_a = global_mean_pool(h_a, batch.batch)
+                z_b = global_mean_pool(h_b, batch.batch)
+                loss, pos_score, neg_score = self_contrastive_loss(
+                    z_a,
+                    z_b,
+                    temperature=sc_temp,
+                )
+                acc = self_contrastive_retrieval_accuracy(z_a, z_b)
+            sc_losses.append(float(loss.detach().cpu()))
+            sc_pos.append(float(pos_score.detach().cpu()))
+            sc_neg.append(float(neg_score.detach().cpu()))
+            sc_acc.append(float(acc.detach().cpu()))
+        model.train(prev_mode)
+        pos_mean = float(np.mean(sc_pos)) if sc_pos else 0.0
+        neg_mean = float(np.mean(sc_neg)) if sc_neg else 0.0
+        return {
+            "eval_objective": "self_contrastive",
+            "eval_sc_loss": float(np.mean(sc_losses)) if sc_losses else 0.0,
+            "eval_sc_pos": pos_mean,
+            "eval_sc_neg": neg_mean,
+            "eval_sc_gap": pos_mean - neg_mean,
+            "eval_sc_acc": float(np.mean(sc_acc)) if sc_acc else 0.0,
+            "eval_g_pos": pos_mean,
+            "eval_g_neg": neg_mean,
+            "eval_sep": pos_mean - neg_mean,
+            "eval_acc": float(np.mean(sc_acc)) if sc_acc else 0.0,
+        }
+
     model.eval()
     gpos = []
     gneg = []
@@ -241,7 +319,7 @@ def _eval_ff_metrics(
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
-        if neg_mode == "hallucinate":
+        if eval_mode == "hallucinate":
             with torch.enable_grad():
                 x_neg = _make_negatives(
                     model,
@@ -250,7 +328,7 @@ def _eval_ff_metrics(
                     batch.edge_index,
                     getattr(batch, "edge_attr", None),
                     edge_weight,
-                    neg_mode,
+                    eval_mode,
                     noise_std,
                     hall_cfg,
                     window_len=window_len,
@@ -265,7 +343,7 @@ def _eval_ff_metrics(
                     batch.edge_index,
                     getattr(batch, "edge_attr", None),
                     edge_weight,
-                    neg_mode,
+                    eval_mode,
                     noise_std,
                     hall_cfg,
                     window_len=window_len,
@@ -282,7 +360,15 @@ def _eval_ff_metrics(
             gpos.append(g_pos.mean().item())
             gneg.append(g_neg.mean().item())
     acc = acc_num / acc_den if acc_den else 0.0
-    return float(np.mean(gpos)), float(np.mean(gneg)), float(acc)
+    pos_mean = float(np.mean(gpos)) if gpos else 0.0
+    neg_mean = float(np.mean(gneg)) if gneg else 0.0
+    return {
+        "eval_objective": "ff",
+        "eval_g_pos": pos_mean,
+        "eval_g_neg": neg_mean,
+        "eval_sep": pos_mean - neg_mean,
+        "eval_acc": float(acc),
+    }
 
 
 def _run_ff_trial(graphs, device, cfg, layerwise: bool):
@@ -348,6 +434,18 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         corr_scope=str(cfg.get("hall_corr_scope", "returns")),
         freeze_non_return_features=bool(cfg.get("hall_freeze_non_return", True)),
     )
+    sc_temp = float(cfg.get("self_contrastive_temp", 0.2))
+    dist_weight = float(cfg.get("distance_forward_weight", 0.0))
+    dist_margin = float(cfg.get("distance_forward_margin", 0.15))
+    train_neg_mode = str(cfg["neg_mode"]).strip().lower()
+    if layerwise and train_neg_mode == "self_contrastive":
+        fallback = str(cfg.get("layerwise_neg_mode", "shuffle")).strip().lower()
+        print(
+            "ff_layerwise does not support self_contrastive negatives directly; "
+            f"using layerwise_neg_mode={fallback!r} for training."
+        )
+        train_neg_mode = fallback
+    eval_mode = _resolve_mode(cfg.get("eval_neg_mode", "auto"), train_neg_mode)
 
     epoch_times = []
     for epoch in range(1, cfg["epochs"] + 1):
@@ -361,7 +459,7 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
 
             use_mode = _get_use_mode(
                 epoch,
-                cfg["neg_mode"],
+                train_neg_mode,
                 cfg["neg_warmup_epochs"],
                 cfg["neg_mix_start"],
                 cfg["neg_mix_end"],
@@ -372,6 +470,8 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                 x_in = x
                 for li in range(len(model.layers)):
                     layer_mode = use_mode
+                    if layer_mode == "self_contrastive":
+                        layer_mode = "shuffle"
                     if use_mode == "hallucinate" and li > 0:
                         layer_mode = "shuffle"
                     h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
@@ -432,33 +532,57 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                     x_in = h_pos.detach()
             else:
                 h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                g_pos = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
-                x_neg = _make_negatives(
-                    model,
-                    x,
-                    batch.batch,
-                    batch.edge_index,
-                    getattr(batch, "edge_attr", None),
-                    edge_weight,
-                    use_mode,
-                    cfg["noise_std"],
-                    hall_cfg,
-                    window_len=cfg.get("window_len"),
-                    summary_dim=cfg.get("summary_dim", 0),
-                )
+                if use_mode == "self_contrastive":
+                    h_view = model(x, batch.edge_index, edge_weight=edge_weight)
+                    loss, _, _, z_pos, z_view = _self_contrastive_step(
+                        h_pos,
+                        h_view,
+                        batch.batch,
+                        temperature=sc_temp,
+                    )
+                    if dist_weight > 0:
+                        z_neg = permute_graph_embeddings(z_view)
+                        loss = loss + dist_weight * pairwise_distance_forward_loss(
+                            z_pos,
+                            z_neg,
+                            margin=dist_margin,
+                        )
+                else:
+                    g_pos = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
+                    x_neg = _make_negatives(
+                        model,
+                        x,
+                        batch.batch,
+                        batch.edge_index,
+                        getattr(batch, "edge_attr", None),
+                        edge_weight,
+                        use_mode,
+                        cfg["noise_std"],
+                        hall_cfg,
+                        window_len=cfg.get("window_len"),
+                        summary_dim=cfg.get("summary_dim", 0),
+                    )
 
-                if use_mode == "hallucinate":
-                    h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                    g_neg_probe = goodness(
-                        h_neg_probe, batch.batch, temperature=cfg["goodness_temp"]
-                    ).mean().item()
-                    g_pos_probe = g_pos.mean().item()
-                    if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
-                        x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=cfg["noise_std"])
+                    if use_mode == "hallucinate":
+                        h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        g_neg_probe = goodness(
+                            h_neg_probe, batch.batch, temperature=cfg["goodness_temp"]
+                        ).mean().item()
+                        g_pos_probe = g_pos.mean().item()
+                        if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
+                            x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=cfg["noise_std"])
 
-                h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
-                loss = ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                    h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                    g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
+                    loss = ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                    if dist_weight > 0:
+                        z_pos = global_mean_pool(h_pos, batch.batch)
+                        z_neg = global_mean_pool(h_neg, batch.batch)
+                        loss = loss + dist_weight * pairwise_distance_forward_loss(
+                            z_pos,
+                            z_neg,
+                            margin=dist_margin,
+                        )
 
                 optim.zero_grad()
                 loss.backward()
@@ -472,14 +596,15 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         dt = time.perf_counter() - t0
         epoch_times.append((dt, graphs_seen))
 
-    gpos, gneg, acc = _eval_ff_metrics(
+    eval_metrics = _eval_ff_metrics(
         model,
         eval_loader,
         cfg["goodness_temp"],
         cfg["goodness_target"],
-        cfg["eval_neg_mode"],
+        eval_mode,
         cfg["noise_std"],
         hall_cfg,
+        sc_temp=sc_temp,
         window_len=cfg.get("window_len"),
         summary_dim=cfg.get("summary_dim", 0),
     )
@@ -487,14 +612,14 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
     avg_time = float(np.mean([t for t, _ in usable]))
     avg_gps = float(np.mean([g / t for t, g in usable]))
-    return {
+    out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
-        "eval_g_pos": gpos,
-        "eval_g_neg": gneg,
-        "eval_sep": gpos - gneg,
-        "eval_acc": acc,
+        "neg_mode_effective": train_neg_mode,
+        "eval_neg_mode_effective": eval_mode,
     }
+    out.update(eval_metrics)
+    return out
 
 
 def _run_trial_worker(args):
@@ -565,6 +690,9 @@ def main() -> int:
         "neg_mix_ramp_epochs": int(train_cfg.get("neg_mix_ramp_epochs", 10)),
         "goodness_target": float(train_cfg.get("goodness_target", 1.0)),
         "goodness_temp": float(train_cfg.get("goodness_temp", 1.0)),
+        "self_contrastive_temp": float(train_cfg.get("self_contrastive_temp", 0.2)),
+        "distance_forward_weight": float(train_cfg.get("distance_forward_weight", 0.0)),
+        "distance_forward_margin": float(train_cfg.get("distance_forward_margin", 0.15)),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "loader_workers": int(train_cfg.get("loader_workers", 0)),
         "persistent_workers": bool(train_cfg.get("dataloader_persistent_workers", True)),
@@ -589,7 +717,7 @@ def main() -> int:
             train_cfg.get("hallucinate_freeze_non_return_features", True)
         ),
         "neg_gate_margin": float(train_cfg.get("neg_gate_margin", 1.0)),
-        "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "shuffle")),
+        "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "auto")),
         "timing_warmup_epochs": int(sweep_cfg.get("timing_warmup_epochs", 1)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
