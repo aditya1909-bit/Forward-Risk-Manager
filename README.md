@@ -15,6 +15,23 @@ The converter writes:
 - `data/processed/constituents.csv`
   - Columns: `date,ticker,is_member,weight,sector,market_cap`
 
+## Artifact Layout
+- Per-run artifacts: `runs/experiments/<run_id>/` with `metrics/`, `plots/`, `diagnostics/`, `models/`, `logs/`, and `manifest.json`.
+- Published snapshots: `reports/published/<topic>/`.
+- Global report index: `reports/index.csv`.
+
+Keep raw/intermediate outputs out of `reports/` root.
+
+One-time legacy consolidation:
+```bash
+python scripts/consolidate_artifacts.py --run-id legacy-20260211-colab
+```
+
+Publish curated artifacts from a run:
+```bash
+python scripts/publish_run.py --run-id <run_id>
+```
+
 ## Converter Usage
 Place your raw exports under `data/raw/` (any filenames). Then run:
 
@@ -156,12 +173,12 @@ python scripts/plot_hallucination.py --config configs/default.toml --list-dates
 
 Export the plotted windows to CSV:
 ```bash
-python scripts/plot_hallucination.py --config configs/default.toml --save-csv reports/hallucination_window.csv
+python scripts/plot_hallucination.py --config configs/default.toml --save-csv runs/experiments/manual/diagnostics/hallucination_window.csv
 ```
 
 Export all nodes to CSV:
 ```bash
-python scripts/plot_hallucination.py --config configs/default.toml --save-csv-all reports/hallucination_window_all.csv
+python scripts/plot_hallucination.py --config configs/default.toml --save-csv-all runs/experiments/manual/diagnostics/hallucination_window_all.csv
 ```
 
 ## Goodness Temperature Sweep
@@ -189,6 +206,8 @@ Or switch to self-contrastive FF (no explicit synthetic negatives):
 ```
 neg_mode = "self_contrastive"
 self_contrastive_temp = 0.2
+self_contrastive_view_mode = "shuffle+noise"
+self_contrastive_view_noise_std = 0.05
 ```
 
 Stability add-ons:
@@ -204,7 +223,8 @@ This is applied in end-to-end FF mode (`ff_e2e` / non-layerwise) and can be comb
 
 ## Training Plots
 Set `log_csv` and `plot_path` in `configs/default.toml` to write a CSV of per-epoch metrics and a PNG plot.
-Recommended publishable location: `reports/ff_train.csv` and `reports/ff_train.png`.
+Recommended run location: `runs/experiments/<run_id>/metrics/ff_train.csv` and `runs/experiments/<run_id>/plots/ff_train.png`.
+Published snapshots should live under `reports/published/`.
 The CSV now includes `hall_hardness` (avg `g_neg - g_pos` for hallucinated batches).
 It also includes `dist_forward_loss` when distance-forward auxiliary training is enabled.
 
@@ -245,21 +265,24 @@ batch_size = 32
 eval_frac = 0.2
 neg_mode = "mix"
 eval_neg_mode = "auto"
+self_contrastive_eval_view_mode = "shuffle+noise"
+self_contrastive_eval_noise_std = 0.05
 timing_warmup_epochs = 1
-out_csv = "reports/benchmark.csv"
+out_csv = "runs/experiments/default/metrics/benchmark.csv"
 ```
 
 The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_acc`, `eval_g_pos`, `eval_g_neg`, and `eval_sep`.
 If `eval_neg_mode = "auto"` with `neg_mode = "self_contrastive"`, benchmarking reports contrastive metrics (`eval_sc_loss`, `eval_sc_pos`, `eval_sc_neg`, `eval_sc_gap`, `eval_sc_acc`) and maps `eval_sep/eval_acc` to that objective.
+`self_contrastive_eval_view_mode` and `self_contrastive_eval_noise_std` let you make retrieval eval harder than plain tiny-noise views.
 
 The script also writes a speed-vs-separation plot:
 ```
-reports/benchmark_speed_sep.png
+runs/experiments/default/plots/benchmark_speed_sep.png
 ```
 
 And a bar chart summary:
 ```
-reports/benchmark.png
+runs/experiments/default/plots/benchmark.png
 ```
 
 ## Auto-Sweep (FF Hyperparams)
@@ -275,7 +298,7 @@ Configure the sweep in `configs/default.toml`:
 epochs = 3
 batch_size = 32
 eval_frac = 0.2
-out_csv = "reports/ff_sweep.csv"
+out_csv = "runs/experiments/default/metrics/ff_sweep.csv"
 modes = ["ff_layerwise", "ff_e2e"]
 goodness_temp = [0.25, 0.5]
 goodness_target = [2.0, 2.5]
@@ -295,29 +318,29 @@ worker_loader_workers = 0
 
 Plot sweep tradeoffs:
 ```bash
-python scripts/plot_ff_sweep.py --csv reports/ff_sweep.csv
+python scripts/plot_ff_sweep.py --csv runs/experiments/default/metrics/ff_sweep.csv
 ```
 
 Pareto frontier plot:
 ```bash
-python scripts/plot_ff_sweep.py --csv reports/ff_sweep.csv --pareto-out reports/ff_sweep_pareto.png
+python scripts/plot_ff_sweep.py --csv runs/experiments/default/metrics/ff_sweep.csv --pareto-out runs/experiments/default/plots/ff_sweep_pareto.png
 ```
 
 Hallucination diagnostics (distribution overlay + diff histogram):
 ```bash
-python scripts/plot_hallucination_diagnostics.py --csv reports/hallucination_window_all.csv
+python scripts/plot_hallucination_diagnostics.py --csv runs/experiments/manual/diagnostics/hallucination_window_all.csv
 ```
 
 Calibrate hallucinations (KL/JS + tail ratios):
 ```bash
-python scripts/hallucination_calibration.py --csv reports/scenario_book.csv
+python scripts/hallucination_calibration.py --csv runs/experiments/manual/metrics/scenario_book.csv
 ```
 Add `--target-ticker` for focused diagnostics and `--out-by-ticker` for per-ticker calibration tables.
 
 ## Scenario Book + Stress Test Report
 Generate a scenario book from multiple windows:
 ```bash
-python scripts/scenario_book.py --config configs/default.toml --num-scenarios 10 --out reports/scenario_book.csv
+python scripts/scenario_book.py --config configs/default.toml --num-scenarios 10 --out runs/experiments/default/metrics/scenario_book.csv
 ```
 
 You can also set defaults in `configs/default.toml`:
@@ -333,8 +356,8 @@ adaptive = true
 target_hit_rate = 0.6
 target_tolerance = 0.01
 max_adapt_steps = 40
-diag_out = "reports/scenario_constraint_diagnostics.csv"
-out = "reports/scenario_book.csv"
+diag_out = "runs/experiments/default/diagnostics/scenario_constraint_diagnostics.csv"
+out = "runs/experiments/default/metrics/scenario_book.csv"
 ```
 Then run:
 ```bash
@@ -352,7 +375,7 @@ python scripts/scenario_book.py --config configs/default.toml \
 
 Generate a stress test report (portfolio-level metrics + plot):
 ```bash
-python scripts/stress_test_report.py --csv reports/scenario_book.csv --out-csv reports/stress_test_report.csv --out-plot reports/stress_test_report.png
+python scripts/stress_test_report.py --csv runs/experiments/default/metrics/scenario_book.csv --out-csv runs/experiments/default/metrics/stress_test_report.csv --out-plot runs/experiments/default/plots/stress_test_report.png
 ```
 Add `--target-ticker` to produce `all`, `target`, and `non_target` scope diagnostics.
 
@@ -364,7 +387,7 @@ python scripts/goodness_backtest.py --config configs/default.toml --ticker MDY -
 
 Generate a sweep summary report (top-K + Pareto):
 ```bash
-python scripts/ff_sweep_summary.py --csv reports/ff_sweep.csv --out reports/ff_sweep_summary.txt
+python scripts/ff_sweep_summary.py --csv runs/experiments/default/metrics/ff_sweep.csv --out runs/experiments/default/logs/ff_sweep_summary.txt
 ```
 
 ## Long-History Data (2000–2024)
@@ -405,7 +428,7 @@ python scripts/tune_sweep_parallel.py --config configs/default.toml
 Configure candidates in `configs/default.toml`:
 ```
 [sweep_tune]
-out_csv = "reports/sweep_parallel_tune.csv"
+out_csv = "runs/experiments/default/metrics/sweep_parallel_tune.csv"
 device = "cpu"
 epochs = 1
 batch_size = 32

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import random
 import time
 from pathlib import Path
@@ -45,6 +46,64 @@ def _set_seed(seed: int) -> None:
 
 def _choose_device(device: str) -> torch.device:
     return resolve_device(device)
+
+
+def _parse_amp_dtype(value) -> torch.dtype:
+    name = str(value).strip().lower()
+    if name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    return torch.float16
+
+
+def _build_optimizer(params, lr: float, device: torch.device, use_fused: bool):
+    params = tuple(params)
+    if not params:
+        raise ValueError("optimizer got an empty parameter list")
+    kwargs = {}
+    if device.type == "cuda":
+        kwargs["foreach"] = True
+        if use_fused:
+            kwargs["fused"] = True
+    try:
+        return Adam(params, lr=lr, **kwargs)
+    except (TypeError, RuntimeError):
+        kwargs.pop("fused", None)
+    try:
+        return Adam(params, lr=lr, **kwargs)
+    except (TypeError, RuntimeError):
+        kwargs.pop("foreach", None)
+        return Adam(params, lr=lr, **kwargs)
+
+
+def _make_scaler(enabled: bool):
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
+def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
+    if not enabled:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
+
+
+def _optimizer_step(optim, loss: torch.Tensor, grad_clip: float, clip_params, scaler) -> None:
+    optim.zero_grad(set_to_none=True)
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        if grad_clip > 0:
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
+        scaler.step(optim)
+        scaler.update()
+        return
+    loss.backward()
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
+    optim.step()
 
 
 def _split_graphs(
@@ -92,6 +151,16 @@ def _resolve_mode(eval_mode: str, train_mode: str) -> str:
     return mode
 
 
+def _block_endpoint_indices(num_layers: int, block_size: int) -> list[int]:
+    if num_layers <= 0:
+        return []
+    step = max(1, int(block_size))
+    endpoints = list(range(step - 1, num_layers, step))
+    if endpoints[-1] != num_layers - 1:
+        endpoints.append(num_layers - 1)
+    return endpoints
+
+
 def _make_negatives(
     model,
     x,
@@ -127,14 +196,53 @@ def _make_negatives(
     )
 
 
+def _make_self_contrastive_view(
+    x: torch.Tensor,
+    batch: torch.Tensor,
+    view_mode: str,
+    view_noise_std: float,
+    window_len: int | None = None,
+    summary_dim: int = 0,
+) -> torch.Tensor:
+    mode = str(view_mode).strip().lower()
+    if mode in ("", "auto"):
+        mode = "shuffle+noise"
+    valid_modes = {
+        "shuffle",
+        "noise",
+        "shuffle+noise",
+        "time_flip",
+        "shuffle+time_flip",
+        "time_flip+noise",
+    }
+    if mode not in valid_modes:
+        raise ValueError(
+            f"Unsupported self_contrastive view_mode={view_mode!r}. "
+            f"Expected one of {sorted(valid_modes)}."
+        )
+    return make_negative(
+        x,
+        batch,
+        mode=mode,
+        noise_std=max(0.0, float(view_noise_std)),
+        window_len=window_len,
+        summary_dim=summary_dim,
+    )
+
+
 def _self_contrastive_step(
     h_pos: torch.Tensor,
     h_view: torch.Tensor,
     batch: torch.Tensor,
     temperature: float,
+    max_graphs: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     z_pos = global_mean_pool(h_pos, batch)
     z_view = global_mean_pool(h_view, batch)
+    if max_graphs and z_pos.size(0) > int(max_graphs):
+        idx = torch.randperm(z_pos.size(0), device=z_pos.device)[: int(max_graphs)]
+        z_pos = z_pos.index_select(0, idx)
+        z_view = z_view.index_select(0, idx)
     loss, pos_score, neg_score = self_contrastive_loss(
         z_pos,
         z_view,
@@ -156,13 +264,19 @@ def _eval_ff_metrics(
     noise_std,
     hall_cfg,
     sc_temp: float = 0.2,
+    sc_view_mode: str = "shuffle+noise",
+    sc_view_noise_std: float | None = None,
     window_len: int | None = None,
     summary_dim: int = 0,
 ):
     eval_mode = str(neg_mode).strip().lower()
     if eval_mode == "self_contrastive":
         prev_mode = model.training
-        model.train()
+        model.eval()
+        if sc_view_noise_std is None:
+            sc_view_noise_std_eff = max(1e-5, 0.5 * max(0.0, float(noise_std)))
+        else:
+            sc_view_noise_std_eff = max(0.0, float(sc_view_noise_std))
         sc_losses = []
         sc_pos = []
         sc_neg = []
@@ -171,9 +285,17 @@ def _eval_ff_metrics(
             batch = batch.to(next(model.parameters()).device)
             x = batch.x
             edge_weight = getattr(batch, "edge_weight", None)
+            x_view = _make_self_contrastive_view(
+                x,
+                batch.batch,
+                view_mode=sc_view_mode,
+                view_noise_std=sc_view_noise_std_eff,
+                window_len=window_len,
+                summary_dim=summary_dim,
+            )
             with torch.no_grad():
                 h_a = model(x, batch.edge_index, edge_weight=edge_weight)
-                h_b = model(x, batch.edge_index, edge_weight=edge_weight)
+                h_b = model(x_view, batch.edge_index, edge_weight=edge_weight)
                 z_a = global_mean_pool(h_a, batch.batch)
                 z_b = global_mean_pool(h_b, batch.batch)
                 loss, pos_score, neg_score = self_contrastive_loss(
@@ -196,6 +318,8 @@ def _eval_ff_metrics(
             "eval_sc_neg": neg_mean,
             "eval_sc_gap": pos_mean - neg_mean,
             "eval_sc_acc": float(np.mean(sc_acc)) if sc_acc else 0.0,
+            "eval_sc_view_mode": str(sc_view_mode).strip().lower(),
+            "eval_sc_view_noise_std": sc_view_noise_std_eff,
             "eval_g_pos": pos_mean,
             "eval_g_neg": neg_mean,
             "eval_sep": pos_mean - neg_mean,
@@ -394,7 +518,13 @@ def _benchmark_ff(
         num_layers=config["num_layers"],
         dropout=config["dropout"],
     ).to(device)
-    optim = Adam(model.parameters(), lr=config["lr"])
+    optim = _build_optimizer(
+        model.parameters(),
+        lr=config["lr"],
+        device=device,
+        use_fused=bool(config.get("fused_optimizer", True)),
+    )
+    clip_params = list(model.parameters())
 
     hall_cfg = HallucinationConfig(
         steps=config["hall_steps"],
@@ -413,8 +543,18 @@ def _benchmark_ff(
         freeze_non_return_features=bool(config.get("hall_freeze_non_return", True)),
     )
     sc_temp = float(config.get("self_contrastive_temp", 0.2))
+    sc_max_graphs = int(config.get("self_contrastive_max_graphs", 0))
     dist_weight = float(config.get("distance_forward_weight", 0.0))
     dist_margin = float(config.get("distance_forward_margin", 0.15))
+    dist_max_graphs = int(config.get("distance_forward_max_graphs", 0))
+    dist_interval = max(1, int(config.get("distance_forward_interval", 1)))
+    amp_dtype = _parse_amp_dtype(config.get("amp_dtype", "float16"))
+    amp_enabled = bool(config.get("amp", False) and device.type == "cuda")
+    if amp_enabled and amp_dtype == torch.bfloat16:
+        bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+        if not bf16_ok:
+            amp_dtype = torch.float16
+    scaler = _make_scaler(amp_enabled and amp_dtype == torch.float16)
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if layerwise and train_neg_mode == "self_contrastive":
         fallback = str(config.get("layerwise_neg_mode", "shuffle")).strip().lower()
@@ -424,6 +564,18 @@ def _benchmark_ff(
         )
         train_neg_mode = fallback
     eval_mode = _resolve_mode(config.get("eval_neg_mode", "auto"), train_neg_mode)
+    ff_blockwise = bool(config.get("ff_blockwise", False)) and bool(layerwise)
+    ff_block_size = max(1, int(config.get("ff_block_size", 2)))
+    if ff_block_size <= 1:
+        ff_blockwise = False
+    ff_block_endpoints = (
+        _block_endpoint_indices(len(model.layers), ff_block_size) if ff_blockwise else []
+    )
+    if ff_blockwise:
+        print(
+            "benchmark layerwise blockwise endpoints: "
+            + ",".join(str(i + 1) for i in ff_block_endpoints)
+        )
 
     epoch_times = []
     for epoch in tqdm(
@@ -437,7 +589,7 @@ def _benchmark_ff(
         t0 = time.perf_counter()
         graphs_seen = 0
         total_loss = 0.0
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader, start=1):
             batch = batch.to(device)
             x = batch.x
             edge_weight = getattr(batch, "edge_weight", None)
@@ -450,56 +602,126 @@ def _benchmark_ff(
                 config["neg_mix_end"],
                 config["neg_mix_ramp_epochs"],
             )
+            apply_distance = dist_weight > 0 and (batch_idx % dist_interval == 0)
+            step_scaler = scaler if (amp_enabled and use_mode == "self_contrastive") else None
 
             if layerwise:
-                x_in = x
-                for li in range(len(model.layers)):
+                if ff_blockwise:
                     layer_mode = use_mode
                     if layer_mode == "self_contrastive":
                         layer_mode = "shuffle"
-                    h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
-                    g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
                     x_neg = _make_negatives(
                         model,
-                        x_in,
+                        x,
                         batch.batch,
                         batch.edge_index,
                         getattr(batch, "edge_attr", None),
                         edge_weight,
-                        "hallucinate" if (layer_mode == "hallucinate" and li == 0) else "shuffle",
-                        config["noise_std"],
+                        "hallucinate" if layer_mode == "hallucinate" else config["layerwise_neg_mode"],
+                        config["layerwise_noise_std"],
                         hall_cfg,
                         window_len=config.get("window_len"),
                         summary_dim=config.get("summary_dim", 0),
                     )
-                    h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                    g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
-                    loss = ff_loss(g_pos, g_neg, target=config["goodness_target"])
-                    optim.zero_grad()
-                    loss.backward()
-                    if config["grad_clip"] > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-                    optim.step()
-                    total_loss += loss.item()
-                    x_in = h_pos.detach()
-            else:
-                h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                if use_mode == "self_contrastive":
-                    h_view = model(x, batch.edge_index, edge_weight=edge_weight)
-                    loss, _, _, z_pos, z_view = _self_contrastive_step(
-                        h_pos,
-                        h_view,
-                        batch.batch,
-                        temperature=sc_temp,
+                    layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    if layer_mode == "hallucinate":
+                        last_idx = ff_block_endpoints[-1]
+                        g_pos_probe = goodness(
+                            layers_pos[last_idx], batch.batch, temperature=config["goodness_temp"]
+                        ).mean().item()
+                        g_neg_probe = goodness(
+                            layers_neg[last_idx], batch.batch, temperature=config["goodness_temp"]
+                        ).mean().item()
+                        if g_neg_probe > g_pos_probe + config["neg_gate_margin"]:
+                            x_neg = make_negative(
+                                x,
+                                batch.batch,
+                                mode="shuffle",
+                                noise_std=config["noise_std"],
+                                window_len=config.get("window_len"),
+                                summary_dim=config.get("summary_dim", 0),
+                            )
+                            layers_neg = model(
+                                x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
+                            )
+                    loss = 0.0
+                    for li in ff_block_endpoints:
+                        g_pos = goodness(layers_pos[li], batch.batch, temperature=config["goodness_temp"])
+                        g_neg = goodness(layers_neg[li], batch.batch, temperature=config["goodness_temp"])
+                        loss = loss + ff_loss(g_pos, g_neg, target=config["goodness_target"])
+                    loss = loss / max(1, len(ff_block_endpoints))
+                    _optimizer_step(
+                        optim=optim,
+                        loss=loss,
+                        grad_clip=float(config["grad_clip"]),
+                        clip_params=clip_params,
+                        scaler=None,
                     )
-                    if dist_weight > 0:
-                        z_neg = permute_graph_embeddings(z_view)
-                        loss = loss + dist_weight * pairwise_distance_forward_loss(
-                            z_pos,
-                            z_neg,
-                            margin=dist_margin,
-                        )
+                    total_loss += loss.item()
                 else:
+                    x_in = x
+                    for li in range(len(model.layers)):
+                        layer_mode = use_mode
+                        if layer_mode == "self_contrastive":
+                            layer_mode = "shuffle"
+                        h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
+                        g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
+                        x_neg = _make_negatives(
+                            model,
+                            x_in,
+                            batch.batch,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            edge_weight,
+                            "hallucinate" if (layer_mode == "hallucinate" and li == 0) else "shuffle",
+                            config["noise_std"],
+                            hall_cfg,
+                            window_len=config.get("window_len"),
+                            summary_dim=config.get("summary_dim", 0),
+                        )
+                        h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                        g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
+                        loss = ff_loss(g_pos, g_neg, target=config["goodness_target"])
+                        _optimizer_step(
+                            optim=optim,
+                            loss=loss,
+                            grad_clip=float(config["grad_clip"]),
+                            clip_params=clip_params,
+                            scaler=None,
+                        )
+                        total_loss += loss.item()
+                        x_in = h_pos.detach()
+            else:
+                if use_mode == "self_contrastive":
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        x_view = _make_self_contrastive_view(
+                            x,
+                            batch.batch,
+                            view_mode=config["self_contrastive_view_mode"],
+                            view_noise_std=config["self_contrastive_view_noise_std"],
+                            window_len=config.get("window_len"),
+                            summary_dim=config.get("summary_dim", 0),
+                        )
+                        h_view = model(x_view, batch.edge_index, edge_weight=edge_weight)
+                        loss, _, _, z_pos, z_view = _self_contrastive_step(
+                            h_pos,
+                            h_view,
+                            batch.batch,
+                            temperature=sc_temp,
+                            max_graphs=sc_max_graphs,
+                        )
+                        if apply_distance:
+                            z_neg = permute_graph_embeddings(z_view)
+                            loss = loss + dist_weight * pairwise_distance_forward_loss(
+                                z_pos,
+                                z_neg,
+                                margin=dist_margin,
+                                max_graphs=dist_max_graphs,
+                            )
+                else:
+                    h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
                     g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
                     x_neg = _make_negatives(
                         model,
@@ -517,19 +739,22 @@ def _benchmark_ff(
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                     g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
                     loss = ff_loss(g_pos, g_neg, target=config["goodness_target"])
-                    if dist_weight > 0:
+                    if apply_distance:
                         z_pos = global_mean_pool(h_pos, batch.batch)
                         z_neg = global_mean_pool(h_neg, batch.batch)
                         loss = loss + dist_weight * pairwise_distance_forward_loss(
                             z_pos,
                             z_neg,
                             margin=dist_margin,
+                            max_graphs=dist_max_graphs,
                         )
-                optim.zero_grad()
-                loss.backward()
-                if config["grad_clip"] > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-                optim.step()
+                _optimizer_step(
+                    optim=optim,
+                    loss=loss,
+                    grad_clip=float(config["grad_clip"]),
+                    clip_params=clip_params,
+                    scaler=step_scaler,
+                )
                 total_loss += loss.item()
 
             graphs_seen += batch.num_graphs
@@ -571,6 +796,8 @@ def _benchmark_ff(
         config["noise_std"],
         hall_cfg,
         sc_temp=sc_temp,
+        sc_view_mode=config.get("self_contrastive_eval_view_mode", "shuffle+noise"),
+        sc_view_noise_std=config.get("self_contrastive_eval_noise_std"),
         window_len=config.get("window_len"),
         summary_dim=config.get("summary_dim", 0),
     )
@@ -620,8 +847,21 @@ def _benchmark_backprop(graphs, device, config):
         dropout=config["dropout"],
     ).to(device)
     head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
-    optim = Adam(list(model.parameters()) + list(head.parameters()), lr=config["lr"])
+    optim_params = list(model.parameters()) + list(head.parameters())
+    optim = _build_optimizer(
+        optim_params,
+        lr=config["lr"],
+        device=device,
+        use_fused=bool(config.get("backprop_fused_optimizer", True)),
+    )
     bce = torch.nn.BCEWithLogitsLoss()
+    bp_amp_dtype = _parse_amp_dtype(config.get("backprop_amp_dtype", "float16"))
+    bp_amp_enabled = bool(config.get("backprop_amp", False) and device.type == "cuda")
+    if bp_amp_enabled and bp_amp_dtype == torch.bfloat16:
+        bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+        if not bf16_ok:
+            bp_amp_dtype = torch.float16
+    bp_scaler = _make_scaler(bp_amp_enabled and bp_amp_dtype == torch.float16)
 
     hall_cfg = HallucinationConfig(
         steps=config["hall_steps"],
@@ -658,9 +898,10 @@ def _benchmark_backprop(graphs, device, config):
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
             x = batch.x
-            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-            z_pos = global_mean_pool(h_pos, batch.batch)
-            y_pos = torch.ones(z_pos.size(0), device=device)
+            with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
+                h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                z_pos = global_mean_pool(h_pos, batch.batch)
+                y_pos = torch.ones(z_pos.size(0), device=device)
 
             use_mode = _get_use_mode(
                 epoch,
@@ -683,20 +924,23 @@ def _benchmark_backprop(graphs, device, config):
                 window_len=config.get("window_len"),
                 summary_dim=config.get("summary_dim", 0),
             )
-            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-            z_neg = global_mean_pool(h_neg, batch.batch)
-            y_neg = torch.zeros(z_neg.size(0), device=device)
+            with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
+                h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                z_neg = global_mean_pool(h_neg, batch.batch)
+                y_neg = torch.zeros(z_neg.size(0), device=device)
 
-            z = torch.cat([z_pos, z_neg], dim=0)
-            y = torch.cat([y_pos, y_neg], dim=0)
-            logits = head(z).squeeze(1)
-            loss = bce(logits, y)
+                z = torch.cat([z_pos, z_neg], dim=0)
+                y = torch.cat([y_pos, y_neg], dim=0)
+                logits = head(z).squeeze(1)
+                loss = bce(logits, y)
 
-            optim.zero_grad()
-            loss.backward()
-            if config["grad_clip"] > 0:
-                torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head.parameters()), config["grad_clip"])
-            optim.step()
+            _optimizer_step(
+                optim=optim,
+                loss=loss,
+                grad_clip=float(config["grad_clip"]),
+                clip_params=optim_params,
+                scaler=bp_scaler,
+            )
             graphs_seen += batch.num_graphs
         _sync(device)
         dt = time.perf_counter() - t0
@@ -801,8 +1045,11 @@ def main() -> int:
     build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
-    payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
-    graphs = payload["graphs"]
+    try:
+        payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(graphs_path, map_location="cpu")
+    graphs = payload["graphs"] if isinstance(payload, dict) and "graphs" in payload else payload
 
     device = _choose_device(train_cfg.get("device", "auto"))
     _set_seed(int(train_cfg.get("seed", 7)))
@@ -838,9 +1085,49 @@ def main() -> int:
         "goodness_target": float(train_cfg.get("goodness_target", 1.0)),
         "goodness_temp": float(train_cfg.get("goodness_temp", 1.0)),
         "self_contrastive_temp": float(train_cfg.get("self_contrastive_temp", 0.2)),
+        "self_contrastive_view_mode": str(
+            train_cfg.get("self_contrastive_view_mode", "shuffle+noise")
+        ),
+        "self_contrastive_view_noise_std": float(
+            train_cfg.get("self_contrastive_view_noise_std", train_cfg.get("noise_std", 0.05))
+        ),
+        "self_contrastive_eval_view_mode": str(
+            bench_cfg.get(
+                "self_contrastive_eval_view_mode",
+                train_cfg.get("self_contrastive_eval_view_mode", "shuffle+noise"),
+            )
+        ),
+        "self_contrastive_eval_noise_std": float(
+            bench_cfg.get(
+                "self_contrastive_eval_noise_std",
+                train_cfg.get("self_contrastive_eval_noise_std", train_cfg.get("noise_std", 0.05)),
+            )
+        ),
+        "self_contrastive_max_graphs": int(train_cfg.get("self_contrastive_max_graphs", 0)),
         "distance_forward_weight": float(train_cfg.get("distance_forward_weight", 0.0)),
         "distance_forward_margin": float(train_cfg.get("distance_forward_margin", 0.15)),
+        "distance_forward_max_graphs": int(train_cfg.get("distance_forward_max_graphs", 0)),
+        "distance_forward_interval": int(train_cfg.get("distance_forward_interval", 1)),
+        "ff_blockwise": bool(train_cfg.get("ff_blockwise", False)),
+        "ff_block_size": int(train_cfg.get("ff_block_size", 2)),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
+        "amp": bool(bench_cfg.get("ff_amp", train_cfg.get("amp", True))),
+        "amp_dtype": str(bench_cfg.get("amp_dtype", train_cfg.get("amp_dtype", "float16"))),
+        "fused_optimizer": bool(
+            bench_cfg.get("fused_optimizer", train_cfg.get("fused_optimizer", True))
+        ),
+        "backprop_amp": bool(
+            bench_cfg.get("backprop_amp", bench_cfg.get("ff_amp", train_cfg.get("amp", True)))
+        ),
+        "backprop_amp_dtype": str(
+            bench_cfg.get("backprop_amp_dtype", bench_cfg.get("amp_dtype", train_cfg.get("amp_dtype", "float16")))
+        ),
+        "backprop_fused_optimizer": bool(
+            bench_cfg.get(
+                "backprop_fused_optimizer",
+                bench_cfg.get("fused_optimizer", train_cfg.get("fused_optimizer", True)),
+            )
+        ),
         "loader_workers": int(train_cfg.get("loader_workers", 0)),
         "persistent_workers": bool(train_cfg.get("dataloader_persistent_workers", True)),
         "prefetch_factor": int(train_cfg.get("dataloader_prefetch_factor", 2)),
@@ -868,6 +1155,7 @@ def main() -> int:
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
         "calibrate_quantiles": int(bench_cfg.get("calibrate_quantiles", 31)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
+        "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
         "window_len": int(returns_len),
         "summary_dim": int(summary_dim),
     }
@@ -886,7 +1174,7 @@ def main() -> int:
         res["mode"] = mode
         results.append(res)
 
-    out_path = Path(bench_cfg.get("out_csv", "reports/benchmark.csv"))
+    out_path = Path(bench_cfg.get("out_csv", "runs/experiments/manual/metrics/benchmark.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     import csv
 
@@ -901,8 +1189,8 @@ def main() -> int:
     for r in results:
         print(r)
 
-    plot_path = bench_cfg.get("plot_path", "reports/benchmark_speed_sep.png")
-    bar_plot_path = bench_cfg.get("bar_plot_path", "reports/benchmark.png")
+    plot_path = bench_cfg.get("plot_path", "runs/experiments/manual/plots/benchmark_speed_sep.png")
+    bar_plot_path = bench_cfg.get("bar_plot_path", "runs/experiments/manual/plots/benchmark.png")
     try:
         import matplotlib.pyplot as plt
 

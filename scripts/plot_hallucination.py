@@ -30,10 +30,14 @@ def main() -> int:
     parser.add_argument("--graph-index", type=int, default=None, help="Graph index to plot")
     parser.add_argument("--date", default=None, help="Graph date (YYYY-MM-DD) to plot")
     parser.add_argument("--top-k", type=int, default=5, help="Number of tickers to plot")
-    parser.add_argument("--out", default="reports/hallucination_plot.png", help="Output PNG")
+    parser.add_argument(
+        "--out",
+        default="runs/experiments/manual/diagnostics/hallucination_plot.png",
+        help="Output PNG",
+    )
     parser.add_argument(
         "--save-csv",
-        default="reports/hallucination_window.csv",
+        default="runs/experiments/manual/diagnostics/hallucination_window.csv",
         help="Output CSV of real vs hallucinated returns",
     )
     parser.add_argument(

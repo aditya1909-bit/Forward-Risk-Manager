@@ -178,6 +178,7 @@ def pairwise_distance_forward_loss(
     z_pos: torch.Tensor,
     z_neg: torch.Tensor,
     margin: float = 0.15,
+    max_graphs: int = 0,
 ) -> torch.Tensor:
     if z_pos.ndim != 2 or z_neg.ndim != 2:
         raise ValueError("Expected z_pos and z_neg to have shape [num_graphs, dim]")
@@ -185,6 +186,11 @@ def pairwise_distance_forward_loss(
         raise ValueError("z_pos and z_neg must have the same shape")
     if z_pos.size(0) == 0:
         return torch.zeros((), device=z_pos.device, dtype=z_pos.dtype)
+
+    if max_graphs and z_pos.size(0) > int(max_graphs):
+        idx = torch.randperm(z_pos.size(0), device=z_pos.device)[: int(max_graphs)]
+        z_pos = z_pos.index_select(0, idx)
+        z_neg = z_neg.index_select(0, idx)
 
     d_neg = torch.norm(z_pos - z_neg, p=2, dim=1)
     if z_pos.size(0) == 1:

@@ -87,11 +87,19 @@ def _summarize(real: np.ndarray, hall: np.ndarray, bins: int = 60) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calibrate hallucinations vs real distributions.")
-    parser.add_argument("--csv", default="reports/scenario_book.csv", help="Input CSV")
-    parser.add_argument("--out", default="reports/hallucination_calibration.json", help="Output JSON")
+    parser.add_argument(
+        "--csv",
+        default="runs/experiments/manual/metrics/scenario_book.csv",
+        help="Input CSV",
+    )
+    parser.add_argument(
+        "--out",
+        default="runs/experiments/manual/diagnostics/hallucination_calibration.json",
+        help="Output JSON",
+    )
     parser.add_argument(
         "--out-by-ticker",
-        default="reports/hallucination_calibration_by_ticker.csv",
+        default="runs/experiments/manual/diagnostics/hallucination_calibration_by_ticker.csv",
         help="Optional per-ticker calibration CSV (empty to disable).",
     )
     parser.add_argument("--target-ticker", default="", help="Optional target ticker for focused diagnostics.")

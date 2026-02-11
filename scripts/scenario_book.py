@@ -99,7 +99,7 @@ def main() -> int:
         "--target-drop",
         type=float,
         default=0.0,
-        help="Target cumulative return over window (e.g., -0.10 for -10%)",
+        help="Target cumulative return over window (e.g., -0.10 for -10%%)",
     )
     parser.add_argument(
         "--constraint-weight",
@@ -221,6 +221,24 @@ def main() -> int:
         help="Tolerance for constraint hit (absolute)",
     )
     parser.add_argument(
+        "--nontarget-drift-weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight to keep non-target tickers near original returns.",
+    )
+    parser.add_argument(
+        "--nontarget-drift-tolerance",
+        type=float,
+        default=0.0,
+        help="Free band for non-target drift before penalty is applied.",
+    )
+    parser.add_argument(
+        "--max-nontarget-drift",
+        type=float,
+        default=0.03,
+        help="Adaptive target for mean non-target absolute return drift.",
+    )
+    parser.add_argument(
         "--max-adapt-steps",
         type=int,
         default=6,
@@ -329,6 +347,24 @@ def main() -> int:
         help="Min hallucination corr penalty in adaptive mode",
     )
     parser.add_argument(
+        "--adapt-nontarget-mult",
+        type=float,
+        default=1.4,
+        help="Multiplier for non-target drift weight when drift is too high.",
+    )
+    parser.add_argument(
+        "--adapt-max-nontarget-weight",
+        type=float,
+        default=300.0,
+        help="Cap for non-target drift penalty weight in adaptive mode.",
+    )
+    parser.add_argument(
+        "--adapt-nontarget-reg-mult",
+        type=float,
+        default=1.15,
+        help="Regularization multiplier when non-target drift is too high.",
+    )
+    parser.add_argument(
         "--constraint-mode",
         choices=["exact", "at_least"],
         default="exact",
@@ -347,7 +383,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--out",
-        default="reports/scenario_book.csv",
+        default="runs/experiments/manual/metrics/scenario_book.csv",
         help="Output CSV path",
     )
     args = parser.parse_args()
@@ -392,6 +428,9 @@ def main() -> int:
     _maybe_override("adaptive", "--adaptive", bool)
     _maybe_override("target_hit_rate", "--target-hit-rate", float)
     _maybe_override("target_tolerance", "--target-tolerance", float)
+    _maybe_override("nontarget_drift_weight", "--nontarget-drift-weight", float)
+    _maybe_override("nontarget_drift_tolerance", "--nontarget-drift-tolerance", float)
+    _maybe_override("max_nontarget_drift", "--max-nontarget-drift", float)
     _maybe_override("max_adapt_steps", "--max-adapt-steps", int)
     _maybe_override("adapt_constraint_mult", "--adapt-constraint-mult", float)
     _maybe_override("adapt_hall_step_inc", "--adapt-hall-step-inc", int)
@@ -410,6 +449,9 @@ def main() -> int:
     _maybe_override("adapt_min_mean", "--adapt-min-mean", float)
     _maybe_override("adapt_min_std", "--adapt-min-std", float)
     _maybe_override("adapt_min_corr", "--adapt-min-corr", float)
+    _maybe_override("adapt_nontarget_mult", "--adapt-nontarget-mult", float)
+    _maybe_override("adapt_max_nontarget_weight", "--adapt-max-nontarget-weight", float)
+    _maybe_override("adapt_nontarget_reg_mult", "--adapt-nontarget-reg-mult", float)
 
     _maybe_override("hall_steps", "--hall-steps", int)
     _maybe_override("hall_lr", "--hall-lr", float)
@@ -549,7 +591,11 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     import csv
 
-    def _run_once(hcfg: HallucinationConfig, constraint_weight: float):
+    def _run_once(
+        hcfg: HallucinationConfig,
+        constraint_weight: float,
+        nontarget_drift_weight: float,
+    ):
         scenario_rows = []
         diag_rows = []
 
@@ -576,6 +622,7 @@ def main() -> int:
             constraint_fn = None
             force_indices = None
             target_idx = None
+            nontarget_mean_abs_delta = None
             if args.target_ticker:
                 if args.target_ticker not in tickers:
                     raise ValueError(f"Target ticker {args.target_ticker} not in graph.")
@@ -587,6 +634,8 @@ def main() -> int:
                 else:
                     ret_mean_t = None
                     ret_std_t = None
+
+                pos_returns_ref = pos_returns.detach()
 
                 def _constraint(x_var, idx=target_idx):
                     if ret_mean_t is not None and ret_std_t is not None:
@@ -600,7 +649,23 @@ def main() -> int:
                         args.constraint_mode,
                         args.constraint_tolerance,
                     )
-                    return constraint_weight * diff.pow(2)
+                    loss = constraint_weight * diff.pow(2)
+
+                    if nontarget_drift_weight > 0 and x_var.size(0) > 1:
+                        if ret_mean_t is not None and ret_std_t is not None:
+                            all_rets = x_var[:, :returns_len] * ret_std_t + ret_mean_t
+                        else:
+                            all_rets = x_var[:, :returns_len]
+                        nt_mask = torch.ones(all_rets.size(0), dtype=torch.bool, device=all_rets.device)
+                        nt_mask[idx] = False
+                        if nt_mask.any():
+                            nt_ref = pos_returns_ref.to(all_rets.device)
+                            drift = (all_rets[nt_mask] - nt_ref[nt_mask]).abs().mean()
+                            tol = max(0.0, float(args.nontarget_drift_tolerance))
+                            if tol > 0:
+                                drift = torch.relu(drift - tol)
+                            loss = loss + float(nontarget_drift_weight) * drift.pow(2)
+                    return loss
 
                 constraint_fn = _constraint
 
@@ -653,12 +718,20 @@ def main() -> int:
                     node_fraction=new_node_fraction,
                 )
 
-            pos_returns = pos_returns.numpy()
-            neg_returns = neg_returns.detach().numpy()
+            if target_idx is not None and neg_returns.size(0) > 1:
+                nt_mask = torch.ones(neg_returns.size(0), dtype=torch.bool, device=neg_returns.device)
+                nt_mask[target_idx] = False
+                if nt_mask.any():
+                    nontarget_mean_abs_delta = float(
+                        torch.mean(torch.abs(neg_returns[nt_mask] - pos_returns[nt_mask])).item()
+                    )
+
+            pos_returns_np = pos_returns.detach().cpu().numpy()
+            neg_returns_np = neg_returns.detach().cpu().numpy()
 
             if target_idx is not None:
-                real_cum = float(np.exp(np.sum(pos_returns[target_idx])) - 1.0)
-                hall_cum = float(np.exp(np.sum(neg_returns[target_idx])) - 1.0)
+                real_cum = float(np.exp(np.sum(pos_returns_np[target_idx])) - 1.0)
+                hall_cum = float(np.exp(np.sum(neg_returns_np[target_idx])) - 1.0)
                 diff = hall_cum - args.target_drop
                 print(
                     f"scenario {scenario_id} {date} {args.target_ticker}: "
@@ -678,6 +751,7 @@ def main() -> int:
                         "hall_cum_return": hall_cum,
                         "hall_minus_target": diff,
                         "abs_error": abs(diff),
+                        "nontarget_mean_abs_delta": nontarget_mean_abs_delta,
                         "hit": int(
                             _constraint_hit(
                                 diff,
@@ -691,8 +765,8 @@ def main() -> int:
 
             selected = list(range(len(tickers)))
             if args.max_tickers and args.max_tickers > 0:
-                pos_cum = np.exp(np.cumsum(pos_returns, axis=1))
-                neg_cum = np.exp(np.cumsum(neg_returns, axis=1))
+                pos_cum = np.exp(np.cumsum(pos_returns_np, axis=1))
+                neg_cum = np.exp(np.cumsum(neg_returns_np, axis=1))
                 diff = neg_cum[:, -1] - pos_cum[:, -1]
                 ranked = np.argsort(diff)
                 selected = ranked[: args.max_tickers].tolist()
@@ -701,15 +775,16 @@ def main() -> int:
 
             for i in selected:
                 scenario_rows.append(
-                    [scenario_id, idx, date, tickers[i], "real"] + list(pos_returns[i])
+                    [scenario_id, idx, date, tickers[i], "real"] + list(pos_returns_np[i])
                 )
                 scenario_rows.append(
-                    [scenario_id, idx, date, tickers[i], "halluc"] + list(neg_returns[i])
+                    [scenario_id, idx, date, tickers[i], "halluc"] + list(neg_returns_np[i])
                 )
 
         return scenario_rows, diag_rows
 
     constraint_weight = float(args.constraint_weight)
+    nontarget_drift_weight = float(args.nontarget_drift_weight)
     max_steps = max(1, int(args.max_adapt_steps)) if args.adaptive else 1
     attempt = 0
     final_rows = []
@@ -726,6 +801,7 @@ def main() -> int:
             hall_cfg.corr_weight,
             hall_cfg.node_fraction,
             hall_cfg.clamp_std,
+            nontarget_drift_weight,
         )
         attempt += 1
         clamp_display = (
@@ -742,9 +818,10 @@ def main() -> int:
             f"hall_corr={hall_cfg.corr_weight:.3f} | "
             f"hall_mean={hall_cfg.mean_weight:.4f} | "
             f"hall_std={hall_cfg.std_weight:.4f} | "
-            f"hall_clamp={clamp_display}"
+            f"hall_clamp={clamp_display} | "
+            f"nontarget_drift_weight={nontarget_drift_weight:.3f}"
         )
-        scenario_rows, diag_rows = _run_once(hall_cfg, constraint_weight)
+        scenario_rows, diag_rows = _run_once(hall_cfg, constraint_weight, nontarget_drift_weight)
         final_rows = scenario_rows
         final_diag = diag_rows
 
@@ -769,15 +846,33 @@ def main() -> int:
         mean_abs = sum(abs_diffs) / len(abs_diffs)
         med_abs = sorted(abs_diffs)[len(abs_diffs) // 2]
         p90_abs = float(np.quantile(np.array(abs_diffs), 0.9))
+        nontarget_diffs = [
+            float(row["nontarget_mean_abs_delta"])
+            for row in diag_rows
+            if row.get("nontarget_mean_abs_delta") is not None
+        ]
+        mean_nontarget = (
+            sum(nontarget_diffs) / len(nontarget_diffs) if nontarget_diffs else float("nan")
+        )
         print(
             "constraint summary: "
             f"hit_rate={hits}/{len(diffs)} ({hit_rate:.1%}) | "
             f"mean_diff={mean_diff:.4f} | median_diff={med_diff:.4f} | "
             f"mean_abs={mean_abs:.4f} | median_abs={med_abs:.4f} | p90_abs={p90_abs:.4f}"
+            + (
+                f" | mean_non_target_abs={mean_nontarget:.4f}"
+                if np.isfinite(mean_nontarget)
+                else ""
+            )
         )
-        if hit_rate >= args.target_hit_rate:
-            print("Target hit rate reached.")
+        drift_ok = (not nontarget_diffs) or (mean_nontarget <= float(args.max_nontarget_drift))
+        if hit_rate >= args.target_hit_rate and drift_ok:
+            print("Target hit rate and non-target drift thresholds reached.")
             break
+        if hit_rate >= args.target_hit_rate and not drift_ok:
+            print(
+                "Target hit rate reached but non-target drift is above threshold; tightening drift control."
+            )
 
         # Adaptive adjustments
         if args.constraint_mode == "exact":
@@ -790,7 +885,39 @@ def main() -> int:
             needs_harder = mean_diff < -args.target_tolerance
             too_hard = mean_diff > args.target_tolerance
 
-        if needs_harder:
+        needs_drift_tightening = (not drift_ok) and np.isfinite(mean_nontarget)
+
+        if needs_drift_tightening:
+            base_weight = (
+                nontarget_drift_weight
+                if nontarget_drift_weight > 0
+                else max(1.0, 0.25 * constraint_weight)
+            )
+            nontarget_drift_weight = min(
+                base_weight * args.adapt_nontarget_mult,
+                args.adapt_max_nontarget_weight,
+            )
+            hall_cfg.l2_weight = min(
+                hall_cfg.l2_weight * args.adapt_nontarget_reg_mult,
+                2.0,
+            )
+            hall_cfg.mean_weight = min(
+                hall_cfg.mean_weight * args.adapt_nontarget_reg_mult,
+                2.0,
+            )
+            hall_cfg.std_weight = min(
+                hall_cfg.std_weight * args.adapt_nontarget_reg_mult,
+                2.0,
+            )
+            hall_cfg.corr_weight = min(
+                hall_cfg.corr_weight * args.adapt_nontarget_reg_mult,
+                5.0,
+            )
+            hall_cfg.lr = max(
+                hall_cfg.lr / max(args.adapt_hall_lr_mult, 1e-6),
+                0.001,
+            )
+        elif needs_harder:
             constraint_weight = min(
                 constraint_weight * args.adapt_constraint_mult,
                 args.adapt_max_constraint,
@@ -847,6 +974,7 @@ def main() -> int:
             hall_cfg.corr_weight,
             hall_cfg.node_fraction,
             hall_cfg.clamp_std,
+            nontarget_drift_weight,
         )
         if new_state == prev_state and attempt < max_steps:
             print("adaptive tuning saturated at current caps; stopping early.")
@@ -882,6 +1010,7 @@ def main() -> int:
                     "hall_cum_return",
                     "hall_minus_target",
                     "abs_error",
+                    "nontarget_mean_abs_delta",
                     "hit",
                 ],
             )
@@ -908,11 +1037,24 @@ def main() -> int:
             mean_abs = sum(abs_diffs) / len(abs_diffs)
             med_abs = sorted(abs_diffs)[len(abs_diffs) // 2]
             p90_abs = float(np.quantile(np.array(abs_diffs), 0.9))
+            nontarget_diffs = [
+                float(row["nontarget_mean_abs_delta"])
+                for row in final_diag
+                if row.get("nontarget_mean_abs_delta") is not None
+            ]
+            mean_nontarget = (
+                sum(nontarget_diffs) / len(nontarget_diffs) if nontarget_diffs else float("nan")
+            )
             print(
                 "constraint summary: "
                 f"hit_rate={hits}/{len(diffs)} ({hit_rate:.1%}) | "
                 f"mean_diff={mean_diff:.4f} | median_diff={med_diff:.4f} | "
                 f"mean_abs={mean_abs:.4f} | median_abs={med_abs:.4f} | p90_abs={p90_abs:.4f}"
+                + (
+                    f" | mean_non_target_abs={mean_nontarget:.4f}"
+                    if np.isfinite(mean_nontarget)
+                    else ""
+                )
             )
 
     print(f"Wrote {out}")

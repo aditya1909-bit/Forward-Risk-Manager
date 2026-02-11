@@ -95,10 +95,20 @@ def _apply_to_config(path: Path, section: str, updates: dict) -> None:
 def _pick_rank_column(rows: list[dict], rank_by: str) -> str:
     if rank_by != "auto":
         return rank_by
+    if any(_to_float(r.get("rank_value")) is not None for r in rows):
+        return "rank_value"
+    objectives = [str(r.get("eval_objective", "")).strip().lower() for r in rows]
+    has_sc = any(obj == "self_contrastive" for obj in objectives)
+    has_ff = any(obj == "ff" for obj in objectives)
+    if has_sc and not has_ff:
+        if any(_to_float(r.get("eval_sc_gap")) is not None for r in rows):
+            return "eval_sc_gap"
     for key in ("score", "eval_sep", "eval_acc", "graphs_per_s"):
         if any(_to_float(r.get(key)) is not None for r in rows):
             return key
-    raise ValueError("No numeric ranking column found. Expected score/eval_sep/eval_acc/graphs_per_s.")
+    raise ValueError(
+        "No numeric ranking column found. Expected rank_value/eval_sc_gap/score/eval_sep/eval_acc/graphs_per_s."
+    )
 
 
 def _read_rows(path: Path) -> list[dict]:
@@ -181,11 +191,11 @@ def main() -> int:
     parser.add_argument(
         "--csv",
         default="",
-        help="Sweep CSV path (defaults to [sweep].out_csv or reports/ff_sweep.csv)",
+        help="Sweep CSV path (defaults to [sweep].out_csv or runs/experiments/manual/metrics/ff_sweep.csv)",
     )
     parser.add_argument(
         "--rank-by",
-        choices=["auto", "score", "eval_sep", "eval_acc", "graphs_per_s"],
+        choices=["auto", "rank_value", "score", "eval_sc_gap", "eval_sep", "eval_acc", "graphs_per_s"],
         default="auto",
         help="Column to maximize when selecting best row",
     )
@@ -203,7 +213,9 @@ def main() -> int:
     cfg_path = Path(args.config)
     cfg = _load_config(cfg_path)
     sweep_cfg = cfg.get("sweep", {})
-    csv_path = Path(args.csv or sweep_cfg.get("out_csv", "reports/ff_sweep.csv"))
+    csv_path = Path(
+        args.csv or sweep_cfg.get("out_csv", "runs/experiments/manual/metrics/ff_sweep.csv")
+    )
     rows = _read_rows(csv_path)
 
     mode_filter = args.mode.strip()
@@ -228,6 +240,9 @@ def main() -> int:
             {
                 "mode": row.get("mode", ""),
                 rank_col: _to_float(row.get(rank_col)),
+                "rank_metric": row.get("rank_metric"),
+                "rank_value": _to_float(row.get("rank_value")),
+                "eval_sc_gap": _to_float(row.get("eval_sc_gap")),
                 "eval_sep": _to_float(row.get("eval_sep")),
                 "eval_acc": _to_float(row.get("eval_acc")),
                 "graphs_per_s": _to_float(row.get("graphs_per_s")),

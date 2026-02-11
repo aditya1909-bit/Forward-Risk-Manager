@@ -43,10 +43,14 @@ def _load_pairs(path: Path, window: int = 20):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot hallucination diagnostics.")
-    parser.add_argument("--csv", default="reports/hallucination_window_all.csv", help="Input CSV")
+    parser.add_argument(
+        "--csv",
+        default="runs/experiments/manual/diagnostics/hallucination_window_all.csv",
+        help="Input CSV",
+    )
     parser.add_argument(
         "--out",
-        default="reports/hallucination_diagnostics.png",
+        default="runs/experiments/manual/diagnostics/hallucination_diagnostics.png",
         help="Output plot path",
     )
     parser.add_argument("--bins", type=int, default=60, help="Histogram bins")

@@ -297,7 +297,7 @@ def main() -> int:
             }
         )
 
-    out_path = Path(tune_cfg.get("out_csv", "reports/sweep_parallel_tune.csv"))
+    out_path = Path(tune_cfg.get("out_csv", "runs/experiments/manual/metrics/sweep_parallel_tune.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     import csv
 

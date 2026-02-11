@@ -41,9 +41,21 @@ def main() -> int:
         default=0.5,
         help="Drop benchmark log-returns with abs(value) above this threshold (<=0 disables).",
     )
-    parser.add_argument("--out-csv", default="reports/goodness_backtest.csv", help="Output CSV")
-    parser.add_argument("--out-quantiles", default="reports/goodness_quantiles.csv", help="Quantile CSV")
-    parser.add_argument("--out-plot", default="reports/goodness_scatter.png", help="Scatter plot")
+    parser.add_argument(
+        "--out-csv",
+        default="runs/experiments/manual/diagnostics/goodness_backtest.csv",
+        help="Output CSV",
+    )
+    parser.add_argument(
+        "--out-quantiles",
+        default="runs/experiments/manual/diagnostics/goodness_quantiles.csv",
+        help="Quantile CSV",
+    )
+    parser.add_argument(
+        "--out-plot",
+        default="runs/experiments/manual/diagnostics/goodness_scatter.png",
+        help="Scatter plot",
+    )
     args = parser.parse_args()
     if args.ticker:
         args.ticker = args.ticker.strip().upper()

@@ -26,11 +26,19 @@ def _load_rows(path: Path):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot FF sweep tradeoffs.")
-    parser.add_argument("--csv", default="reports/ff_sweep.csv", help="Path to sweep CSV")
-    parser.add_argument("--out", default="reports/ff_sweep_tradeoff.png", help="Output plot path")
+    parser.add_argument(
+        "--csv",
+        default="runs/experiments/manual/metrics/ff_sweep.csv",
+        help="Path to sweep CSV",
+    )
+    parser.add_argument(
+        "--out",
+        default="runs/experiments/manual/plots/ff_sweep_tradeoff.png",
+        help="Output plot path",
+    )
     parser.add_argument(
         "--pareto-out",
-        default="reports/ff_sweep_pareto.png",
+        default="runs/experiments/manual/plots/ff_sweep_pareto.png",
         help="Output path for Pareto frontier plot",
     )
     args = parser.parse_args()

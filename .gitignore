@@ -4,11 +4,21 @@
 /data/raw_merged/
 /data/processed_long/
 /runs/cache/
+/runs/experiments/
+/runs/registry/
 
 # Python
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+*.egg-info/
 
 # OS
 .DS_Store
+
+# Generated reports (keep published snapshots + index)
+/reports/*
+!/reports/published/
+!/reports/published/**
+!/reports/index.csv
