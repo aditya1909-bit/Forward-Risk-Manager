@@ -32,6 +32,7 @@ from frisk.ff import (
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
+from frisk.econ_eval import resolve_price_ticker
 
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _NEG_AUG_MODES = {
@@ -41,6 +42,9 @@ _NEG_AUG_MODES = {
     "time_flip",
     "shuffle+time_flip",
     "time_flip+noise",
+    "block_bootstrap",
+    "cross_asset_mix",
+    "phase_randomize",
 }
 
 
@@ -410,6 +414,9 @@ def _make_self_contrastive_view(
         "time_flip",
         "shuffle+time_flip",
         "time_flip+noise",
+        "block_bootstrap",
+        "cross_asset_mix",
+        "phase_randomize",
     }
     if mode not in valid_modes:
         raise ValueError(
@@ -692,6 +699,9 @@ def main() -> int:
             "time_flip",
             "shuffle+time_flip",
             "time_flip+noise",
+            "block_bootstrap",
+            "cross_asset_mix",
+            "phase_randomize",
             "hallucinate",
             "schedule",
             "mix",
@@ -847,6 +857,15 @@ def main() -> int:
     hall_corr_scope = str(
         _get_setting(args, section, "hallucinate_corr_scope", "returns")
     ).strip().lower()
+    hall_corr_every_n_steps = int(
+        _get_setting(args, section, "hallucinate_corr_every_n_steps", 1)
+    )
+    hall_corr_edge_fraction = float(
+        _get_setting(args, section, "hallucinate_corr_edge_fraction", 1.0)
+    )
+    hall_corr_edge_min = int(
+        _get_setting(args, section, "hallucinate_corr_edge_min", 1)
+    )
     hall_freeze_non_return = _to_bool(
         _get_setting(args, section, "hallucinate_freeze_non_return_features", True)
     )
@@ -854,6 +873,9 @@ def main() -> int:
         hall_penalty_scope = "returns"
     if hall_corr_scope not in {"all", "returns"}:
         hall_corr_scope = "returns"
+    hall_corr_every_n_steps = max(1, int(hall_corr_every_n_steps))
+    hall_corr_edge_fraction = _clamp(float(hall_corr_edge_fraction), 0.0, 1.0)
+    hall_corr_edge_min = max(1, int(hall_corr_edge_min))
     hall_curriculum = section.get("hallucinate_curriculum", {})
     hall_curr_enabled = bool(hall_curriculum.get("enabled", False))
     hall_curr_start = int(hall_curriculum.get("start_epoch", 1))
@@ -893,7 +915,7 @@ def main() -> int:
     energy_penalty_mode = _get_setting(args, section, "energy_penalty_mode", "last")
 
     risk_head_enabled = bool(_get_setting(args, section, "risk_head_enabled", False))
-    risk_ticker = _get_setting(args, section, "risk_ticker", "MDY")
+    risk_ticker = _get_setting(args, section, "risk_ticker", "AUTO")
     risk_horizon = int(_get_setting(args, section, "risk_horizon", 21))
     risk_horizons = _parse_positive_int_list(
         _get_setting(args, section, "risk_horizons", section.get("risk_horizon", risk_horizon)),
@@ -973,6 +995,9 @@ def main() -> int:
                 penalty_scope=hall_penalty_scope,
                 corr_scope=hall_corr_scope,
                 freeze_non_return_features=hall_freeze_non_return,
+                corr_every_n_steps=hall_corr_every_n_steps,
+                corr_edge_fraction=hall_corr_edge_fraction,
+                corr_edge_min=hall_corr_edge_min,
             )
 
         if epoch < hall_curr_start:
@@ -1016,6 +1041,9 @@ def main() -> int:
             penalty_scope=hall_penalty_scope,
             corr_scope=hall_corr_scope,
             freeze_non_return_features=hall_freeze_non_return,
+            corr_every_n_steps=hall_corr_every_n_steps,
+            corr_edge_fraction=hall_corr_edge_fraction,
+            corr_edge_min=hall_corr_edge_min,
         )
 
     set_seed(seed)
@@ -1172,6 +1200,7 @@ def main() -> int:
     risk_head = None
     risk_targets_by_horizon: list[list[float | None]] | None = None
     risk_horizons_effective: list[int] = []
+    risk_ticker_effective = str(risk_ticker)
     if risk_head_enabled:
         if ff_layerwise:
             print("risk_head disabled when ff_layerwise is enabled.")
@@ -1182,12 +1211,22 @@ def main() -> int:
         else:
             prices_path = build_cfg.get("prices", "data/processed/prices.csv")
             try:
+                risk_ticker_effective, ticker_src, ticker_rows = resolve_price_ticker(
+                    prices_path=prices_path,
+                    requested_ticker=str(risk_ticker),
+                    min_rows=max(64, max(risk_horizons)),
+                )
+                print(
+                    "risk ticker: "
+                    f"requested={risk_ticker} effective={risk_ticker_effective} "
+                    f"source={ticker_src} rows={ticker_rows}"
+                )
                 risk_targets_by_horizon = []
                 risk_horizons_effective = []
                 for horizon in risk_horizons:
                     targets_h, _, _ = _compute_risk_targets(
                         prices_path=prices_path,
-                        ticker=str(risk_ticker),
+                        ticker=str(risk_ticker_effective),
                         dates=dates,
                         horizon=int(horizon),
                         standardize=risk_standardize,

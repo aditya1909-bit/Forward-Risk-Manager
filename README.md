@@ -4,8 +4,8 @@ This repo starts with a data conversion pipeline from QuantConnect Research expo
 
 ## Data You Should Export
 From QuantConnect Research, export daily history for:
-- Prices for your symbol universe (S&P 400 constituents via MDY proxy).
-- MDY ETF constituents (date + holdings/weights).
+- Prices for your symbol universe (include any benchmark ticker you plan to use for evaluation/risk targets).
+- Constituents membership (date + holdings/weights), if using membership-based graph filtering.
 - Optional: Coarse Universe data for market cap.
 
 ## Expected Tidy Outputs
@@ -48,6 +48,8 @@ Benchmark (`runs/experiments/long_constituents/metrics/benchmark.csv`):
 | `ff_layerwise` | `ff` | 0.866 | 1.719 (`eval_sep`) | 1.185 | 2383.5 |
 | `ff_e2e` | `self_contrastive` | 0.999 | 0.730 (`eval_sc_gap`) | 1.169 | 2415.0 |
 | `backprop` | `bce` | 0.983 | 0.548 (`eval_sep`) | 0.832 | 3395.3 |
+
+`eval_acc` is a secondary metric. Prefer objective-aware separation (`eval_sep`/`eval_sc_gap`) plus AUROC/AUPRC/calibration metrics for model selection.
 
 Sweep best (`runs/experiments/long_constituents/metrics/ff_sweep.csv`):
 - Best objective-aware row (rank metric `eval_sep`): `2.071` in `ff_layerwise`.
@@ -99,6 +101,11 @@ Note: If you pass a directory to `--prices`, every CSV in that directory is trea
 ## Rolling Correlation Graphs
 Build rolling correlation graphs using a window size (in trading days). The correlation matrix for each graph is computed from the last `window` days ending at each date.
 
+For leakage-safe forecasting experiments, lag what the graph can see:
+- `corr_lag_days`: lag for correlation edge construction.
+- `feature_lag_days`: lag for node features.
+- `membership_lag_days`: lag for constituents membership lookup.
+
 Example (20-day window, top-10 edges per node):
 
 ```bash
@@ -112,11 +119,13 @@ python scripts/build_graphs.py \
   --prices data/processed/prices.csv \
   --constituents data/processed/constituents.csv \
   --window 20 \
+  --corr-lag-days 1 \
+  --feature-lag-days 1 \
   --corr-threshold 0.3 \
   --out data/processed/graphs.pt
 ```
 
-Tip: Use `--include-tickers MDY` if you want the ETF as a global context node even though it’s not in the constituents list.
+Tip: Use `--include-tickers <TICKER>` only if that ticker also exists in your prices data and you want it forced into membership.
 You can disable the progress bar with `--no-progress` or `progress = false` in config.
 
 ## Optional: joblib Parallel Backend
@@ -169,13 +178,22 @@ neg_mode = "time_flip"
 ```
 This flips the time window while keeping summary features unchanged (for `window_plus_summary`), teaching the model the arrow of time.
 
+Additional hard negatives are available:
+- `block_bootstrap`
+- `cross_asset_mix`
+- `phase_randomize`
+
 ## Feature Mode
 `feature_mode = "window_plus_summary"` appends summary indicators to the raw return window:
 - Realized volatility
 - Momentum (sum of log returns)
 - Volume shock
-- Beta vs MDY
+- Beta vs configured market ticker (`mdy_ticker`) or an automatic equal-weight market proxy when unavailable
 - RSI
+
+Ticker policy:
+- `mdy_ticker = "AUTO"`: no hard dependency on a benchmark ETF; beta uses equal-weight market proxy if no explicit ticker is present.
+- `risk_ticker = "AUTO"` / `econ_ticker = "AUTO"` / `target_ticker = "AUTO"`: scripts auto-select a viable ticker from available data and print the effective ticker used.
 
 ## GCN + Cached Edge Norm
 Graphs now store normalized edge weights for faster GCN passes:
@@ -190,6 +208,13 @@ Limit hallucination optimization to a subset of nodes:
 ```
 hallucinate_node_fraction = 0.5
 hallucinate_node_min = 20
+```
+
+You can also reduce correlation-penalty cost:
+```
+hallucinate_corr_every_n_steps = 2
+hallucinate_corr_edge_fraction = 0.5
+hallucinate_corr_edge_min = 32
 ```
 
 ## Plot Hallucinations
@@ -303,13 +328,35 @@ batch_size = 32
 eval_frac = 0.2
 neg_mode = "mix"
 eval_neg_mode = "auto"
+eval_neg_modes = ["time_flip", "block_bootstrap", "cross_asset_mix", "phase_randomize"]
 self_contrastive_eval_view_mode = "shuffle+noise"
 self_contrastive_eval_noise_std = 0.05
+ece_bins = 10
 timing_warmup_epochs = 1
+econ_enabled = true
+econ_ticker = "AUTO"
+econ_signal_window = 126
+econ_signal_quantile = 0.5
+econ_turnover_cost_bps = 0.0
 out_csv = "runs/experiments/default/metrics/benchmark.csv"
 ```
 
-The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_acc`, `eval_g_pos`, `eval_g_neg`, and `eval_sep`.
+For expanding walk-forward validation instead of a single holdout:
+```
+[benchmark]
+split_mode = "walk_forward"
+walk_forward_train_frac = 0.6
+walk_forward_eval_frac = 0.2
+walk_forward_step_frac = 0.1
+walk_forward_min_train_graphs = 128
+walk_forward_min_eval_graphs = 32
+walk_forward_max_folds = 0
+walk_forward_out_csv = "runs/experiments/default/metrics/benchmark_walk_forward_folds.csv"
+```
+This writes aggregate metrics (mean/std across folds) to `out_csv` and fold-level metrics with date ranges to `walk_forward_out_csv`.
+
+The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_sep`, `eval_auroc`, `eval_auprc`, `eval_brier`, `eval_ece`, plus thresholded `eval_acc`.
+It also appends economic columns (`econ_strategy_*`, `econ_bh_*`, `econ_ann_return_uplift`, `econ_sharpe_uplift`) computed from goodness-driven risk-on/off signals on the eval window.
 If `eval_neg_mode = "auto"` with `neg_mode = "self_contrastive"`, benchmarking reports contrastive metrics (`eval_sc_loss`, `eval_sc_pos`, `eval_sc_neg`, `eval_sc_gap`, `eval_sc_acc`) and maps `eval_sep/eval_acc` to that objective.
 `self_contrastive_eval_view_mode` and `self_contrastive_eval_noise_std` let you make retrieval eval harder than plain tiny-noise views.
 This means `ff_e2e` can report near-1.0 `eval_acc` without being directly comparable to FF-separation rows; compare `eval_sc_gap` for self-contrastive rows and `eval_sep` for FF rows.
@@ -327,7 +374,7 @@ runs/experiments/default/plots/benchmark.png
 ```
 
 ## Auto-Sweep (FF Hyperparams)
-Run a lightweight grid search over FF settings and rank by `eval_sep`:
+Run a lightweight grid search over FF settings with finance-first or objective-first ranking:
 
 ```bash
 python scripts/ff_sweep.py --config configs/default.toml
@@ -340,6 +387,12 @@ epochs = 3
 batch_size = 32
 eval_frac = 0.2
 out_csv = "runs/experiments/default/metrics/ff_sweep.csv"
+rank_mode = "finance_first"
+econ_enabled = true
+econ_ticker = "AUTO"
+econ_signal_window = 126
+econ_signal_quantile = 0.5
+econ_turnover_cost_bps = 0.0
 modes = ["ff_layerwise", "ff_e2e"]
 goodness_temp = [0.25, 0.5]
 goodness_target = [2.0, 2.5]
@@ -356,6 +409,11 @@ worker_torch_threads = 1
 worker_torch_interop_threads = 1
 worker_loader_workers = 0
 ```
+
+`rank_mode` accepts:
+- `finance_first` (default when economic metrics are enabled): ranks by `econ_sharpe_uplift` then `econ_ann_return_uplift`.
+- `objective`: ranks by objective-aware separation (`eval_sep` / `eval_sc_gap`).
+- any metric column name (e.g. `rank_mode = "econ_strategy_ann_return"`).
 
 Plot sweep tradeoffs:
 ```bash
@@ -388,7 +446,7 @@ You can also set defaults in `configs/default.toml`:
 ```
 [scenario_book]
 num_scenarios = 50
-target_ticker = "MDY"
+target_ticker = "AUTO"
 target_drop = -0.10
 constraint_mode = "exact"
 constraint_tolerance = 0.01
@@ -405,11 +463,11 @@ Then run:
 python scripts/scenario_book.py --config configs/default.toml
 ```
 
-Constrained “dreaming” (pick a ticker that exists in your graphs; e.g., MDY):
+Constrained “dreaming” (pick a ticker that exists in your graphs):
 ```bash
 python scripts/scenario_book.py --config configs/default.toml \
   --num-scenarios 10 \
-  --target-ticker MDY \
+  --target-ticker AUTO \
   --target-drop -0.10 \
   --constraint-weight 10.0
 ```
@@ -419,11 +477,23 @@ Generate a stress test report (portfolio-level metrics + plot):
 python scripts/stress_test_report.py --csv runs/experiments/default/metrics/scenario_book.csv --out-csv runs/experiments/default/metrics/stress_test_report.csv --out-plot runs/experiments/default/plots/stress_test_report.png
 ```
 Add `--target-ticker` to produce `all`, `target`, and `non_target` scope diagnostics.
+When `--target-ticker` is set, the report also synthesizes a `baseline_cov` scenario and writes `delta_vs_baseline_*` columns for direct hallucinated-vs-baseline comparison.
 
 ## Goodness Backtest
 Check whether low goodness predicts higher forward volatility/drawdown:
 ```bash
-python scripts/goodness_backtest.py --config configs/default.toml --ticker MDY --horizons 5,21
+python scripts/goodness_backtest.py --config configs/default.toml --ticker AUTO --horizons 5,21
+```
+
+This now also writes:
+- regime/OOD summary CSV (`--out-events`) with `ood_auroc_low_goodness_vs_high_vol`
+- strategy metrics CSV (`--out-strategy`) with `ann_return`, `ann_vol`, `sharpe`, `max_drawdown`, and `cvar_95_daily`
+- goodness timeline plot (`--out-timeline`) with 2008/2020/2022 highlighted
+
+## Sanity Checks
+Run anti-triviality checks on benchmark outputs:
+```bash
+python scripts/sanity_checks.py --benchmark-csv runs/experiments/default/metrics/benchmark.csv
 ```
 
 Generate a sweep summary report (top-K + Pareto):

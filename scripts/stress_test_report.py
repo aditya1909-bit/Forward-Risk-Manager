@@ -40,6 +40,37 @@ def _var_cvar(x: np.ndarray, alpha: float = 0.95):
     return float(q), float(cvar)
 
 
+def _build_cov_baseline(entries_real, entries_hall, target_ticker: str):
+    tickers = [t for t, _ in entries_real]
+    if target_ticker.upper() not in {t.upper() for t in tickers}:
+        return []
+    t_norm = target_ticker.upper()
+    real_map = {t.upper(): r for t, r in entries_real}
+    hall_map = {t.upper(): r for t, r in entries_hall}
+    rt = real_map.get(t_norm)
+    if rt is None:
+        return []
+    ht = hall_map.get(t_norm, rt)
+    tlen = int(rt.size)
+    if tlen == 0:
+        return []
+
+    target_cum = float(np.exp(np.sum(ht)) - 1.0)
+    shift = (np.log1p(target_cum) - float(np.sum(rt))) / float(tlen)
+    rt_var = float(np.var(rt)) + 1e-8
+
+    baseline = []
+    for ticker, r in entries_real:
+        if ticker.upper() == t_norm:
+            r_base = r + shift
+        else:
+            cov = float(np.mean((r - r.mean()) * (rt - rt.mean())))
+            beta = cov / rt_var
+            r_base = r + beta * shift
+        baseline.append((ticker, r_base.astype(float)))
+    return baseline
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate stress test report from hallucination windows.")
     parser.add_argument(
@@ -75,6 +106,18 @@ def main() -> int:
         rets = np.array([float(row[c]) for c in ret_cols], dtype=float)
         grouped[key].append((ticker, rets))
 
+    # Build a covariance-style baseline scenario using real cross-sectional betas.
+    if target_ticker:
+        scenarios = sorted({k[0] for k in grouped.keys()})
+        for scenario in scenarios:
+            real_entries = grouped.get((scenario, "real"))
+            hall_entries = grouped.get((scenario, "halluc"))
+            if not real_entries or not hall_entries:
+                continue
+            baseline = _build_cov_baseline(real_entries, hall_entries, target_ticker)
+            if baseline:
+                grouped[(scenario, "baseline_cov")] = baseline
+
     metrics = []
     curves = defaultdict(list)
     scenarios = sorted({k[0] for k in grouped.keys()})
@@ -84,7 +127,8 @@ def main() -> int:
 
     for scenario in scenarios:
         for scope in scopes:
-            for series in ("real", "halluc"):
+            series_list = sorted({k[1] for k in grouped.keys() if k[0] == scenario})
+            for series in series_list:
                 entries = grouped.get((scenario, series))
                 if not entries:
                     continue
@@ -121,23 +165,46 @@ def main() -> int:
                 )
                 curves[(scope, series)].append(cum)
 
+    # Add explicit comparison columns: vs real and vs covariance baseline.
+    by_key = {(m["scenario"], m["scope"], m["series"]): m for m in metrics}
+    metric_cols = ["total_return", "max_drawdown", "volatility", "var_95", "cvar_95"]
+    for m in metrics:
+        scenario = m["scenario"]
+        scope = m["scope"]
+        real_row = by_key.get((scenario, scope, "real"))
+        base_row = by_key.get((scenario, scope, "baseline_cov"))
+        for col in metric_cols:
+            if real_row is not None:
+                m[f"delta_vs_real_{col}"] = float(m[col]) - float(real_row[col])
+            else:
+                m[f"delta_vs_real_{col}"] = float("nan")
+            if base_row is not None:
+                m[f"delta_vs_baseline_{col}"] = float(m[col]) - float(base_row[col])
+            else:
+                m[f"delta_vs_baseline_{col}"] = float("nan")
+
     # Save metrics CSV
     out_csv = Path(args.out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "scenario",
+        "scope",
+        "series",
+        "num_tickers",
+        "total_return",
+        "max_drawdown",
+        "volatility",
+        "var_95",
+        "cvar_95",
+    ]
+    for col in metric_cols:
+        fieldnames.append(f"delta_vs_real_{col}")
+    for col in metric_cols:
+        fieldnames.append(f"delta_vs_baseline_{col}")
     with out_csv.open("w", newline="") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=[
-                "scenario",
-                "scope",
-                "series",
-                "num_tickers",
-                "total_return",
-                "max_drawdown",
-                "volatility",
-                "var_95",
-                "cvar_95",
-            ],
+            fieldnames=fieldnames,
         )
         w.writeheader()
         for row in metrics:
@@ -156,6 +223,9 @@ def main() -> int:
         if curves[("all", "halluc")]:
             hall_mean = np.mean(np.stack(curves[("all", "halluc")], axis=0), axis=0)
             ax.plot(hall_mean, label="halluc all (mean)")
+        if curves[("all", "baseline_cov")]:
+            base_mean = np.mean(np.stack(curves[("all", "baseline_cov")], axis=0), axis=0)
+            ax.plot(base_mean, label="baseline_cov all (mean)")
         if target_ticker:
             if curves[("target", "real")]:
                 real_target = np.mean(np.stack(curves[("target", "real")], axis=0), axis=0)
@@ -163,6 +233,9 @@ def main() -> int:
             if curves[("target", "halluc")]:
                 hall_target = np.mean(np.stack(curves[("target", "halluc")], axis=0), axis=0)
                 ax.plot(hall_target, linestyle="--", label=f"halluc {target_ticker}")
+            if curves[("target", "baseline_cov")]:
+                base_target = np.mean(np.stack(curves[("target", "baseline_cov")], axis=0), axis=0)
+                ax.plot(base_target, linestyle="--", label=f"baseline_cov {target_ticker}")
         ax.set_title("Mean Portfolio Paths")
         ax.set_xlabel("Window step")
         ax.set_ylabel("Cumulative return")
@@ -197,6 +270,16 @@ def main() -> int:
                     real_rets = np.stack(real_sel, axis=0).mean(axis=0)
                     real_cum = np.exp(np.cumsum(real_rets))
                     ax.plot(real_cum, label=f"real {focus_scope} (scn {scenario})")
+            if (scenario, "baseline_cov") in grouped:
+                base_entries = grouped[(scenario, "baseline_cov")]
+                if focus_scope == "target":
+                    base_sel = [rets for ticker, rets in base_entries if ticker.upper() == target_ticker]
+                else:
+                    base_sel = [rets for _, rets in base_entries]
+                if base_sel:
+                    base_rets = np.stack(base_sel, axis=0).mean(axis=0)
+                    base_cum = np.exp(np.cumsum(base_rets))
+                    ax.plot(base_cum, label=f"baseline_cov {focus_scope} (scn {scenario})")
         ax.set_title(f"Worst Halluc Scenario ({focus_scope})")
         ax.set_xlabel("Window step")
         ax.set_ylabel("Cumulative return")

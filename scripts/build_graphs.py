@@ -53,6 +53,24 @@ def main() -> int:
     parser.add_argument("--out", help="Output .pt file", default=argparse.SUPPRESS)
     parser.add_argument("--window", type=int, help="Rolling window size in days", default=argparse.SUPPRESS)
     parser.add_argument("--step", type=int, help="Step size between windows", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--corr-lag-days",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Lag (days) applied to correlation window end to prevent lookahead.",
+    )
+    parser.add_argument(
+        "--feature-lag-days",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Lag (days) applied to feature window end to prevent lookahead.",
+    )
+    parser.add_argument(
+        "--membership-lag-days",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Lag (days) applied to membership date lookup to prevent lookahead.",
+    )
     parser.add_argument("--top-k", type=int, help="Top-k correlations per node", default=argparse.SUPPRESS)
     parser.add_argument(
         "--corr-threshold", type=float, help="Correlation threshold", default=argparse.SUPPRESS
@@ -91,7 +109,7 @@ def main() -> int:
     parser.add_argument("--no-symmetric", action="store_true", help="Disable symmetric edge mirroring")
     parser.add_argument(
         "--include-tickers",
-        help="Comma-separated tickers to force-include in every graph (e.g., MDY)",
+        help="Comma-separated tickers to force-include in every graph",
         default=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -148,12 +166,15 @@ def main() -> int:
 
     window = _get_setting(args, section, "window", 20)
     step = _get_setting(args, section, "step", 1)
+    corr_lag_days = _get_setting(args, section, "corr_lag_days", 0)
+    feature_lag_days = _get_setting(args, section, "feature_lag_days", 0)
+    membership_lag_days = _get_setting(args, section, "membership_lag_days", 0)
     top_k = _get_setting(args, section, "top_k", 10)
     corr_threshold = _get_setting(args, section, "corr_threshold", None)
     min_nodes = _get_setting(args, section, "min_nodes", 50)
     feature_mode = _get_setting(args, section, "feature_mode", "window")
     rsi_period = _get_setting(args, section, "rsi_period", 14)
-    mdy_ticker = _get_setting(args, section, "mdy_ticker", "MDY")
+    mdy_ticker = _get_setting(args, section, "mdy_ticker", "AUTO")
     edge_norm = _get_setting(args, section, "edge_norm", True)
     edge_weight_mode = _get_setting(args, section, "edge_weight_mode", "raw")
     normalize = _get_setting(args, section, "normalize", True)
@@ -239,6 +260,9 @@ def main() -> int:
     cfg = GraphBuildConfig(
         window=window,
         step=step,
+        corr_lag_days=max(0, int(corr_lag_days)),
+        feature_lag_days=max(0, int(feature_lag_days)),
+        membership_lag_days=max(0, int(membership_lag_days)),
         top_k=top_k,
         corr_threshold=corr_threshold,
         min_nodes=min_nodes,
@@ -285,6 +309,7 @@ def main() -> int:
         f"Date range: {start_date} -> {end_date} | "
         f"windows: {stats.get('total_windows', 0)} | "
         f"built: {stats.get('built', 0)} | "
+        f"skipped_lag={stats.get('skipped_lag_history', 0)}, "
         f"skipped: members={stats.get('skipped_no_members', 0)}, "
         f"cols={stats.get('skipped_no_cols', 0)}, "
         f"min_nodes={stats.get('skipped_min_nodes', 0)}, "

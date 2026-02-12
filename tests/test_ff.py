@@ -64,6 +64,68 @@ def test_make_negative_time_flip_keeps_summary_slice():
     assert torch.equal(out[:, 4:], x[:, 4:])
 
 
+def test_make_negative_block_bootstrap_keeps_tail_slice():
+    torch.manual_seed(0)
+    x = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 9.0, 99.0],
+            [10.0, 20.0, 30.0, 40.0, 8.0, 88.0],
+        ]
+    )
+    batch = torch.tensor([0, 1], dtype=torch.long)
+    out = make_negative(
+        x,
+        batch,
+        mode="block_bootstrap",
+        window_len=4,
+        summary_dim=2,
+    )
+
+    assert out.shape == x.shape
+    assert torch.equal(out[:, 4:], x[:, 4:])
+    for i in range(x.size(0)):
+        src = set(x[i, :4].tolist())
+        for v in out[i, :4].tolist():
+            assert v in src
+
+
+def test_make_negative_cross_asset_mix_stays_within_group_range():
+    torch.manual_seed(0)
+    x = torch.tensor([[1.0], [2.0], [10.0], [20.0], [100.0]])
+    batch = torch.tensor([0, 0, 1, 1, 1], dtype=torch.long)
+    out = make_negative(x, batch, mode="cross_asset_mix")
+
+    for gid in batch.unique():
+        idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+        lo = float(x[idx].min().item())
+        hi = float(x[idx].max().item())
+        assert torch.all(out[idx] >= lo - 1e-6)
+        assert torch.all(out[idx] <= hi + 1e-6)
+
+
+def test_make_negative_phase_randomize_keeps_tail_and_moments():
+    torch.manual_seed(0)
+    x = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 9.0, 99.0],
+            [2.0, 1.0, 0.0, -1.0, 8.0, 88.0],
+        ]
+    )
+    batch = torch.tensor([0, 1], dtype=torch.long)
+    out = make_negative(
+        x,
+        batch,
+        mode="phase_randomize",
+        window_len=4,
+        summary_dim=2,
+    )
+
+    assert out.shape == x.shape
+    assert torch.equal(out[:, 4:], x[:, 4:])
+    assert torch.allclose(out[:, :4].mean(dim=1), x[:, :4].mean(dim=1), atol=1e-4)
+    assert torch.allclose(out[:, :4].std(dim=1), x[:, :4].std(dim=1), atol=1e-4)
+
+
 def test_permute_graph_embeddings_deranges_rows_for_n_gt_1():
     torch.manual_seed(0)
     z = torch.arange(12, dtype=torch.float32).reshape(4, 3)

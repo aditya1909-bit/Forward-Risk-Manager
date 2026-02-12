@@ -48,6 +48,9 @@ def make_negative(
         "time_flip",
         "shuffle+time_flip",
         "time_flip+noise",
+        "block_bootstrap",
+        "cross_asset_mix",
+        "phase_randomize",
     ] = "shuffle",
     noise_std: float = 0.05,
     window_len: int | None = None,
@@ -58,21 +61,83 @@ def make_negative(
         return out
     batch_idx = batch if batch.device == out.device else batch.to(out.device)
 
+    def _split_window_and_tail(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if window_len is None or window_len <= 0 or window_len >= tensor.size(1):
+            return tensor, tensor.new_zeros((tensor.size(0), 0))
+        return tensor[:, :window_len], tensor[:, window_len:]
+
+    def _merge_window_and_tail(window_part: torch.Tensor, tail_part: torch.Tensor) -> torch.Tensor:
+        if tail_part.numel() == 0:
+            return window_part
+        return torch.cat([window_part, tail_part], dim=1)
+
     def _time_flip(tensor: torch.Tensor) -> torch.Tensor:
         if window_len is None:
             return torch.flip(tensor, dims=[1])
-        w = tensor[:, :window_len]
+        w, tail = _split_window_and_tail(tensor)
         flipped = torch.flip(w, dims=[1])
-        if summary_dim > 0:
-            s = tensor[:, window_len : window_len + summary_dim]
-            rest = tensor[:, window_len + summary_dim :]
-            if rest.numel() == 0:
-                return torch.cat([flipped, s], dim=1)
-            return torch.cat([flipped, s, rest], dim=1)
-        return torch.cat([flipped, tensor[:, window_len:]], dim=1)
+        if summary_dim > 0 and tail.numel() > 0:
+            s = tail[:, :summary_dim]
+            rest = tail[:, summary_dim:]
+            return _merge_window_and_tail(flipped, torch.cat([s, rest], dim=1))
+        return _merge_window_and_tail(flipped, tail)
+
+    def _block_bootstrap(tensor: torch.Tensor) -> torch.Tensor:
+        w, tail = _split_window_and_tail(tensor)
+        wlen = w.size(1)
+        if wlen <= 1:
+            return tensor
+        block = max(2, min(5, wlen // 2 if wlen < 8 else 4))
+        nblocks = (wlen + block - 1) // block
+        out_w = torch.empty_like(w)
+        max_start = max(1, wlen - block + 1)
+        for i in range(w.size(0)):
+            starts = torch.randint(0, max_start, (nblocks,), device=w.device)
+            idx = []
+            for s in starts.tolist():
+                idx.extend(range(s, min(wlen, s + block)))
+                if len(idx) >= wlen:
+                    break
+            out_w[i] = w[i, idx[:wlen]]
+        return _merge_window_and_tail(out_w, tail)
+
+    def _cross_asset_mix(tensor: torch.Tensor) -> torch.Tensor:
+        mixed = tensor.clone()
+        for gid in batch_idx.unique():
+            idx = (batch_idx == gid).nonzero(as_tuple=False).view(-1)
+            if idx.numel() <= 1:
+                continue
+            peer = idx[torch.randperm(idx.numel(), device=out.device)]
+            alpha = 0.25 + 0.5 * torch.rand((idx.numel(), 1), device=out.device, dtype=out.dtype)
+            mixed.index_copy_(
+                0,
+                idx,
+                alpha * mixed.index_select(0, idx) + (1.0 - alpha) * mixed.index_select(0, peer),
+            )
+        return mixed
+
+    def _phase_randomize(tensor: torch.Tensor) -> torch.Tensor:
+        w, tail = _split_window_and_tail(tensor)
+        wlen = w.size(1)
+        if wlen <= 2:
+            return tensor
+        spec = torch.fft.rfft(w, dim=1)
+        if spec.size(1) > 2:
+            rand_phase = 2.0 * torch.pi * torch.rand(
+                spec.size(0), spec.size(1) - 2, device=spec.device, dtype=w.dtype
+            )
+            spec[:, 1:-1] = spec[:, 1:-1].abs() * torch.exp(1j * rand_phase)
+        w_rand = torch.fft.irfft(spec, n=wlen, dim=1)
+        return _merge_window_and_tail(w_rand, tail)
 
     if mode in ("time_flip", "shuffle+time_flip", "time_flip+noise"):
         out = _time_flip(out)
+    elif mode == "block_bootstrap":
+        out = _block_bootstrap(out)
+    elif mode == "cross_asset_mix":
+        out = _cross_asset_mix(out)
+    elif mode == "phase_randomize":
+        out = _phase_randomize(out)
 
     if mode in ("shuffle", "shuffle+noise", "shuffle+time_flip"):
         # Group-preserving shuffle: each node is reassigned to another node in the same graph.

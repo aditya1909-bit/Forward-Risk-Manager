@@ -1,0 +1,81 @@
+import numpy as np
+import pandas as pd
+
+from frisk.econ_eval import (
+    evaluate_goodness_strategy,
+    load_forward_returns_from_prices,
+    resolve_price_ticker,
+)
+
+
+def test_evaluate_goodness_strategy_reports_uplift():
+    dates = pd.date_range("2020-01-01", periods=40, freq="D")
+    goodness = np.linspace(-1.0, 1.0, num=40)
+    fwd = pd.Series(
+        np.where(goodness > 0.0, 0.01, -0.01),
+        index=dates,
+    )
+
+    out = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=20,
+        signal_quantile=0.5,
+        turnover_cost_bps=0.0,
+    )
+
+    assert out["econ_num_days"] > 0
+    assert np.isfinite(out["econ_strategy_ann_return"])
+    assert np.isfinite(out["econ_bh_ann_return"])
+    assert out["econ_ann_return_uplift"] > -1e-6
+
+
+def test_load_forward_returns_from_prices_uses_close_and_dedups(tmp_path):
+    csv_path = tmp_path / "prices.csv"
+    df = pd.DataFrame(
+        {
+            "date": [
+                "2020-01-01",
+                "2020-01-01",
+                "2020-01-02",
+                "2020-01-03",
+            ],
+            "ticker": ["MDY", "MDY", "MDY", "MDY"],
+            "close": [100.0, 100.0, 101.0, 102.0],
+        }
+    )
+    df.to_csv(csv_path, index=False)
+
+    fwd = load_forward_returns_from_prices(csv_path, ticker="MDY", max_abs_logret=0.5)
+
+    assert isinstance(fwd, pd.Series)
+    assert not fwd.empty
+    assert fwd.index.is_unique
+
+
+def test_resolve_price_ticker_auto_and_requested(tmp_path):
+    csv_path = tmp_path / "prices.csv"
+    df = pd.DataFrame(
+        {
+            "date": [
+                "2020-01-01",
+                "2020-01-02",
+                "2020-01-03",
+                "2020-01-01",
+            ],
+            "ticker": ["AAA", "AAA", "AAA", "BBB"],
+            "close": [10.0, 10.1, 10.2, 9.9],
+        }
+    )
+    df.to_csv(csv_path, index=False)
+
+    t_auto, src_auto, rows_auto = resolve_price_ticker(csv_path, requested_ticker="AUTO", min_rows=2)
+    assert t_auto == "AAA"
+    assert src_auto in {"auto_max_rows", "auto_max_rows_no_min_match"}
+    assert rows_auto == 3
+
+    t_req, src_req, rows_req = resolve_price_ticker(csv_path, requested_ticker="BBB", min_rows=2)
+    assert t_req == "BBB"
+    assert src_req == "requested"
+    assert rows_req == 1

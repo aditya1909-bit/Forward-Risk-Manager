@@ -25,6 +25,9 @@ class HallucinationConfig:
     penalty_scope: str = "returns"  # "returns" or "all"
     corr_scope: str = "returns"  # "returns" or "all"
     freeze_non_return_features: bool = True
+    corr_every_n_steps: int = 1
+    corr_edge_fraction: float = 1.0
+    corr_edge_min: int = 1
 
 
 def _edge_corr_loss(
@@ -32,6 +35,7 @@ def _edge_corr_loss(
     edge_index: torch.Tensor,
     edge_attr: Optional[torch.Tensor],
     return_slice_len: int = 0,
+    edge_sample_idx: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if edge_attr is None:
         return torch.tensor(0.0, device=x.device)
@@ -44,6 +48,10 @@ def _edge_corr_loss(
 
     src = edge_index[0]
     dst = edge_index[1]
+    if edge_sample_idx is not None and edge_sample_idx.numel() > 0:
+        src = src.index_select(0, edge_sample_idx)
+        dst = dst.index_select(0, edge_sample_idx)
+        w = w.index_select(0, edge_sample_idx)
     xi = x[src]
     xj = x[dst]
 
@@ -120,7 +128,12 @@ def hallucinate_negative(
             mask[torch.tensor(force_indices, device=x0.device, dtype=torch.long)] = True
         mask = mask[:, None]
 
-        for _ in range(config.steps):
+        corr_every = max(1, int(config.corr_every_n_steps))
+        corr_edge_fraction = float(max(0.0, min(1.0, config.corr_edge_fraction)))
+        corr_edge_min = max(1, int(config.corr_edge_min))
+        num_edges = int(edge_index.size(1))
+
+        for step_i in range(config.steps):
             if forward_fn is not None:
                 h = forward_fn(x_var)
             else:
@@ -135,12 +148,21 @@ def hallucinate_negative(
             l2 = (x_var_scope - x0_scope).pow(2).mean()
             mean_pen = (x_var_scope.mean() - mean0).pow(2)
             std_pen = (x_var_scope.std() - std0).pow(2)
-            corr_pen = _edge_corr_loss(
-                x_var,
-                edge_index,
-                edge_attr,
-                return_slice_len=return_slice_len if use_corr_return_scope else 0,
-            )
+            if config.corr_weight > 0 and (step_i % corr_every == 0):
+                edge_sample_idx = None
+                if 0 < corr_edge_fraction < 1.0 and num_edges > 0:
+                    sample_k = max(corr_edge_min, int(num_edges * corr_edge_fraction))
+                    sample_k = min(sample_k, num_edges)
+                    edge_sample_idx = torch.randperm(num_edges, device=x_var.device)[:sample_k]
+                corr_pen = _edge_corr_loss(
+                    x_var,
+                    edge_index,
+                    edge_attr,
+                    return_slice_len=return_slice_len if use_corr_return_scope else 0,
+                    edge_sample_idx=edge_sample_idx,
+                )
+            else:
+                corr_pen = torch.zeros((), device=x_var.device, dtype=x_var.dtype)
 
             loss = (
                 -g

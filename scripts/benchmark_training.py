@@ -31,6 +31,24 @@ from frisk.ff import (
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import resolve_device, sync_device
+from frisk.eval_metrics import (
+    binary_auprc,
+    binary_auroc,
+    binary_brier_and_ece,
+    ff_binary_metrics,
+)
+from frisk.splits import (
+    is_walk_forward_mode,
+    simple_split_indices,
+    simple_train_eval_split,
+    walk_forward_splits,
+)
+from frisk.econ_eval import (
+    evaluate_goodness_strategy,
+    infer_graph_goodness,
+    load_forward_returns_from_prices,
+    resolve_price_ticker,
+)
 
 _NEG_AUG_MODES = {
     "shuffle",
@@ -39,6 +57,9 @@ _NEG_AUG_MODES = {
     "time_flip",
     "shuffle+time_flip",
     "time_flip+noise",
+    "block_bootstrap",
+    "cross_asset_mix",
+    "phase_randomize",
 }
 
 
@@ -121,23 +142,100 @@ def _split_graphs(
     seed: int = 7,
     split_mode: str = "chronological",
 ):
-    n = len(graphs)
-    if n < 2:
-        raise ValueError("Need at least 2 graphs to create train/eval splits.")
-    cut = int(n * (1 - eval_frac))
-    cut = max(1, min(n - 1, cut))
+    return simple_train_eval_split(
+        graphs,
+        eval_frac=eval_frac,
+        seed=seed,
+        split_mode=split_mode,
+    )
 
-    mode = str(split_mode).strip().lower()
-    if mode in ("chronological", "chrono", "time"):
-        return graphs[:cut], graphs[cut:]
-    if mode in ("random", "shuffle"):
-        rng = random.Random(seed)
-        idx = list(range(n))
-        rng.shuffle(idx)
-        train = [graphs[i] for i in idx[:cut]]
-        evals = [graphs[i] for i in idx[cut:]]
-        return train, evals
-    raise ValueError(f"Unknown split_mode: {split_mode}. Expected chronological or random.")
+
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return float(values[0]), 0.0
+    arr = np.asarray(values, dtype=float)
+    return float(np.mean(arr)), float(np.std(arr, ddof=1))
+
+
+def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
+    if not fold_rows:
+        return {}
+    out: dict[str, object] = {}
+    key_union = sorted({k for r in fold_rows for k in r.keys()})
+    skip_keys = {
+        "mode",
+        "row_type",
+        "walk_forward_num_folds",
+    }
+    for key in key_union:
+        if key in skip_keys or key.startswith("fold_"):
+            continue
+        vals: list[float] = []
+        for row in fold_rows:
+            value = row.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.number)):
+                fv = float(value)
+                if np.isfinite(fv):
+                    vals.append(fv)
+        if vals:
+            mean_val, std_val = _mean_std(vals)
+            out[key] = mean_val
+            out[f"{key}_std"] = std_val
+    first = fold_rows[0]
+    for key in (
+        "eval_objective",
+        "neg_mode_effective",
+        "eval_neg_mode_effective",
+    ):
+        if key in first:
+            out[key] = first[key]
+    out["walk_forward_num_folds"] = len(fold_rows)
+    out["split_mode_effective"] = "walk_forward"
+    return out
+
+
+def _compute_econ_metrics_for_eval(
+    model,
+    eval_graphs,
+    eval_dates,
+    config: dict,
+):
+    meta = {
+        "econ_ticker_requested": str(config.get("econ_ticker", "")),
+        "econ_ticker_effective": str(config.get("econ_ticker_effective", "")),
+        "econ_ticker_source": str(config.get("econ_ticker_source", "")),
+        "econ_ticker_rows": float(config.get("econ_ticker_rows", 0) or 0),
+    }
+    if not bool(config.get("econ_enabled", False)):
+        return meta
+    if not eval_graphs or not eval_dates:
+        return meta
+    fwd_ret_1 = config.get("econ_fwd_ret_1")
+    if fwd_ret_1 is None:
+        return meta
+    g = infer_graph_goodness(
+        model,
+        eval_graphs,
+        goodness_temp=float(config.get("goodness_temp", 1.0)),
+        batch_size=int(config.get("econ_loader_batch_size", config.get("batch_size", 64))),
+    )
+    if g.size == 0:
+        return meta
+    out = evaluate_goodness_strategy(
+        eval_dates,
+        g,
+        fwd_ret_1=fwd_ret_1,
+        signal_window=int(config.get("econ_signal_window", 126)),
+        signal_quantile=float(config.get("econ_signal_quantile", 0.5)),
+        turnover_cost_bps=float(config.get("econ_turnover_cost_bps", 0.0)),
+        trading_days=int(config.get("econ_trading_days", 252)),
+    )
+    out.update(meta)
+    return out
 
 
 def _get_use_mode(epoch: int, neg_mode: str, warmup: int, mix_start: float, mix_end: float, ramp: int):
@@ -255,6 +353,9 @@ def _make_self_contrastive_view(
         "time_flip",
         "shuffle+time_flip",
         "time_flip+noise",
+        "block_bootstrap",
+        "cross_asset_mix",
+        "phase_randomize",
     }
     if mode not in valid_modes:
         raise ValueError(
@@ -309,6 +410,7 @@ def _eval_ff_metrics(
     sc_view_noise_std: float | None = None,
     window_len: int | None = None,
     summary_dim: int = 0,
+    ece_bins: int = 10,
 ):
     eval_mode = str(neg_mode).strip().lower()
     if eval_mode == "self_contrastive":
@@ -365,11 +467,17 @@ def _eval_ff_metrics(
             "eval_g_neg": neg_mean,
             "eval_sep": pos_mean - neg_mean,
             "eval_acc": float(np.mean(sc_acc)) if sc_acc else 0.0,
+            "eval_auroc": float("nan"),
+            "eval_auprc": float("nan"),
+            "eval_brier": float("nan"),
+            "eval_ece": float("nan"),
         }
 
     model.eval()
     gpos = []
     gneg = []
+    gpos_all = []
+    gneg_all = []
     acc_num = 0
     acc_den = 0
     for batch in loader:
@@ -420,15 +528,24 @@ def _eval_ff_metrics(
             acc_den += 2 * g_pos.numel()
             gpos.append(g_pos.mean().item())
             gneg.append(g_neg.mean().item())
+            gpos_all.extend(g_pos.detach().cpu().tolist())
+            gneg_all.extend(g_neg.detach().cpu().tolist())
     acc = acc_num / acc_den if acc_den else 0.0
     pos_mean = float(np.mean(gpos)) if gpos else 0.0
     neg_mean = float(np.mean(gneg)) if gneg else 0.0
+    cls_metrics = ff_binary_metrics(
+        np.asarray(gpos_all, dtype=float),
+        np.asarray(gneg_all, dtype=float),
+        threshold=float(goodness_target),
+        ece_bins=int(ece_bins),
+    )
     return {
         "eval_objective": "ff",
         "eval_g_pos": pos_mean,
         "eval_g_neg": neg_mean,
         "eval_sep": pos_mean - neg_mean,
         "eval_acc": float(acc),
+        **cls_metrics,
     }
 
 
@@ -530,13 +647,22 @@ def _benchmark_ff(
     device,
     config,
     layerwise: bool,
+    train_graphs=None,
+    eval_graphs=None,
+    eval_dates=None,
 ):
-    train_graphs, eval_graphs = _split_graphs(
-        graphs,
-        eval_frac=config["eval_frac"],
-        seed=config["seed"],
-        split_mode=config.get("split_mode", "chronological"),
-    )
+    if train_graphs is None or eval_graphs is None:
+        train_graphs, eval_graphs = _split_graphs(
+            graphs,
+            eval_frac=config["eval_frac"],
+            seed=config["seed"],
+            split_mode=config.get("split_mode", "chronological"),
+        )
+    else:
+        train_graphs = list(train_graphs)
+        eval_graphs = list(eval_graphs)
+        if not train_graphs or not eval_graphs:
+            raise ValueError("Explicit fold split must include non-empty train and eval graphs.")
     loader_kwargs = {
         "batch_size": config["batch_size"],
         "shuffle": True,
@@ -582,6 +708,9 @@ def _benchmark_ff(
         penalty_scope=str(config.get("hall_penalty_scope", "returns")),
         corr_scope=str(config.get("hall_corr_scope", "returns")),
         freeze_non_return_features=bool(config.get("hall_freeze_non_return", True)),
+        corr_every_n_steps=int(config.get("hall_corr_every_n_steps", 1)),
+        corr_edge_fraction=float(config.get("hall_corr_edge_fraction", 1.0)),
+        corr_edge_min=int(config.get("hall_corr_edge_min", 1)),
     )
     sc_temp = float(config.get("self_contrastive_temp", 0.2))
     sc_max_graphs = int(config.get("self_contrastive_max_graphs", 0))
@@ -873,6 +1002,7 @@ def _benchmark_ff(
         sc_view_noise_std=config.get("self_contrastive_eval_noise_std"),
         window_len=config.get("window_len"),
         summary_dim=config.get("summary_dim", 0),
+        ece_bins=int(config.get("ece_bins", 10)),
     )
     warm = int(config.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
@@ -887,16 +1017,69 @@ def _benchmark_ff(
         "eval_neg_mode_effective": eval_mode,
     }
     out.update(eval_metrics)
+    econ = _compute_econ_metrics_for_eval(
+        model,
+        eval_graphs,
+        eval_dates or [],
+        config,
+    )
+    if econ:
+        out.update(econ)
+
+    eval_neg_modes = config.get("eval_neg_modes", [])
+    if isinstance(eval_neg_modes, str):
+        eval_neg_modes = [m.strip() for m in eval_neg_modes.split(",") if m.strip()]
+    extra_modes = [str(m).strip().lower() for m in eval_neg_modes if str(m).strip()]
+    if extra_modes:
+        reported = []
+        for mode in extra_modes:
+            mode_metrics = _eval_ff_metrics(
+                model,
+                eval_loader,
+                config["goodness_temp"],
+                target_eval,
+                mode,
+                config["noise_std"],
+                hall_cfg,
+                sc_temp=sc_temp,
+                sc_view_mode=config.get("self_contrastive_eval_view_mode", "shuffle+noise"),
+                sc_view_noise_std=config.get("self_contrastive_eval_noise_std"),
+                window_len=config.get("window_len"),
+                summary_dim=config.get("summary_dim", 0),
+                ece_bins=int(config.get("ece_bins", 10)),
+            )
+            mode_key = mode.replace("+", "_plus_")
+            out[f"eval_{mode_key}_acc"] = mode_metrics.get("eval_acc")
+            out[f"eval_{mode_key}_sep"] = mode_metrics.get("eval_sep")
+            out[f"eval_{mode_key}_auroc"] = mode_metrics.get("eval_auroc")
+            out[f"eval_{mode_key}_auprc"] = mode_metrics.get("eval_auprc")
+            out[f"eval_{mode_key}_brier"] = mode_metrics.get("eval_brier")
+            out[f"eval_{mode_key}_ece"] = mode_metrics.get("eval_ece")
+            reported.append(mode)
+        out["eval_neg_modes_reported"] = ",".join(reported)
     return out
 
 
-def _benchmark_backprop(graphs, device, config):
-    train_graphs, eval_graphs = _split_graphs(
-        graphs,
-        eval_frac=config["eval_frac"],
-        seed=config["seed"],
-        split_mode=config.get("split_mode", "chronological"),
-    )
+def _benchmark_backprop(
+    graphs,
+    device,
+    config,
+    train_graphs=None,
+    eval_graphs=None,
+    eval_dates=None,
+):
+    if train_graphs is None or eval_graphs is None:
+        train_graphs, eval_graphs = _split_graphs(
+            graphs,
+            eval_frac=config["eval_frac"],
+            seed=config["seed"],
+            split_mode=config.get("split_mode", "chronological"),
+        )
+    else:
+        train_graphs = list(train_graphs)
+        eval_graphs = list(eval_graphs)
+        if not train_graphs or not eval_graphs:
+            raise ValueError("Explicit fold split must include non-empty train and eval graphs.")
     loader_kwargs = {
         "batch_size": config["batch_size"],
         "shuffle": True,
@@ -947,6 +1130,9 @@ def _benchmark_backprop(graphs, device, config):
         goodness_temp=config["goodness_temp"],
         node_fraction=config["hall_node_fraction"],
         node_min=config["hall_node_min"],
+        corr_every_n_steps=int(config.get("hall_corr_every_n_steps", 1)),
+        corr_edge_fraction=float(config.get("hall_corr_edge_fraction", 1.0)),
+        corr_edge_min=int(config.get("hall_corr_edge_min", 1)),
     )
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if train_neg_mode == "self_contrastive":
@@ -1027,6 +1213,8 @@ def _benchmark_backprop(graphs, device, config):
     gpos = []
     gneg = []
     eval_losses = []
+    all_scores = []
+    all_labels = []
     for batch in eval_loader:
         batch = batch.to(device)
         edge_weight = getattr(batch, "edge_weight", None)
@@ -1079,16 +1267,34 @@ def _benchmark_backprop(graphs, device, config):
             correct += (preds == y).sum().item()
             total += y.numel()
             eval_losses.append(bce(logits, y).item())
+            all_scores.extend(logits.detach().cpu().tolist())
+            all_labels.extend(y.detach().cpu().tolist())
             g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
             g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
             gpos.append(g_pos.mean().item())
             gneg.append(g_neg.mean().item())
 
+    if all_scores and all_labels:
+        scores_np = np.asarray(all_scores, dtype=float)
+        labels_np = np.asarray(all_labels, dtype=int)
+        auroc = binary_auroc(scores_np, labels_np)
+        auprc = binary_auprc(scores_np, labels_np)
+        brier, ece = binary_brier_and_ece(
+            scores_np,
+            labels_np,
+            bins=int(config.get("ece_bins", 10)),
+        )
+    else:
+        auroc = float("nan")
+        auprc = float("nan")
+        brier = float("nan")
+        ece = float("nan")
+
     warm = int(config.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
     avg_time = float(np.mean([t for t, _ in usable]))
     avg_gps = float(np.mean([g / t for t, g in usable]))
-    return {
+    out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
         "eval_acc": correct / total if total else 0.0,
@@ -1096,10 +1302,23 @@ def _benchmark_backprop(graphs, device, config):
         "eval_g_pos": float(np.mean(gpos)) if gpos else 0.0,
         "eval_g_neg": float(np.mean(gneg)) if gneg else 0.0,
         "eval_sep": float(np.mean(gpos)) - float(np.mean(gneg)) if gpos and gneg else 0.0,
+        "eval_auroc": float(auroc),
+        "eval_auprc": float(auprc),
+        "eval_brier": float(brier),
+        "eval_ece": float(ece),
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
         "eval_objective": "bce",
     }
+    econ = _compute_econ_metrics_for_eval(
+        model,
+        eval_graphs,
+        eval_dates or [],
+        config,
+    )
+    if econ:
+        out.update(econ)
+    return out
 
 
 def main() -> int:
@@ -1123,6 +1342,9 @@ def main() -> int:
     except TypeError:
         payload = torch.load(graphs_path, map_location="cpu")
     graphs = payload["graphs"] if isinstance(payload, dict) and "graphs" in payload else payload
+    graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
+    if graph_dates and len(graph_dates) != len(graphs):
+        graph_dates = []
 
     device = _choose_device(train_cfg.get("device", "auto"))
     _set_seed(int(train_cfg.get("seed", 7)))
@@ -1216,6 +1438,17 @@ def main() -> int:
         "multiprocessing_context": str(train_cfg.get("dataloader_mp_context", "")),
         "eval_frac": float(bench_cfg.get("eval_frac", 0.2)),
         "split_mode": str(bench_cfg.get("split_mode", "chronological")),
+        "walk_forward_train_frac": float(bench_cfg.get("walk_forward_train_frac", 0.6)),
+        "walk_forward_eval_frac": float(bench_cfg.get("walk_forward_eval_frac", 0.2)),
+        "walk_forward_step_frac": float(
+            bench_cfg.get(
+                "walk_forward_step_frac",
+                bench_cfg.get("walk_forward_eval_frac", 0.2),
+            )
+        ),
+        "walk_forward_min_train_graphs": int(bench_cfg.get("walk_forward_min_train_graphs", 64)),
+        "walk_forward_min_eval_graphs": int(bench_cfg.get("walk_forward_min_eval_graphs", 16)),
+        "walk_forward_max_folds": int(bench_cfg.get("walk_forward_max_folds", 0)),
         "seed": int(train_cfg.get("seed", 7)),
         "hall_steps": int(train_cfg.get("hallucinate_steps", 3)),
         "hall_lr": float(train_cfg.get("hallucinate_lr", 0.03)),
@@ -1226,6 +1459,9 @@ def main() -> int:
         "hall_clamp": float(train_cfg.get("hallucinate_clamp_std", 3.0)),
         "hall_node_fraction": float(train_cfg.get("hallucinate_node_fraction", 0.5)),
         "hall_node_min": int(train_cfg.get("hallucinate_node_min", 20)),
+        "hall_corr_every_n_steps": int(train_cfg.get("hallucinate_corr_every_n_steps", 1)),
+        "hall_corr_edge_fraction": float(train_cfg.get("hallucinate_corr_edge_fraction", 1.0)),
+        "hall_corr_edge_min": int(train_cfg.get("hallucinate_corr_edge_min", 1)),
         "hall_penalty_scope": str(train_cfg.get("hallucinate_penalty_scope", "returns")),
         "hall_corr_scope": str(train_cfg.get("hallucinate_corr_scope", "returns")),
         "hall_freeze_non_return": bool(
@@ -1235,11 +1471,49 @@ def main() -> int:
         "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
         "calibrate_quantiles": int(bench_cfg.get("calibrate_quantiles", 31)),
+        "ece_bins": int(bench_cfg.get("ece_bins", 10)),
+        "eval_neg_modes": bench_cfg.get("eval_neg_modes", []),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
         "window_len": int(returns_len),
         "summary_dim": int(summary_dim),
+        "econ_enabled": bool(bench_cfg.get("econ_enabled", True)),
+        "econ_ticker": str(bench_cfg.get("econ_ticker", "AUTO")),
+        "econ_max_abs_logret": float(bench_cfg.get("econ_max_abs_logret", 0.5)),
+        "econ_signal_window": int(bench_cfg.get("econ_signal_window", 126)),
+        "econ_signal_quantile": float(bench_cfg.get("econ_signal_quantile", 0.5)),
+        "econ_turnover_cost_bps": float(bench_cfg.get("econ_turnover_cost_bps", 0.0)),
+        "econ_loader_batch_size": int(bench_cfg.get("econ_loader_batch_size", 128)),
+        "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
     }
+    config["econ_fwd_ret_1"] = None
+    config["econ_ticker_effective"] = ""
+    config["econ_ticker_source"] = ""
+    config["econ_ticker_rows"] = 0
+    if bool(config.get("econ_enabled", False)):
+        prices_path = str(bench_cfg.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv")))
+        try:
+            ticker_eff, ticker_src, ticker_rows = resolve_price_ticker(
+                prices_path=prices_path,
+                requested_ticker=str(config.get("econ_ticker", "AUTO")),
+                min_rows=max(32, int(config.get("econ_signal_window", 126)) // 2),
+            )
+            config["econ_ticker_effective"] = ticker_eff
+            config["econ_ticker_source"] = ticker_src
+            config["econ_ticker_rows"] = int(ticker_rows)
+            config["econ_fwd_ret_1"] = load_forward_returns_from_prices(
+                prices_path=prices_path,
+                ticker=ticker_eff,
+                max_abs_logret=float(config.get("econ_max_abs_logret", 0.5)),
+            )
+            print(
+                "econ ticker: "
+                f"requested={config.get('econ_ticker')} "
+                f"effective={ticker_eff} source={ticker_src} rows={ticker_rows}"
+            )
+        except Exception as exc:
+            config["econ_enabled"] = False
+            print(f"warning: disabled econ metrics: {exc}")
 
     mode_overrides = bench_cfg.get("mode_overrides", {})
     if not isinstance(mode_overrides, dict):
@@ -1247,26 +1521,154 @@ def main() -> int:
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     results = []
+    fold_results = []
+    split_mode_cfg = str(config.get("split_mode", "chronological"))
+    use_walk_forward = is_walk_forward_mode(split_mode_cfg)
+    walk_forward = []
+    if use_walk_forward:
+        walk_forward = walk_forward_splits(
+            graphs,
+            train_frac=float(config.get("walk_forward_train_frac", 0.6)),
+            eval_frac=float(config.get("walk_forward_eval_frac", config.get("eval_frac", 0.2))),
+            step_frac=float(config.get("walk_forward_step_frac", 0.2)),
+            min_train_size=int(config.get("walk_forward_min_train_graphs", 64)),
+            min_eval_size=int(config.get("walk_forward_min_eval_graphs", 16)),
+            max_folds=int(config.get("walk_forward_max_folds", 0)),
+        )
+        print(
+            "walk-forward splits="
+            f"{len(walk_forward)} "
+            f"(train_frac={config.get('walk_forward_train_frac')}, "
+            f"eval_frac={config.get('walk_forward_eval_frac')}, "
+            f"step_frac={config.get('walk_forward_step_frac')})"
+        )
+
     for mode in modes:
         cfg_mode = config.copy()
         mode_override = mode_overrides.get(mode, {})
         if isinstance(mode_override, dict):
             cfg_mode.update(mode_override)
         _warn_self_contrastive_eval_view(cfg_mode, mode)
-        if mode == "ff_layerwise":
-            res = _benchmark_ff(graphs, device, cfg_mode, layerwise=True)
-        elif mode == "ff_e2e":
-            res = _benchmark_ff(graphs, device, cfg_mode, layerwise=False)
-        elif mode == "backprop":
-            res = _benchmark_backprop(graphs, device, cfg_mode)
+        if use_walk_forward:
+            fold_rows = []
+            for fold in walk_forward:
+                train_fold = fold["train_items"]
+                eval_fold = fold["eval_items"]
+                eval_dates_fold = []
+                if graph_dates:
+                    s = int(fold["eval_start"])
+                    e = int(fold["eval_end"])
+                    eval_dates_fold = list(graph_dates[s:e])
+                cfg_fold = cfg_mode.copy()
+                cfg_fold["split_mode"] = "chronological"
+                if mode == "ff_layerwise":
+                    res = _benchmark_ff(
+                        graphs,
+                        device,
+                        cfg_fold,
+                        layerwise=True,
+                        train_graphs=train_fold,
+                        eval_graphs=eval_fold,
+                        eval_dates=eval_dates_fold,
+                    )
+                elif mode == "ff_e2e":
+                    res = _benchmark_ff(
+                        graphs,
+                        device,
+                        cfg_fold,
+                        layerwise=False,
+                        train_graphs=train_fold,
+                        eval_graphs=eval_fold,
+                        eval_dates=eval_dates_fold,
+                    )
+                elif mode == "backprop":
+                    res = _benchmark_backprop(
+                        graphs,
+                        device,
+                        cfg_fold,
+                        train_graphs=train_fold,
+                        eval_graphs=eval_fold,
+                        eval_dates=eval_dates_fold,
+                    )
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                res["mode"] = mode
+                res["row_type"] = "fold"
+                res["split_mode_effective"] = "walk_forward"
+                res["fold_id"] = int(fold["fold_id"])
+                res["fold_train_start_idx"] = int(fold["train_start"])
+                res["fold_train_end_idx"] = int(fold["train_end"]) - 1
+                res["fold_eval_start_idx"] = int(fold["eval_start"])
+                res["fold_eval_end_idx"] = int(fold["eval_end"]) - 1
+                if graph_dates:
+                    res["fold_eval_start_date"] = str(graph_dates[int(fold["eval_start"])])
+                    res["fold_eval_end_date"] = str(graph_dates[int(fold["eval_end"]) - 1])
+                if isinstance(mode_override, dict):
+                    for key, value in mode_override.items():
+                        if key not in res:
+                            res[key] = value
+                fold_rows.append(res)
+                fold_results.append(res)
+
+            agg = _aggregate_fold_results(fold_rows)
+            agg["mode"] = mode
+            agg["row_type"] = "aggregate"
+            if isinstance(mode_override, dict):
+                for key, value in mode_override.items():
+                    if key not in agg:
+                        agg[key] = value
+            results.append(agg)
         else:
-            raise ValueError(f"Unknown mode: {mode}")
-        res["mode"] = mode
-        if isinstance(mode_override, dict):
-            for key, value in mode_override.items():
-                if key not in res:
-                    res[key] = value
-        results.append(res)
+            split_mode_mode = str(cfg_mode.get("split_mode", config.get("split_mode", "chronological")))
+            eval_frac_mode = float(cfg_mode.get("eval_frac", config.get("eval_frac", 0.2)))
+            seed_mode = int(cfg_mode.get("seed", config.get("seed", 7)))
+            tr_idx, ev_idx = simple_split_indices(
+                len(graphs),
+                eval_frac=eval_frac_mode,
+                seed=seed_mode,
+                split_mode=split_mode_mode,
+            )
+            train_graphs_mode = [graphs[i] for i in tr_idx]
+            eval_graphs_mode = [graphs[i] for i in ev_idx]
+            eval_dates_mode = [graph_dates[i] for i in ev_idx] if graph_dates else []
+            if mode == "ff_layerwise":
+                res = _benchmark_ff(
+                    graphs,
+                    device,
+                    cfg_mode,
+                    layerwise=True,
+                    train_graphs=train_graphs_mode,
+                    eval_graphs=eval_graphs_mode,
+                    eval_dates=eval_dates_mode,
+                )
+            elif mode == "ff_e2e":
+                res = _benchmark_ff(
+                    graphs,
+                    device,
+                    cfg_mode,
+                    layerwise=False,
+                    train_graphs=train_graphs_mode,
+                    eval_graphs=eval_graphs_mode,
+                    eval_dates=eval_dates_mode,
+                )
+            elif mode == "backprop":
+                res = _benchmark_backprop(
+                    graphs,
+                    device,
+                    cfg_mode,
+                    train_graphs=train_graphs_mode,
+                    eval_graphs=eval_graphs_mode,
+                    eval_dates=eval_dates_mode,
+                )
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+            res["mode"] = mode
+            if isinstance(mode_override, dict):
+                for key, value in mode_override.items():
+                    if key not in res:
+                        res[key] = value
+            results.append(res)
 
     out_path = Path(bench_cfg.get("out_csv", "runs/experiments/manual/metrics/benchmark.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1280,6 +1682,21 @@ def main() -> int:
             w.writerow(r)
 
     print(f"Wrote {out_path}")
+    if use_walk_forward and fold_results:
+        fold_out = str(bench_cfg.get("walk_forward_out_csv", "")).strip()
+        fold_out_path = (
+            Path(fold_out)
+            if fold_out
+            else out_path.with_name(f"{out_path.stem}_walk_forward_folds.csv")
+        )
+        fold_out_path.parent.mkdir(parents=True, exist_ok=True)
+        fold_keys = sorted({k for r in fold_results for k in r.keys()})
+        with fold_out_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fold_keys)
+            w.writeheader()
+            for r in fold_results:
+                w.writerow(r)
+        print(f"Wrote {fold_out_path}")
     for r in results:
         print(r)
 
@@ -1306,11 +1723,16 @@ def main() -> int:
         plt.close(fig)
         print(f"Wrote {plot_path}")
 
-        # Bar chart summary (avg_epoch_s + eval_acc)
+        # Bar chart summary (avg_epoch_s + objective-aware quality)
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
         modes = [r["mode"] for r in results]
         avg_epoch_s = [r["avg_epoch_s"] for r in results]
-        eval_acc = [r.get("eval_acc", 0.0) for r in results]
+        quality = []
+        for r in results:
+            if str(r.get("eval_objective", "")).strip().lower() == "self_contrastive":
+                quality.append(r.get("eval_sc_gap", r.get("eval_sep", 0.0)))
+            else:
+                quality.append(r.get("eval_sep", 0.0))
 
         ax = axes[0]
         ax.bar(modes, avg_epoch_s, color=["#4C78A8", "#72B7B2", "#F58518"])
@@ -1318,10 +1740,9 @@ def main() -> int:
         ax.set_ylabel("seconds")
 
         ax = axes[1]
-        ax.bar(modes, eval_acc, color=["#4C78A8", "#72B7B2", "#F58518"])
-        ax.set_title("Eval Accuracy")
-        ax.set_ylim(0, 1)
-        ax.set_ylabel("accuracy")
+        ax.bar(modes, quality, color=["#4C78A8", "#72B7B2", "#F58518"])
+        ax.set_title("Eval Separation / SC Gap")
+        ax.set_ylabel("quality")
 
         fig.tight_layout()
         bar_plot_path = Path(bar_plot_path)

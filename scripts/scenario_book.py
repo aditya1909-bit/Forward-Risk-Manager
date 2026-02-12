@@ -51,6 +51,20 @@ def _sample_ticker_preview(tickers_list, max_items=20):
     return ", ".join(preview) + suffix
 
 
+def _resolve_auto_target_ticker(tickers_list):
+    counts: dict[str, int] = {}
+    for tickers in tickers_list or []:
+        for t in tickers:
+            tt = str(t).upper().strip()
+            if not tt:
+                continue
+            counts[tt] = counts.get(tt, 0) + 1
+    if not counts:
+        return ""
+    # Pick the most frequently available ticker across windows.
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
 def _constraint_diff(
     cum_return: torch.Tensor,
     target_drop: float,
@@ -485,6 +499,13 @@ def main() -> int:
     if not graphs:
         raise ValueError("No graphs found.")
 
+    if args.target_ticker in {"AUTO", "AUTO_DETECT", "AUTO-DETECT"}:
+        resolved = _resolve_auto_target_ticker(tickers_list)
+        if not resolved:
+            raise ValueError("target_ticker=AUTO but no ticker metadata found in graphs.")
+        args.target_ticker = resolved
+        print(f"scenario target_ticker auto-resolved to {args.target_ticker}")
+
     indices = [int(x) for x in args.indices.split(",") if x.strip()] if args.indices else []
     date_list = [d.strip() for d in args.dates.split(",") if d.strip()] if args.dates else []
 
@@ -585,6 +606,9 @@ def main() -> int:
         freeze_non_return_features=bool(
             train_cfg.get("hallucinate_freeze_non_return_features", True)
         ),
+        corr_every_n_steps=int(train_cfg.get("hallucinate_corr_every_n_steps", 1)),
+        corr_edge_fraction=float(train_cfg.get("hallucinate_corr_edge_fraction", 1.0)),
+        corr_edge_min=int(train_cfg.get("hallucinate_corr_edge_min", 1)),
     )
 
     out = Path(args.out)
@@ -770,8 +794,10 @@ def main() -> int:
                 diff = neg_cum[:, -1] - pos_cum[:, -1]
                 ranked = np.argsort(diff)
                 selected = ranked[: args.max_tickers].tolist()
-                if "MDY" in tickers and tickers.index("MDY") not in selected:
-                    selected.insert(0, tickers.index("MDY"))
+                if args.target_ticker and args.target_ticker in tickers:
+                    t_idx = tickers.index(args.target_ticker)
+                    if t_idx not in selected:
+                        selected.insert(0, t_idx)
 
             for i in selected:
                 scenario_rows.append(

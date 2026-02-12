@@ -24,9 +24,13 @@ class GraphBuildConfig:
     normalize: bool = True
     symmetric: bool = True
     rsi_period: int = 14
-    mdy_ticker: str = "MDY"
+    mdy_ticker: str = "AUTO"
     edge_norm: bool = True
     edge_weight_mode: str = "raw"
+    # Leakage controls: build graph inputs at t using only data up to t-lag.
+    corr_lag_days: int = 0
+    feature_lag_days: int = 0
+    membership_lag_days: int = 0
 
 
 def _select_edges(
@@ -134,23 +138,29 @@ def _compute_summary_features(
         vol_shock = np.ones(n)
 
     tickers = list(window_returns.columns)
-    if mdy_ticker in tickers:
-        mdy_idx = tickers.index(mdy_ticker)
-        mdy = rets[mdy_idx]
-        mdy_c = mdy - np.nanmean(mdy)
-        mdy_std = np.nanstd(mdy_c) + 1e-8
-        beta = np.zeros(n)
-        for i in range(n):
-            if i == mdy_idx:
-                beta[i] = 1.0
-                continue
-            xi = rets[i]
-            xi_c = xi - np.nanmean(xi)
-            denom = (np.nanstd(xi_c) + 1e-8) * mdy_std
-            cov = np.nanmean(xi_c * mdy_c)
-            beta[i] = cov / denom if denom > 0 else 0.0
+    ref = str(mdy_ticker or "").upper().strip()
+    use_explicit = ref not in {"", "AUTO", "AUTO_DETECT", "AUTO-DETECT"} and ref in tickers
+
+    if use_explicit:
+        ref_idx = tickers.index(ref)
+        market = rets[ref_idx]
     else:
-        beta = np.zeros(n)
+        # Fallback when explicit market ticker is unavailable: equal-weight market proxy.
+        market = np.nanmean(rets, axis=0)
+        ref_idx = -1
+
+    market_c = market - np.nanmean(market)
+    market_std = np.nanstd(market_c) + 1e-8
+    beta = np.zeros(n)
+    for i in range(n):
+        if use_explicit and i == ref_idx:
+            beta[i] = 1.0
+            continue
+        xi = rets[i]
+        xi_c = xi - np.nanmean(xi)
+        denom = (np.nanstd(xi_c) + 1e-8) * market_std
+        cov = np.nanmean(xi_c * market_c)
+        beta[i] = cov / denom if denom > 0 else 0.0
 
     rsi = _compute_rsi(rets, rsi_period)
     summary = np.stack([vol, momentum, vol_shock, beta, rsi], axis=1)
@@ -254,34 +264,65 @@ def _window_to_graph_data(
     fund_cols: List[str],
 ):
     end_date = dates[end_idx]
-    members = membership_map.get(end_date)
+    corr_end_idx = end_idx - max(0, int(config.corr_lag_days))
+    feature_end_idx = end_idx - max(0, int(config.feature_lag_days))
+    member_end_idx = end_idx - max(0, int(config.membership_lag_days))
+    if min(corr_end_idx, feature_end_idx, member_end_idx) < 0:
+        return None, "lag_history"
+
+    corr_start_idx = corr_end_idx - config.window + 1
+    feature_start_idx = feature_end_idx - config.window + 1
+    if corr_start_idx < 0 or feature_start_idx < 0:
+        return None, "lag_history"
+
+    member_date = dates[member_end_idx]
+    members = membership_map.get(member_date)
     if not members:
         return None, "no_members"
 
-    window_df = returns.iloc[end_idx - config.window + 1 : end_idx + 1]
+    corr_window_df = returns.iloc[corr_start_idx : corr_end_idx + 1]
+    window_df = returns.iloc[feature_start_idx : feature_end_idx + 1]
     window_volume = None
     if volume is not None:
-        window_volume = volume.iloc[end_idx - config.window + 1 : end_idx + 1]
-    cols = [t for t in members if t in window_df.columns]
+        window_volume = volume.iloc[feature_start_idx : feature_end_idx + 1]
+
+    cols = [t for t in members if t in window_df.columns and t in corr_window_df.columns]
     if not cols:
         return None, "no_cols"
-    window_df = window_df[cols].dropna(axis=1, how="any")
+    corr_window_df = corr_window_df[cols]
+    window_df = window_df[cols]
+
+    valid_cols = corr_window_df.notna().all(axis=0) & window_df.notna().all(axis=0)
+    cols = [c for c in cols if bool(valid_cols.get(c, False))]
+    if not cols:
+        return None, "no_cols"
+    corr_window_df = corr_window_df[cols]
+    window_df = window_df[cols]
+
     if window_volume is not None:
-        window_volume = window_volume[window_df.columns]
+        window_volume = window_volume[cols]
+        vol_cols = window_volume.notna().all(axis=0)
+        cols = [c for c in cols if bool(vol_cols.get(c, False))]
+        if not cols:
+            return None, "no_cols"
+        corr_window_df = corr_window_df[cols]
+        window_df = window_df[cols]
+        window_volume = window_volume[cols]
     # Use the post-dropna columns for all downstream alignment
     cols = list(window_df.columns)
     if window_df.shape[1] < config.min_nodes:
         return None, "min_nodes"
 
-    corr = _safe_corr_matrix(window_df)
+    corr = _safe_corr_matrix(corr_window_df)
     src, dst, w = _select_edges(corr, config.top_k, config.corr_threshold, config.symmetric)
     if len(src) == 0:
         return None, "no_edges"
 
     fund_features = None
     if config.feature_mode == "window_plus_summary_fund" and fund_panel is not None:
+        feature_end_date = dates[feature_end_idx]
         try:
-            fund_slice = fund_panel.loc[end_date]
+            fund_slice = fund_panel.loc[feature_end_date]
         except KeyError:
             fund_slice = None
         if fund_slice is not None and fund_cols:
@@ -329,6 +370,7 @@ def build_rolling_corr_graphs(
     node_tickers: List[List[str]] = []
     stats = {
         "total_windows": 0,
+        "skipped_lag_history": 0,
         "skipped_no_members": 0,
         "skipped_no_cols": 0,
         "skipped_min_nodes": 0,
@@ -431,7 +473,9 @@ def build_rolling_corr_graphs(
     stats["total_windows"] = len(results)
     for result, reason in results:
         if result is None:
-            if reason == "no_members":
+            if reason == "lag_history":
+                stats["skipped_lag_history"] += 1
+            elif reason == "no_members":
                 stats["skipped_no_members"] += 1
             elif reason == "no_cols":
                 stats["skipped_no_cols"] += 1

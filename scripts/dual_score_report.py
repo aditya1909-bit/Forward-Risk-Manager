@@ -40,6 +40,14 @@ def _primary_metric(row):
     if sep is not None:
         return "eval_sep", sep
 
+    auroc = _to_float(row.get("eval_auroc"))
+    if auroc is not None:
+        return "eval_auroc", auroc
+
+    auprc = _to_float(row.get("eval_auprc"))
+    if auprc is not None:
+        return "eval_auprc", auprc
+
     sc_gap = _to_float(row.get("eval_sc_gap"))
     if sc_gap is not None:
         return "eval_sc_gap", sc_gap
@@ -75,6 +83,8 @@ def _attach_derived(rows, source):
         copy["_primary_metric"] = metric_name
         copy["_primary_value"] = metric_value
         copy["_eval_acc"] = _to_float(copy.get("eval_acc"))
+        copy["_eval_auroc"] = _to_float(copy.get("eval_auroc"))
+        copy["_eval_auprc"] = _to_float(copy.get("eval_auprc"))
         copy["_avg_epoch_s"] = _to_float(copy.get("avg_epoch_s"))
         copy["_graphs_per_s"] = _to_float(copy.get("graphs_per_s"))
         out.append(copy)
@@ -83,12 +93,16 @@ def _attach_derived(rows, source):
 
 def _score_e2e(rows, primary_weight):
     lo_p, hi_p = _range(r.get("_primary_value") for r in rows)
-    lo_a, hi_a = _range(r.get("_eval_acc") for r in rows)
+    lo_a, hi_a = _range(r.get("_eval_auroc") for r in rows)
+    use_acc_fallback = hi_a <= lo_a
+    if use_acc_fallback:
+        lo_a, hi_a = _range(r.get("_eval_acc") for r in rows)
     speed_weight = 1.0 - primary_weight
     scored = []
     for row in rows:
         p = _minmax_norm(row.get("_primary_value"), lo_p, hi_p)
-        a = _minmax_norm(row.get("_eval_acc"), lo_a, hi_a)
+        aux_val = row.get("_eval_acc") if use_acc_fallback else row.get("_eval_auroc")
+        a = _minmax_norm(aux_val, lo_a, hi_a)
         row = dict(row)
         row["_dual_score"] = primary_weight * p + speed_weight * a
         scored.append(row)
@@ -188,11 +202,12 @@ def _write_text_report(path: Path, rows, backprop):
             f.write(f"[{row['track']}] mode={row['mode']} source={row['source']}\n")
             f.write(
                 "  "
-                f"dual_score={_fmt(row.get('dual_score'))}, "
-                f"dual_score_raw={_fmt(row.get('dual_score_raw'))}, "
-                f"penalty_factor={_fmt(row.get('penalty_factor'))}, "
-                f"primary({row['primary_metric']})={_fmt(row.get('primary_value'))}, "
-                f"eval_acc={_fmt(row.get('eval_acc'))}\n"
+            f"dual_score={_fmt(row.get('dual_score'))}, "
+            f"dual_score_raw={_fmt(row.get('dual_score_raw'))}, "
+            f"penalty_factor={_fmt(row.get('penalty_factor'))}, "
+            f"primary({row['primary_metric']})={_fmt(row.get('primary_value'))}, "
+            f"eval_acc={_fmt(row.get('eval_acc'))}, "
+            f"eval_auroc={_fmt(row.get('eval_auroc'))}\n"
             )
             f.write(
                 "  "
@@ -240,6 +255,8 @@ def _write_csv(path: Path, rows):
         "primary_metric",
         "primary_value",
         "eval_acc",
+        "eval_auroc",
+        "eval_auprc",
         "acc_ratio_vs_backprop",
         "avg_epoch_s",
         "graphs_per_s",
@@ -374,6 +391,8 @@ def main() -> int:
             "primary_metric": chosen.get("_primary_metric"),
             "primary_value": chosen.get("_primary_value"),
             "eval_acc": chosen.get("_eval_acc"),
+            "eval_auroc": chosen.get("_eval_auroc"),
+            "eval_auprc": chosen.get("_eval_auprc"),
             "acc_ratio_vs_backprop": chosen.get("_acc_ratio_vs_backprop"),
             "avg_epoch_s": chosen.get("_avg_epoch_s"),
             "graphs_per_s": chosen.get("_graphs_per_s"),

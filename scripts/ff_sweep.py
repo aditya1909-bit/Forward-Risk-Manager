@@ -32,8 +32,16 @@ from frisk.ff import (
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import resolve_device, sync_device
+from frisk.eval_metrics import ff_binary_metrics
+from frisk.econ_eval import (
+    evaluate_goodness_strategy,
+    infer_graph_goodness,
+    load_forward_returns_from_prices,
+    resolve_price_ticker,
+)
+from frisk.splits import simple_split_indices
 
-_GRAPH_CACHE: dict[str, list] = {}
+_GRAPH_CACHE: dict[str, tuple[list, list]] = {}
 _NEG_AUG_MODES = {
     "shuffle",
     "noise",
@@ -41,6 +49,9 @@ _NEG_AUG_MODES = {
     "time_flip",
     "shuffle+time_flip",
     "time_flip+noise",
+    "block_bootstrap",
+    "cross_asset_mix",
+    "phase_randomize",
 }
 
 
@@ -51,16 +62,20 @@ def _load_config(path: str) -> dict:
 
 def _load_graphs_cached(graphs_path: str):
     key = str(Path(graphs_path).resolve())
-    graphs = _GRAPH_CACHE.get(key)
-    if graphs is not None:
-        return graphs
+    cached = _GRAPH_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(Path(graphs_path), map_location="cpu")
-    graphs = payload["graphs"]
-    _GRAPH_CACHE[key] = graphs
-    return graphs
+    graphs = payload["graphs"] if isinstance(payload, dict) else payload
+    graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
+    if graph_dates and len(graph_dates) != len(graphs):
+        graph_dates = []
+    out = (graphs, graph_dates)
+    _GRAPH_CACHE[key] = out
+    return out
 
 
 def _set_seed(seed: int) -> None:
@@ -149,16 +164,39 @@ def _to_float(value, default: float = float("nan")) -> float:
     return out
 
 
-def _objective_rank_metric(result: dict) -> tuple[str, float]:
+def _objective_rank_metric(result: dict, rank_mode: str = "objective") -> tuple[str, float]:
+    mode = str(rank_mode).strip().lower()
+    if mode in {"finance_first", "economic", "econ"}:
+        for key in (
+            "econ_sharpe_uplift",
+            "econ_ann_return_uplift",
+            "econ_strategy_sharpe",
+            "econ_strategy_ann_return",
+        ):
+            val = _to_float(result.get(key))
+            if np.isfinite(val):
+                return key, val
+        # Fallback to objective metric if economic metrics are unavailable.
+
+    if mode not in {"objective", "finance_first", "economic", "econ"} and mode != "":
+        val = _to_float(result.get(mode))
+        if np.isfinite(val):
+            return mode, val
+        # If custom rank field is missing, fallback to objective metric.
+
     objective = str(result.get("eval_objective", "ff")).strip().lower()
     if objective == "self_contrastive":
         if np.isfinite(_to_float(result.get("eval_sc_gap"))):
             return "eval_sc_gap", _to_float(result.get("eval_sc_gap"), 0.0)
         if np.isfinite(_to_float(result.get("eval_sep"))):
             return "eval_sep", _to_float(result.get("eval_sep"), 0.0)
+        if np.isfinite(_to_float(result.get("eval_auroc"))):
+            return "eval_auroc", _to_float(result.get("eval_auroc"), 0.0)
         return "eval_sc_acc", _to_float(result.get("eval_sc_acc"), 0.0)
     if np.isfinite(_to_float(result.get("eval_sep"))):
         return "eval_sep", _to_float(result.get("eval_sep"), 0.0)
+    if np.isfinite(_to_float(result.get("eval_auroc"))):
+        return "eval_auroc", _to_float(result.get("eval_auroc"), 0.0)
     return "eval_acc", _to_float(result.get("eval_acc"), 0.0)
 
 
@@ -249,23 +287,15 @@ def _split_graphs(
     seed: int,
     split_mode: str = "chronological",
 ):
-    n = len(graphs)
-    if n < 2:
-        raise ValueError("Need at least 2 graphs to create train/eval splits.")
-    cut = int(n * (1 - eval_frac))
-    cut = max(1, min(n - 1, cut))
-
-    mode = str(split_mode).strip().lower()
-    if mode in ("chronological", "chrono", "time"):
-        return graphs[:cut], graphs[cut:]
-    if mode in ("random", "shuffle"):
-        rng = random.Random(seed)
-        idx = list(range(n))
-        rng.shuffle(idx)
-        train = [graphs[i] for i in idx[:cut]]
-        evals = [graphs[i] for i in idx[cut:]]
-        return train, evals
-    raise ValueError(f"Unknown split_mode: {split_mode}. Expected chronological or random.")
+    train_idx, eval_idx = simple_split_indices(
+        len(graphs),
+        eval_frac=eval_frac,
+        seed=seed,
+        split_mode=split_mode,
+    )
+    train = [graphs[i] for i in train_idx]
+    evals = [graphs[i] for i in eval_idx]
+    return train, evals, train_idx, eval_idx
 
 
 def _get_use_mode(epoch: int, neg_mode: str, warmup: int, mix_start: float, mix_end: float, ramp: int):
@@ -385,6 +415,9 @@ def _make_self_contrastive_view(
         "time_flip",
         "shuffle+time_flip",
         "time_flip+noise",
+        "block_bootstrap",
+        "cross_asset_mix",
+        "phase_randomize",
     }
     if mode not in valid_modes:
         raise ValueError(
@@ -435,6 +468,7 @@ def _eval_ff_metrics(
     sc_view_noise_std: float | None = None,
     window_len: int | None = None,
     summary_dim: int = 0,
+    ece_bins: int = 10,
 ):
     eval_mode = str(neg_mode).strip().lower()
     if eval_mode == "self_contrastive":
@@ -491,11 +525,17 @@ def _eval_ff_metrics(
             "eval_g_neg": neg_mean,
             "eval_sep": pos_mean - neg_mean,
             "eval_acc": float(np.mean(sc_acc)) if sc_acc else 0.0,
+            "eval_auroc": float("nan"),
+            "eval_auprc": float("nan"),
+            "eval_brier": float("nan"),
+            "eval_ece": float("nan"),
         }
 
     model.eval()
     gpos = []
     gneg = []
+    gpos_all = []
+    gneg_all = []
     acc_num = 0
     acc_den = 0
     for batch in loader:
@@ -546,25 +586,75 @@ def _eval_ff_metrics(
             acc_den += 2 * g_pos.numel()
             gpos.append(g_pos.mean().item())
             gneg.append(g_neg.mean().item())
+            gpos_all.extend(g_pos.detach().cpu().tolist())
+            gneg_all.extend(g_neg.detach().cpu().tolist())
     acc = acc_num / acc_den if acc_den else 0.0
     pos_mean = float(np.mean(gpos)) if gpos else 0.0
     neg_mean = float(np.mean(gneg)) if gneg else 0.0
+    cls_metrics = ff_binary_metrics(
+        np.asarray(gpos_all, dtype=float),
+        np.asarray(gneg_all, dtype=float),
+        threshold=float(goodness_target),
+        ece_bins=int(ece_bins),
+    )
     return {
         "eval_objective": "ff",
         "eval_g_pos": pos_mean,
         "eval_g_neg": neg_mean,
         "eval_sep": pos_mean - neg_mean,
         "eval_acc": float(acc),
+        **cls_metrics,
     }
 
 
-def _run_ff_trial(graphs, device, cfg, layerwise: bool):
-    train_graphs, eval_graphs = _split_graphs(
+def _compute_econ_metrics_for_eval(
+    model,
+    eval_graphs,
+    eval_dates,
+    cfg: dict,
+):
+    meta = {
+        "econ_ticker_requested": str(cfg.get("econ_ticker", "")),
+        "econ_ticker_effective": str(cfg.get("econ_ticker_effective", "")),
+        "econ_ticker_source": str(cfg.get("econ_ticker_source", "")),
+        "econ_ticker_rows": float(cfg.get("econ_ticker_rows", 0) or 0),
+    }
+    if not bool(cfg.get("econ_enabled", False)):
+        return meta
+    if not eval_graphs or not eval_dates:
+        return meta
+    fwd_ret_1 = cfg.get("econ_fwd_ret_1")
+    if fwd_ret_1 is None:
+        return meta
+    g = infer_graph_goodness(
+        model,
+        eval_graphs,
+        goodness_temp=float(cfg.get("goodness_temp", 1.0)),
+        batch_size=int(cfg.get("econ_loader_batch_size", cfg.get("batch_size", 64))),
+    )
+    if g.size == 0:
+        return meta
+    out = evaluate_goodness_strategy(
+        eval_dates,
+        g,
+        fwd_ret_1=fwd_ret_1,
+        signal_window=int(cfg.get("econ_signal_window", 126)),
+        signal_quantile=float(cfg.get("econ_signal_quantile", 0.5)),
+        turnover_cost_bps=float(cfg.get("econ_turnover_cost_bps", 0.0)),
+        trading_days=int(cfg.get("econ_trading_days", 252)),
+    )
+    out.update(meta)
+    return out
+
+
+def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
+    train_graphs, eval_graphs, _, eval_idx = _split_graphs(
         graphs,
         cfg["eval_frac"],
         cfg["seed"],
         cfg.get("split_mode", "chronological"),
     )
+    eval_dates = [graph_dates[i] for i in eval_idx] if graph_dates else []
     loader_kwargs = {
         "batch_size": cfg["batch_size"],
         "shuffle": True,
@@ -609,6 +699,9 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         penalty_scope=str(cfg.get("hall_penalty_scope", "returns")),
         corr_scope=str(cfg.get("hall_corr_scope", "returns")),
         freeze_non_return_features=bool(cfg.get("hall_freeze_non_return", True)),
+        corr_every_n_steps=int(cfg.get("hall_corr_every_n_steps", 1)),
+        corr_edge_fraction=float(cfg.get("hall_corr_edge_fraction", 1.0)),
+        corr_edge_min=int(cfg.get("hall_corr_edge_min", 1)),
     )
     hall_cfg_layer = HallucinationConfig(
         steps=cfg["hall_steps"],
@@ -625,6 +718,9 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         penalty_scope=str(cfg.get("hall_penalty_scope", "returns")),
         corr_scope=str(cfg.get("hall_corr_scope", "returns")),
         freeze_non_return_features=bool(cfg.get("hall_freeze_non_return", True)),
+        corr_every_n_steps=int(cfg.get("hall_corr_every_n_steps", 1)),
+        corr_edge_fraction=float(cfg.get("hall_corr_edge_fraction", 1.0)),
+        corr_edge_min=int(cfg.get("hall_corr_edge_min", 1)),
     )
     sc_temp = float(cfg.get("self_contrastive_temp", 0.2))
     sc_ff_weight = max(0.0, float(cfg.get("self_contrastive_ff_weight", 0.0)))
@@ -944,6 +1040,7 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         sc_view_noise_std=cfg.get("self_contrastive_eval_noise_std"),
         window_len=cfg.get("window_len"),
         summary_dim=cfg.get("summary_dim", 0),
+        ece_bins=int(cfg.get("ece_bins", 10)),
     )
     warm = int(cfg.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
@@ -956,6 +1053,46 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         "eval_neg_mode_effective": eval_mode,
     }
     out.update(eval_metrics)
+    econ = _compute_econ_metrics_for_eval(
+        model,
+        eval_graphs,
+        eval_dates,
+        cfg,
+    )
+    if econ:
+        out.update(econ)
+
+    eval_neg_modes = cfg.get("eval_neg_modes", [])
+    if isinstance(eval_neg_modes, str):
+        eval_neg_modes = [m.strip() for m in eval_neg_modes.split(",") if m.strip()]
+    extra_modes = [str(m).strip().lower() for m in eval_neg_modes if str(m).strip()]
+    if extra_modes:
+        reported = []
+        for mode in extra_modes:
+            mode_metrics = _eval_ff_metrics(
+                model,
+                eval_loader,
+                cfg["goodness_temp"],
+                cfg["goodness_target"],
+                mode,
+                cfg["noise_std"],
+                hall_cfg,
+                sc_temp=sc_temp,
+                sc_view_mode=cfg.get("self_contrastive_eval_view_mode", "shuffle+noise"),
+                sc_view_noise_std=cfg.get("self_contrastive_eval_noise_std"),
+                window_len=cfg.get("window_len"),
+                summary_dim=cfg.get("summary_dim", 0),
+                ece_bins=int(cfg.get("ece_bins", 10)),
+            )
+            mode_key = mode.replace("+", "_plus_")
+            out[f"eval_{mode_key}_acc"] = mode_metrics.get("eval_acc")
+            out[f"eval_{mode_key}_sep"] = mode_metrics.get("eval_sep")
+            out[f"eval_{mode_key}_auroc"] = mode_metrics.get("eval_auroc")
+            out[f"eval_{mode_key}_auprc"] = mode_metrics.get("eval_auprc")
+            out[f"eval_{mode_key}_brier"] = mode_metrics.get("eval_brier")
+            out[f"eval_{mode_key}_ece"] = mode_metrics.get("eval_ece")
+            reported.append(mode)
+        out["eval_neg_modes_reported"] = ",".join(reported)
     return out
 
 
@@ -976,13 +1113,13 @@ def _run_trial_worker(args):
         torch.set_num_interop_threads(int(worker_interop_threads))
     _set_seed(seed)
     device = _choose_device(device_str)
-    graphs = _load_graphs_cached(graphs_path)
-    return _run_ff_trial(graphs, device, cfg, layerwise=layerwise)
+    graphs, graph_dates = _load_graphs_cached(graphs_path)
+    return _run_ff_trial(graphs, graph_dates, device, cfg, layerwise=layerwise)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Sweep FF hyperparams and rank by objective-consistent separation."
+        description="Sweep FF hyperparams and rank by finance/evaluation metrics."
     )
     parser.add_argument("--config", required=True, help="Path to TOML config")
     parser.add_argument(
@@ -1084,6 +1221,9 @@ def main() -> int:
         "hall_clamp": float(train_cfg.get("hallucinate_clamp_std", 3.0)),
         "hall_node_fraction": float(train_cfg.get("hallucinate_node_fraction", 0.5)),
         "hall_node_min": int(train_cfg.get("hallucinate_node_min", 20)),
+        "hall_corr_every_n_steps": int(train_cfg.get("hallucinate_corr_every_n_steps", 1)),
+        "hall_corr_edge_fraction": float(train_cfg.get("hallucinate_corr_edge_fraction", 1.0)),
+        "hall_corr_edge_min": int(train_cfg.get("hallucinate_corr_edge_min", 1)),
         "hall_penalty_scope": str(train_cfg.get("hallucinate_penalty_scope", "returns")),
         "hall_corr_scope": str(train_cfg.get("hallucinate_corr_scope", "returns")),
         "hall_freeze_non_return": bool(
@@ -1091,6 +1231,8 @@ def main() -> int:
         ),
         "neg_gate_margin": float(train_cfg.get("neg_gate_margin", 1.0)),
         "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "auto")),
+        "eval_neg_modes": sweep_cfg.get("eval_neg_modes", []),
+        "ece_bins": int(sweep_cfg.get("ece_bins", 10)),
         "timing_warmup_epochs": int(sweep_cfg.get("timing_warmup_epochs", 1)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
@@ -1101,7 +1243,43 @@ def main() -> int:
         "ff_block_size": int(train_cfg.get("ff_block_size", 2)),
         "window_len": int(returns_len),
         "summary_dim": int(summary_dim),
+        "econ_enabled": bool(sweep_cfg.get("econ_enabled", True)),
+        "econ_ticker": str(sweep_cfg.get("econ_ticker", "AUTO")),
+        "econ_max_abs_logret": float(sweep_cfg.get("econ_max_abs_logret", 0.5)),
+        "econ_signal_window": int(sweep_cfg.get("econ_signal_window", 126)),
+        "econ_signal_quantile": float(sweep_cfg.get("econ_signal_quantile", 0.5)),
+        "econ_turnover_cost_bps": float(sweep_cfg.get("econ_turnover_cost_bps", 0.0)),
+        "econ_loader_batch_size": int(sweep_cfg.get("econ_loader_batch_size", 128)),
+        "econ_trading_days": int(sweep_cfg.get("econ_trading_days", 252)),
     }
+    base["econ_fwd_ret_1"] = None
+    base["econ_ticker_effective"] = ""
+    base["econ_ticker_source"] = ""
+    base["econ_ticker_rows"] = 0
+    if bool(base.get("econ_enabled", False)):
+        prices_path = str(sweep_cfg.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv")))
+        try:
+            ticker_eff, ticker_src, ticker_rows = resolve_price_ticker(
+                prices_path=prices_path,
+                requested_ticker=str(base.get("econ_ticker", "AUTO")),
+                min_rows=max(32, int(base.get("econ_signal_window", 126)) // 2),
+            )
+            base["econ_ticker_effective"] = ticker_eff
+            base["econ_ticker_source"] = ticker_src
+            base["econ_ticker_rows"] = int(ticker_rows)
+            base["econ_fwd_ret_1"] = load_forward_returns_from_prices(
+                prices_path=prices_path,
+                ticker=ticker_eff,
+                max_abs_logret=float(base.get("econ_max_abs_logret", 0.5)),
+            )
+            print(
+                "econ ticker: "
+                f"requested={base.get('econ_ticker')} "
+                f"effective={ticker_eff} source={ticker_src} rows={ticker_rows}"
+            )
+        except Exception as exc:
+            base["econ_enabled"] = False
+            print(f"warning: disabled econ metrics: {exc}")
 
     modes = sweep_cfg.get("modes", ["ff_layerwise", "ff_e2e"])
     if isinstance(modes, str):
@@ -1133,6 +1311,16 @@ def main() -> int:
         "worker_torch_interop_threads",
         "worker_loader_workers",
         "mode_overrides",
+        "rank_mode",
+        "econ_enabled",
+        "econ_ticker",
+        "econ_prices",
+        "econ_max_abs_logret",
+        "econ_signal_window",
+        "econ_signal_quantile",
+        "econ_turnover_cost_bps",
+        "econ_loader_batch_size",
+        "econ_trading_days",
     }
 
     grid_keys = []
@@ -1188,7 +1376,10 @@ def main() -> int:
             payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
         except TypeError:
             payload = torch.load(graphs_path, map_location="cpu")
-        graphs = payload["graphs"]
+        graphs = payload["graphs"] if isinstance(payload, dict) else payload
+        graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
+        if graph_dates and len(graph_dates) != len(graphs):
+            graph_dates = []
         if not graphs:
             raise ValueError("No graphs found in the provided file.")
         device = _choose_device(device_str)
@@ -1236,7 +1427,13 @@ def main() -> int:
                 )
             else:
                 _set_seed(seed)
-                res = _run_ff_trial(graphs, device, cfg_mode, layerwise=layerwise)
+                res = _run_ff_trial(
+                    graphs,
+                    graph_dates,
+                    device,
+                    cfg_mode,
+                    layerwise=layerwise,
+                )
                 res["mode"] = mode
                 res.update(combo)
                 for k in (
@@ -1357,10 +1554,13 @@ def main() -> int:
     pbar.close()
 
     if results:
+        default_rank_mode = "finance_first" if bool(base.get("econ_enabled", False)) else "objective"
+        rank_mode = str(sweep_cfg.get("rank_mode", default_rank_mode))
         for r in results:
-            rank_metric, rank_value = _objective_rank_metric(r)
+            rank_metric, rank_value = _objective_rank_metric(r, rank_mode=rank_mode)
             r["rank_metric"] = rank_metric
             r["rank_value"] = rank_value
+            r["rank_mode"] = rank_mode
 
         speed_weight = float(sweep_cfg.get("speed_weight", 0.35))
         speed_weight = _clamp(speed_weight, 0.0, 1.0)

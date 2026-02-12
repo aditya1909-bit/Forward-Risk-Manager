@@ -131,6 +131,9 @@ def main() -> int:
         freeze_non_return_features=bool(
             train_cfg.get("hallucinate_freeze_non_return_features", True)
         ),
+        corr_every_n_steps=int(train_cfg.get("hallucinate_corr_every_n_steps", 1)),
+        corr_edge_fraction=float(train_cfg.get("hallucinate_corr_edge_fraction", 1.0)),
+        corr_edge_min=int(train_cfg.get("hallucinate_corr_edge_min", 1)),
     )
 
     x_neg = hallucinate_negative(
@@ -158,8 +161,6 @@ def main() -> int:
     ranked = np.argsort(diff)  # most negative first
 
     selected = []
-    if "MDY" in tickers:
-        selected.append(tickers.index("MDY"))
     for idx_i in ranked:
         if idx_i not in selected:
             selected.append(idx_i)

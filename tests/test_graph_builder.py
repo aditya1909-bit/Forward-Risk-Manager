@@ -66,6 +66,29 @@ def test_build_node_features_window_plus_summary_fund():
     assert ret_std.shape == (3, 1)
 
 
+def test_build_node_features_auto_market_proxy_beta_is_finite():
+    window_df = pd.DataFrame(
+        {
+            "AAA": [0.01, -0.02, 0.02, 0.00],
+            "BBB": [0.03, -0.01, 0.01, -0.01],
+            "CCC": [-0.02, 0.01, 0.00, 0.02],
+        }
+    )
+    x, _, _ = _build_node_features(
+        window_df,
+        volume_df=None,
+        feature_mode="window_plus_summary",
+        normalize=False,
+        mdy_ticker="AUTO",
+        rsi_period=14,
+        fund_features=None,
+    )
+    # window=4 + summary=5 ; beta is summary slot index 3 => absolute index 7
+    beta = x[:, 7]
+    assert np.isfinite(beta).all()
+    assert np.std(beta) > 0
+
+
 def test_build_rolling_corr_graphs_basic():
     dates = pd.date_range("2020-01-01", periods=5, freq="D").strftime("%Y-%m-%d")
     returns = pd.DataFrame(
@@ -155,3 +178,54 @@ def test_build_rolling_corr_graphs_signed_edge_norm_is_finite():
     edge_weight = graphs[0].edge_weight
     assert torch.isfinite(edge_weight).all()
     assert (edge_weight < 0).any()
+
+
+def test_build_rolling_corr_graphs_with_lags_avoids_lookahead():
+    dates = pd.date_range("2020-01-01", periods=6, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
+            "BBB": [0.03, 0.02, 0.01, 0.00, -0.01, -0.02],
+            "CCC": [0.00, -0.01, -0.02, -0.03, -0.04, -0.05],
+        },
+        index=dates,
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    cfg = GraphBuildConfig(
+        window=3,
+        step=1,
+        corr_lag_days=1,
+        feature_lag_days=1,
+        membership_lag_days=1,
+        top_k=1,
+        corr_threshold=None,
+        min_nodes=2,
+        feature_mode="last",
+        normalize=False,
+        symmetric=True,
+        rsi_period=14,
+        mdy_ticker="AAA",
+        edge_norm=False,
+        edge_weight_mode="raw",
+    )
+    graphs, graph_dates, tickers, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    # 4 candidate windows (end_idx=2..5), first is invalid due to lag+window history.
+    assert stats["total_windows"] == 4
+    assert stats["skipped_lag_history"] == 1
+    assert stats["built"] == 3
+    assert graph_dates[0] == dates[3]
+
+    first_tickers = tickers[0]
+    x_last = graphs[0].x.squeeze(1).numpy()
+    expected_date = dates[2]  # feature lag of 1 day for graph date dates[3]
+    expected = np.array([returns.loc[expected_date, t] for t in first_tickers], dtype=float)
+    assert np.allclose(x_last, expected, atol=1e-8)
