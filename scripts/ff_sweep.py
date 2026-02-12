@@ -34,6 +34,14 @@ from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import resolve_device, sync_device
 
 _GRAPH_CACHE: dict[str, list] = {}
+_NEG_AUG_MODES = {
+    "shuffle",
+    "noise",
+    "shuffle+noise",
+    "time_flip",
+    "shuffle+time_flip",
+    "time_flip+noise",
+}
 
 
 def _load_config(path: str) -> dict:
@@ -278,6 +286,38 @@ def _resolve_mode(eval_mode: str, train_mode: str) -> str:
     if mode in ("", "auto"):
         return str(train_mode).strip().lower()
     return mode
+
+
+def _warn_self_contrastive_eval_view(config: dict, mode: str) -> None:
+    train_mode = str(config.get("neg_mode", "")).strip().lower()
+    eval_mode = _resolve_mode(config.get("eval_neg_mode", "auto"), train_mode)
+    if eval_mode != "self_contrastive":
+        return
+
+    train_view = str(config.get("self_contrastive_view_mode", "shuffle+noise")).strip().lower()
+    eval_view = str(config.get("self_contrastive_eval_view_mode", train_view)).strip().lower()
+    train_noise = float(
+        config.get(
+            "self_contrastive_view_noise_std",
+            config.get("noise_std", 0.05),
+        )
+    )
+    eval_noise = float(
+        config.get(
+            "self_contrastive_eval_noise_std",
+            train_noise,
+        )
+    )
+    harder_view = ("time_flip" in eval_view and "time_flip" not in train_view) or (
+        eval_noise > (1.5 * max(1e-8, train_noise))
+    )
+    if harder_view:
+        print(
+            "warning: "
+            f"{mode} uses harder self_contrastive eval views than training "
+            f"(train={train_view}@{train_noise:.4f}, eval={eval_view}@{eval_noise:.4f}). "
+            "This can sharply depress eval_sc_acc/eval_sc_gap."
+        )
 
 
 def _block_endpoint_indices(num_layers: int, block_size: int) -> list[int]:
@@ -587,6 +627,15 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
         freeze_non_return_features=bool(cfg.get("hall_freeze_non_return", True)),
     )
     sc_temp = float(cfg.get("self_contrastive_temp", 0.2))
+    sc_ff_weight = max(0.0, float(cfg.get("self_contrastive_ff_weight", 0.0)))
+    sc_ff_neg_mode = str(cfg.get("self_contrastive_ff_neg_mode", "shuffle+noise")).strip().lower()
+    if sc_ff_neg_mode not in _NEG_AUG_MODES:
+        sc_ff_neg_mode = "shuffle+noise"
+    sc_ff_noise_std = max(
+        0.0,
+        float(cfg.get("self_contrastive_ff_noise_std", cfg.get("noise_std", 0.05))),
+    )
+    sc_ff_target = float(cfg.get("self_contrastive_ff_target", cfg["goodness_target"]))
     dist_weight = float(cfg.get("distance_forward_weight", 0.0))
     dist_margin = float(cfg.get("distance_forward_margin", 0.15))
     sc_max_graphs = max(0, int(cfg.get("self_contrastive_max_graphs", 0)))
@@ -638,7 +687,7 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                 cfg["neg_mix_ramp_epochs"],
             )
             apply_distance = dist_weight > 0 and (batch_idx % dist_interval == 0)
-            step_scaler = scaler if (amp_enabled and use_mode == "self_contrastive") else None
+            step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or layerwise)) else None
 
             if layerwise:
                 if ff_blockwise:
@@ -673,16 +722,18 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                             window_len=cfg.get("window_len"),
                             summary_dim=cfg.get("summary_dim", 0),
                         )
-                    layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
-                    layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                        layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
                     if layer_mode == "hallucinate":
                         last_idx = ff_block_endpoints[-1]
-                        g_pos_probe = goodness(
-                            layers_pos[last_idx], batch.batch, temperature=cfg["goodness_temp"]
-                        ).mean().item()
-                        g_neg_probe = goodness(
-                            layers_neg[last_idx], batch.batch, temperature=cfg["goodness_temp"]
-                        ).mean().item()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            g_pos_probe = goodness(
+                                layers_pos[last_idx], batch.batch, temperature=cfg["goodness_temp"]
+                            ).mean().item()
+                            g_neg_probe = goodness(
+                                layers_neg[last_idx], batch.batch, temperature=cfg["goodness_temp"]
+                            ).mean().item()
                         if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
                             x_neg = make_negative(
                                 x,
@@ -692,22 +743,24 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                                 window_len=cfg.get("window_len"),
                                 summary_dim=cfg.get("summary_dim", 0),
                             )
-                            layers_neg = model(
-                                x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
-                            )
+                            with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                                layers_neg = model(
+                                    x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
+                                )
 
                     loss = 0.0
-                    for li in ff_block_endpoints:
-                        g_pos = goodness(layers_pos[li], batch.batch, temperature=cfg["goodness_temp"])
-                        g_neg = goodness(layers_neg[li], batch.batch, temperature=cfg["goodness_temp"])
-                        loss = loss + ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        for li in ff_block_endpoints:
+                            g_pos = goodness(layers_pos[li], batch.batch, temperature=cfg["goodness_temp"])
+                            g_neg = goodness(layers_neg[li], batch.batch, temperature=cfg["goodness_temp"])
+                            loss = loss + ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
                     loss = loss / max(1, len(ff_block_endpoints))
                     _optimizer_step(
                         optim=optim,
                         loss=loss,
                         grad_clip=float(cfg["grad_clip"]),
                         clip_params=clip_params,
-                        scaler=None,
+                        scaler=step_scaler,
                     )
                 else:
                     x_in = x
@@ -717,8 +770,9 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                             layer_mode = "shuffle"
                         if use_mode == "hallucinate" and li > 0:
                             layer_mode = "shuffle"
-                        h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
-                        g_pos = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
+                            g_pos = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
 
                         if layer_mode == "hallucinate":
                             forward_fn = lambda x_var, li=li: model.forward_layer(
@@ -754,26 +808,28 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                             )
 
                         if layer_mode == "hallucinate":
-                            h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                            g_neg_probe = goodness(
-                                h_neg_probe, batch.batch, temperature=cfg["goodness_temp"]
-                            ).mean().item()
+                            with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                                h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                                g_neg_probe = goodness(
+                                    h_neg_probe, batch.batch, temperature=cfg["goodness_temp"]
+                                ).mean().item()
                             g_pos_probe = g_pos.mean().item()
                             if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
                                 x_neg = make_negative(
                                     x_in, batch.batch, mode="shuffle", noise_std=cfg["noise_std"]
                                 )
 
-                        h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                        g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
-                        loss = ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                            g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
+                            loss = ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
 
                         _optimizer_step(
                             optim=optim,
                             loss=loss,
                             grad_clip=float(cfg["grad_clip"]),
                             clip_params=clip_params,
-                            scaler=None,
+                            scaler=step_scaler,
                         )
 
                         x_in = h_pos.detach()
@@ -804,6 +860,23 @@ def _run_ff_trial(graphs, device, cfg, layerwise: bool):
                                 z_neg,
                                 margin=dist_margin,
                                 max_graphs=dist_max_graphs,
+                            )
+                        if sc_ff_weight > 0:
+                            x_neg_aux = make_negative(
+                                x,
+                                batch.batch,
+                                mode=sc_ff_neg_mode,
+                                noise_std=sc_ff_noise_std,
+                                window_len=cfg.get("window_len"),
+                                summary_dim=cfg.get("summary_dim", 0),
+                            )
+                            h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                            g_pos_aux = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
+                            g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=cfg["goodness_temp"])
+                            loss = loss + sc_ff_weight * ff_loss(
+                                g_pos_aux,
+                                g_neg_aux,
+                                target=sc_ff_target,
                             )
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
@@ -976,6 +1049,14 @@ def main() -> int:
             )
         ),
         "self_contrastive_max_graphs": int(train_cfg.get("self_contrastive_max_graphs", 0)),
+        "self_contrastive_ff_weight": float(train_cfg.get("self_contrastive_ff_weight", 0.0)),
+        "self_contrastive_ff_neg_mode": str(train_cfg.get("self_contrastive_ff_neg_mode", "shuffle+noise")),
+        "self_contrastive_ff_noise_std": float(
+            train_cfg.get("self_contrastive_ff_noise_std", train_cfg.get("noise_std", 0.05))
+        ),
+        "self_contrastive_ff_target": float(
+            train_cfg.get("self_contrastive_ff_target", train_cfg.get("goodness_target", 1.0))
+        ),
         "distance_forward_weight": float(train_cfg.get("distance_forward_weight", 0.0)),
         "distance_forward_margin": float(train_cfg.get("distance_forward_margin", 0.15)),
         "distance_forward_max_graphs": int(train_cfg.get("distance_forward_max_graphs", 0)),
@@ -1025,6 +1106,9 @@ def main() -> int:
     modes = sweep_cfg.get("modes", ["ff_layerwise", "ff_e2e"])
     if isinstance(modes, str):
         modes = [m.strip() for m in modes.split(",") if m.strip()]
+    mode_overrides = sweep_cfg.get("mode_overrides", {})
+    if not isinstance(mode_overrides, dict):
+        mode_overrides = {}
 
     meta_keys = {
         "epochs",
@@ -1048,6 +1132,7 @@ def main() -> int:
         "worker_torch_threads",
         "worker_torch_interop_threads",
         "worker_loader_workers",
+        "mode_overrides",
     }
 
     grid_keys = []
@@ -1129,12 +1214,18 @@ def main() -> int:
         for mode in modes:
             run_idx += 1
             layerwise = mode == "ff_layerwise"
-            seed = int(cfg_run.get("seed", 7)) + run_idx
+            cfg_mode = cfg_run.copy()
+            mode_override = mode_overrides.get(mode, {})
+            if isinstance(mode_override, dict):
+                cfg_mode.update(mode_override)
+            if run_idx <= len(modes):
+                _warn_self_contrastive_eval_view(cfg_mode, mode)
+            seed = int(cfg_mode.get("seed", 7)) + run_idx
             if parallel_workers > 1:
                 tasks.append(
                     (
                         str(graphs_path),
-                        cfg_run,
+                        cfg_mode,
                         combo,
                         layerwise,
                         device_str,
@@ -1145,11 +1236,12 @@ def main() -> int:
                 )
             else:
                 _set_seed(seed)
-                res = _run_ff_trial(graphs, device, cfg_run, layerwise=layerwise)
+                res = _run_ff_trial(graphs, device, cfg_mode, layerwise=layerwise)
                 res["mode"] = mode
                 res.update(combo)
                 for k in (
                     "neg_mode",
+                    "eval_neg_mode",
                     "goodness_temp",
                     "goodness_target",
                     "neg_mix_end",
@@ -1164,14 +1256,18 @@ def main() -> int:
                     "self_contrastive_max_graphs",
                     "distance_forward_max_graphs",
                     "distance_forward_interval",
+                    "self_contrastive_ff_weight",
+                    "self_contrastive_ff_neg_mode",
+                    "self_contrastive_ff_noise_std",
+                    "self_contrastive_ff_target",
                     "amp",
                     "amp_dtype",
                     "fused_optimizer",
                     "ff_blockwise",
                     "ff_block_size",
                 ):
-                    if k in cfg_run:
-                        res[k] = cfg_run[k]
+                    if k in cfg_mode:
+                        res[k] = cfg_mode[k]
                 results.append(res)
                 pbar.update(1)
 
@@ -1183,11 +1279,12 @@ def main() -> int:
 
             with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
                 for res, task in zip(ex.map(_run_trial_worker, tasks), tasks):
-                    _, cfg_run, combo, layerwise, *_ = task
+                    _, cfg_mode, combo, layerwise, *_ = task
                     res["mode"] = "ff_layerwise" if layerwise else "ff_e2e"
                     res.update(combo)
                     for k in (
                         "neg_mode",
+                        "eval_neg_mode",
                         "goodness_temp",
                         "goodness_target",
                         "neg_mix_end",
@@ -1202,14 +1299,18 @@ def main() -> int:
                         "self_contrastive_max_graphs",
                         "distance_forward_max_graphs",
                         "distance_forward_interval",
+                        "self_contrastive_ff_weight",
+                        "self_contrastive_ff_neg_mode",
+                        "self_contrastive_ff_noise_std",
+                        "self_contrastive_ff_target",
                         "amp",
                         "amp_dtype",
                         "fused_optimizer",
                         "ff_blockwise",
                         "ff_block_size",
                     ):
-                        if k in cfg_run:
-                            res[k] = cfg_run[k]
+                        if k in cfg_mode:
+                            res[k] = cfg_mode[k]
                     results.append(res)
                     pbar.update(1)
         else:
@@ -1219,11 +1320,12 @@ def main() -> int:
             ctx = mp.get_context(parallel_mp_context)
             with ProcessPoolExecutor(max_workers=parallel_workers, mp_context=ctx) as ex:
                 for res, task in zip(ex.map(_run_trial_worker, tasks), tasks):
-                    _, cfg_run, combo, layerwise, *_ = task
+                    _, cfg_mode, combo, layerwise, *_ = task
                     res["mode"] = "ff_layerwise" if layerwise else "ff_e2e"
                     res.update(combo)
                     for k in (
                         "neg_mode",
+                        "eval_neg_mode",
                         "goodness_temp",
                         "goodness_target",
                         "neg_mix_end",
@@ -1238,14 +1340,18 @@ def main() -> int:
                         "self_contrastive_max_graphs",
                         "distance_forward_max_graphs",
                         "distance_forward_interval",
+                        "self_contrastive_ff_weight",
+                        "self_contrastive_ff_neg_mode",
+                        "self_contrastive_ff_noise_std",
+                        "self_contrastive_ff_target",
                         "amp",
                         "amp_dtype",
                         "fused_optimizer",
                         "ff_blockwise",
                         "ff_block_size",
                     ):
-                        if k in cfg_run:
-                            res[k] = cfg_run[k]
+                        if k in cfg_mode:
+                            res[k] = cfg_mode[k]
                     results.append(res)
                     pbar.update(1)
     pbar.close()

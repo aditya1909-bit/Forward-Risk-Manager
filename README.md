@@ -32,6 +32,44 @@ Publish curated artifacts from a run:
 python scripts/publish_run.py --run-id <run_id>
 ```
 
+## Current Results Snapshot (as of 2026-02-11)
+Primary run analyzed: `runs/experiments/long_constituents/`.
+
+Published index status:
+- `reports/index.csv` currently has mixed provenance.
+- Most scenario/hallucination/sweep benchmark metrics are from `long_constituents`.
+- `train/*` published snapshots are still from `legacy-20260211-colab`.
+- `goodness_backtest.csv` currently exists in `legacy-20260211-colab` only.
+
+Benchmark (`runs/experiments/long_constituents/metrics/benchmark.csv`):
+
+| mode | objective | eval_acc | eval_sep / eval_sc_gap | avg_epoch_s | graphs_per_s |
+|---|---|---:|---:|---:|---:|
+| `ff_layerwise` | `ff` | 0.866 | 1.719 (`eval_sep`) | 1.185 | 2383.5 |
+| `ff_e2e` | `self_contrastive` | 0.999 | 0.730 (`eval_sc_gap`) | 1.169 | 2415.0 |
+| `backprop` | `bce` | 0.983 | 0.548 (`eval_sep`) | 0.832 | 3395.3 |
+
+Sweep best (`runs/experiments/long_constituents/metrics/ff_sweep.csv`):
+- Best objective-aware row (rank metric `eval_sep`): `2.071` in `ff_layerwise`.
+- Speed for that row: `2818.1` graphs/s, `avg_epoch_s=1.002`.
+- Key params: `goodness_temp=0.0524`, `goodness_target=3.4908`, `hall_steps=14`, `hall_lr=0.033614`, `hall_node_fraction=0.25`.
+
+Scenario + stress (`runs/experiments/long_constituents/diagnostics/scenario_constraint_diagnostics.csv`, `runs/experiments/long_constituents/metrics/stress_test_report.csv`):
+- Scenario constraint hit rate: `58.7%` over 150 scenarios.
+- Mean target absolute error: `2.43%` (target drop is `-10%`).
+- Mean non-target drift: `0.094%` absolute.
+- Stress deltas (hallucinated minus real), `all` scope mean absolute:
+  - `|delta total_return| = 0.12%`
+  - `|delta volatility| = 0.04%`
+  - `|delta cvar_95| = 0.08%`
+- Target scope is intentionally harder and shows larger shifts (mean absolute `delta total_return ~= 15.75%`).
+
+Hallucination calibration (`runs/experiments/long_constituents/diagnostics/hallucination_calibration_by_ticker.csv`):
+- Median corr(real, halluc): `0.9937`.
+- Median JS divergence: `0.0047`.
+- Median tail ratio p99 (hall/real): `0.976`.
+- Largest JS outliers currently include: `AEIS`, `INDB`, `CMP`, `MOH`, `SARO`.
+
 ## Converter Usage
 Place your raw exports under `data/raw/` (any filenames). Then run:
 
@@ -274,6 +312,9 @@ out_csv = "runs/experiments/default/metrics/benchmark.csv"
 The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_acc`, `eval_g_pos`, `eval_g_neg`, and `eval_sep`.
 If `eval_neg_mode = "auto"` with `neg_mode = "self_contrastive"`, benchmarking reports contrastive metrics (`eval_sc_loss`, `eval_sc_pos`, `eval_sc_neg`, `eval_sc_gap`, `eval_sc_acc`) and maps `eval_sep/eval_acc` to that objective.
 `self_contrastive_eval_view_mode` and `self_contrastive_eval_noise_std` let you make retrieval eval harder than plain tiny-noise views.
+This means `ff_e2e` can report near-1.0 `eval_acc` without being directly comparable to FF-separation rows; compare `eval_sc_gap` for self-contrastive rows and `eval_sep` for FF rows.
+If `self_contrastive_eval_view_mode` is much harsher than training views (e.g. `time_flip+noise` at higher noise), `eval_sc_acc` can collapse even when training loss improves.
+For e2e stability, start with matching views (`self_contrastive_view_mode = "noise"` and `self_contrastive_eval_view_mode = "noise"`) before increasing augmentation strength.
 
 The script also writes a speed-vs-separation plot:
 ```
@@ -389,6 +430,23 @@ Generate a sweep summary report (top-K + Pareto):
 ```bash
 python scripts/ff_sweep_summary.py --csv runs/experiments/default/metrics/ff_sweep.csv --out runs/experiments/default/logs/ff_sweep_summary.txt
 ```
+
+Run a dedicated E2E-only sweep profile:
+```bash
+python scripts/ff_sweep.py --config configs/train_long_constituents.toml --section sweep_e2e
+python scripts/ff_sweep_summary.py --csv runs/experiments/long_constituents/metrics/ff_sweep_e2e.csv --out runs/experiments/long_constituents/logs/ff_sweep_e2e_summary.txt
+```
+
+Generate a dual-track recommendation report (best `ff_e2e` by accuracy-focused score, best `ff_layerwise` by speed-focused score):
+```bash
+python scripts/dual_score_report.py \
+  --benchmark runs/experiments/default/metrics/benchmark.csv \
+  --sweep runs/experiments/default/metrics/ff_sweep.csv \
+  --sweep-e2e runs/experiments/default/metrics/ff_sweep_e2e.csv \
+  --out runs/experiments/default/logs/dual_score_report.txt \
+  --out-csv runs/experiments/default/metrics/dual_score_report.csv
+```
+Use `--e2e-min-acc-ratio-vs-backprop` to down-rank e2e picks that are far below backprop accuracy.
 
 ## Long-History Data (2000–2024)
 If your raw exports are split into year buckets under `data/raw/`, merge + clean them:

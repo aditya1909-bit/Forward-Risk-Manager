@@ -34,6 +34,14 @@ from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
 
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+_NEG_AUG_MODES = {
+    "shuffle",
+    "noise",
+    "shuffle+noise",
+    "time_flip",
+    "shuffle+time_flip",
+    "time_flip+noise",
+}
 
 
 def _load_config(path: str | None) -> dict:
@@ -436,6 +444,10 @@ def _try_batch_size(
     self_contrastive_max_graphs: int,
     self_contrastive_view_mode: str,
     self_contrastive_view_noise_std: float,
+    self_contrastive_ff_weight: float,
+    self_contrastive_ff_neg_mode: str,
+    self_contrastive_ff_noise_std: float,
+    self_contrastive_ff_target: float,
     distance_forward_weight: float,
     distance_forward_margin: float,
     distance_forward_max_graphs: int,
@@ -490,6 +502,28 @@ def _try_batch_size(
                     z_neg_last,
                     margin=distance_forward_margin,
                     max_graphs=distance_forward_max_graphs,
+                )
+            if self_contrastive_ff_weight > 0:
+                x_neg_aux = make_negative(
+                    x,
+                    batch.batch,
+                    mode=self_contrastive_ff_neg_mode,
+                    noise_std=self_contrastive_ff_noise_std,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+                layers_neg_aux = model(
+                    x_neg_aux,
+                    batch.edge_index,
+                    edge_weight=edge_weight,
+                    return_all=True,
+                )
+                g_pos_aux = goodness(layers_pos[-1], batch.batch, temperature=goodness_temp)
+                g_neg_aux = goodness(layers_neg_aux[-1], batch.batch, temperature=goodness_temp)
+                loss = loss + self_contrastive_ff_weight * ff_loss(
+                    g_pos_aux,
+                    g_neg_aux,
+                    target=self_contrastive_ff_target,
                 )
         else:
             if neg_mode == "hallucinate":
@@ -576,6 +610,23 @@ def _try_batch_size(
                     z_neg,
                     margin=distance_forward_margin,
                     max_graphs=distance_forward_max_graphs,
+                )
+            if self_contrastive_ff_weight > 0:
+                x_neg_aux = make_negative(
+                    x,
+                    batch.batch,
+                    mode=self_contrastive_ff_neg_mode,
+                    noise_std=self_contrastive_ff_noise_std,
+                    window_len=window_len,
+                    summary_dim=summary_dim,
+                )
+                h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                g_pos_aux = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp)
+                loss = loss + self_contrastive_ff_weight * ff_loss(
+                    g_pos_aux,
+                    g_neg_aux,
+                    target=self_contrastive_ff_target,
                 )
         else:
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
@@ -664,6 +715,15 @@ def main() -> int:
     parser.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--self-contrastive-view-mode", default=argparse.SUPPRESS)
     parser.add_argument("--self-contrastive-view-noise-std", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--self-contrastive-ff-weight", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--self-contrastive-ff-neg-mode", default=argparse.SUPPRESS)
+    parser.add_argument("--self-contrastive-ff-noise-std", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--self-contrastive-ff-target", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--self-contrastive-energy-penalty-scale",
+        type=float,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--temp-sweep", default=argparse.SUPPRESS)
     parser.add_argument("--ff-layerwise", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--ff-blockwise", action="store_true", default=argparse.SUPPRESS)
@@ -720,6 +780,21 @@ def main() -> int:
         _get_setting(args, section, "self_contrastive_view_noise_std", noise_std)
     )
     self_contrastive_max_graphs = int(_get_setting(args, section, "self_contrastive_max_graphs", 0))
+    self_contrastive_ff_weight = float(
+        _get_setting(args, section, "self_contrastive_ff_weight", 0.0)
+    )
+    self_contrastive_ff_neg_mode = str(
+        _get_setting(args, section, "self_contrastive_ff_neg_mode", "shuffle+noise")
+    )
+    self_contrastive_ff_noise_std = float(
+        _get_setting(args, section, "self_contrastive_ff_noise_std", noise_std)
+    )
+    self_contrastive_ff_target = float(
+        _get_setting(args, section, "self_contrastive_ff_target", goodness_target)
+    )
+    self_contrastive_energy_penalty_scale = float(
+        _get_setting(args, section, "self_contrastive_energy_penalty_scale", 0.0)
+    )
     distance_forward_weight = float(_get_setting(args, section, "distance_forward_weight", 0.0))
     distance_forward_margin = float(_get_setting(args, section, "distance_forward_margin", 0.15))
     distance_forward_max_graphs = int(_get_setting(args, section, "distance_forward_max_graphs", 0))
@@ -862,6 +937,13 @@ def main() -> int:
         self_contrastive_view_mode = "shuffle+noise"
     self_contrastive_view_noise_std = max(0.0, float(self_contrastive_view_noise_std))
     self_contrastive_max_graphs = max(0, int(self_contrastive_max_graphs))
+    self_contrastive_ff_weight = max(0.0, float(self_contrastive_ff_weight))
+    self_contrastive_ff_neg_mode = str(self_contrastive_ff_neg_mode).strip().lower()
+    if self_contrastive_ff_neg_mode not in _NEG_AUG_MODES:
+        self_contrastive_ff_neg_mode = "shuffle+noise"
+    self_contrastive_ff_noise_std = max(0.0, float(self_contrastive_ff_noise_std))
+    self_contrastive_ff_target = float(self_contrastive_ff_target)
+    self_contrastive_energy_penalty_scale = max(0.0, float(self_contrastive_energy_penalty_scale))
     distance_forward_weight = max(0.0, float(distance_forward_weight))
     distance_forward_margin = max(0.0, float(distance_forward_margin))
     distance_forward_max_graphs = max(0, int(distance_forward_max_graphs))
@@ -994,6 +1076,19 @@ def main() -> int:
         )
         if self_contrastive_max_graphs > 0:
             print(f"self_contrastive_max_graphs: {self_contrastive_max_graphs}")
+        if self_contrastive_ff_weight > 0:
+            print(
+                "self_contrastive_ff_aux: "
+                f"weight={self_contrastive_ff_weight}, "
+                f"neg_mode={self_contrastive_ff_neg_mode}, "
+                f"noise_std={self_contrastive_ff_noise_std}, "
+                f"target={self_contrastive_ff_target}"
+            )
+        if energy_penalty_weight > 0 and self_contrastive_energy_penalty_scale != 1.0:
+            print(
+                "self_contrastive_energy_penalty_scale: "
+                f"{self_contrastive_energy_penalty_scale}"
+            )
     if distance_forward_weight > 0:
         print(
             "distance_forward: "
@@ -1159,6 +1254,10 @@ def main() -> int:
                     self_contrastive_max_graphs,
                     self_contrastive_view_mode,
                     self_contrastive_view_noise_std,
+                    self_contrastive_ff_weight,
+                    self_contrastive_ff_neg_mode,
+                    self_contrastive_ff_noise_std,
+                    self_contrastive_ff_target,
                     distance_forward_weight,
                     distance_forward_margin,
                     distance_forward_max_graphs,
@@ -1197,6 +1296,10 @@ def main() -> int:
                         self_contrastive_max_graphs,
                         self_contrastive_view_mode,
                         self_contrastive_view_noise_std,
+                        self_contrastive_ff_weight,
+                        self_contrastive_ff_neg_mode,
+                        self_contrastive_ff_noise_std,
+                        self_contrastive_ff_target,
                         distance_forward_weight,
                         distance_forward_margin,
                         distance_forward_max_graphs,
@@ -1314,7 +1417,7 @@ def main() -> int:
                 distance_forward_weight > 0
                 and (step_idx % distance_forward_interval == 0)
             )
-            step_scaler = scaler if (amp_enabled and use_mode == "self_contrastive") else None
+            step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or ff_layerwise)) else None
 
             if ff_multiscale:
                 if step_scaler is not None:
@@ -1366,6 +1469,33 @@ def main() -> int:
                                 max_graphs=distance_forward_max_graphs,
                             )
                             batch_loss = batch_loss + distance_forward_weight * dist_loss_val
+                        if self_contrastive_ff_weight > 0:
+                            x_neg_aux = make_negative(
+                                x,
+                                batch.batch,
+                                mode=self_contrastive_ff_neg_mode,
+                                noise_std=self_contrastive_ff_noise_std,
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
+                            layers_neg_aux = model(
+                                x_neg_aux,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                                return_all=True,
+                            )
+                            g_pos_aux = goodness(
+                                layers_pos[-1], batch.batch, temperature=goodness_temp
+                            )
+                            g_neg_aux = goodness(
+                                layers_neg_aux[-1], batch.batch, temperature=goodness_temp
+                            )
+                            ff_aux = ff_loss(
+                                g_pos_aux,
+                                g_neg_aux,
+                                target=self_contrastive_ff_target,
+                            )
+                            batch_loss = batch_loss + self_contrastive_ff_weight * ff_aux
                 else:
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
@@ -1487,14 +1617,19 @@ def main() -> int:
                     g_neg_last = (g_neg_h_last + g_neg_t_last) / 2.0
 
                 energy_penalty_val = 0.0
-                if energy_penalty_weight > 0:
+                energy_penalty_weight_eff = (
+                    energy_penalty_weight * self_contrastive_energy_penalty_scale
+                    if use_mode == "self_contrastive"
+                    else energy_penalty_weight
+                )
+                if energy_penalty_weight_eff > 0:
                     if energy_penalty_mode == "all":
                         energy_penalty_val = sum(
                             h.pow(2).mean() for h in layers_pos
                         ) / max(1, len(layers_pos))
                     else:
                         energy_penalty_val = layers_pos[-1].pow(2).mean()
-                    batch_loss = batch_loss + energy_penalty_weight * energy_penalty_val
+                    batch_loss = batch_loss + energy_penalty_weight_eff * energy_penalty_val
 
                 risk_loss_val = None
                 if risk_head is not None and risk_targets_by_horizon is not None:
@@ -1524,7 +1659,7 @@ def main() -> int:
                 if hall_active:
                     hall_hardness_sum += (g_neg_last - g_pos_last)
                     hall_hardness_count += 1
-                if energy_penalty_weight > 0:
+                if energy_penalty_weight_eff > 0:
                     energy_penalty_sum += float(energy_penalty_val.detach())
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
@@ -1535,7 +1670,8 @@ def main() -> int:
                 if ff_blockwise:
                     block_mode = "shuffle" if use_mode == "self_contrastive" else use_mode
                     hall_active = block_mode == "hallucinate"
-                    layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
 
                     if hall_active:
                         x_neg = hallucinate_negative(
@@ -1572,15 +1708,17 @@ def main() -> int:
                         )
                     total_used += 1
 
-                    layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
                     if hall_active:
                         last_idx = ff_block_endpoints[-1]
-                        g_pos_probe = goodness(
-                            layers_pos[last_idx], batch.batch, temperature=goodness_temp
-                        ).mean().item()
-                        g_neg_probe = goodness(
-                            layers_neg[last_idx], batch.batch, temperature=goodness_temp
-                        ).mean().item()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            g_pos_probe = goodness(
+                                layers_pos[last_idx], batch.batch, temperature=goodness_temp
+                            ).mean().item()
+                            g_neg_probe = goodness(
+                                layers_neg[last_idx], batch.batch, temperature=goodness_temp
+                            ).mean().item()
                         if g_neg_probe > g_pos_probe + neg_gate_margin:
                             x_neg = make_negative(
                                 x,
@@ -1593,26 +1731,28 @@ def main() -> int:
                             hall_used -= 1
                             hall_gated += 1
                             hall_active = False
-                            layers_neg = model(
-                                x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
-                            )
+                            with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                                layers_neg = model(
+                                    x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
+                                )
 
                     block_loss = 0.0
                     block_gpos = 0.0
                     block_gneg = 0.0
-                    for li in ff_block_endpoints:
-                        g_pos = goodness(layers_pos[li], batch.batch, temperature=goodness_temp)
-                        g_neg = goodness(layers_neg[li], batch.batch, temperature=goodness_temp)
-                        block_loss = block_loss + ff_loss(g_pos, g_neg, target=goodness_target)
-                        block_gpos += g_pos.mean().item()
-                        block_gneg += g_neg.mean().item()
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        for li in ff_block_endpoints:
+                            g_pos = goodness(layers_pos[li], batch.batch, temperature=goodness_temp)
+                            g_neg = goodness(layers_neg[li], batch.batch, temperature=goodness_temp)
+                            block_loss = block_loss + ff_loss(g_pos, g_neg, target=goodness_target)
+                            block_gpos += g_pos.mean().item()
+                            block_gneg += g_neg.mean().item()
                     block_loss = block_loss / max(1, len(ff_block_endpoints))
                     _optimizer_step(
                         optim=optim,
                         loss=block_loss,
                         grad_clip=grad_clip,
                         clip_params=optim_params,
-                        scaler=None,
+                        scaler=step_scaler,
                     )
 
                     avg_g_pos = block_gpos / max(1, len(ff_block_endpoints))
@@ -1632,8 +1772,9 @@ def main() -> int:
                         layer_mode = use_mode
                         if use_mode == "hallucinate" and li > 0:
                             layer_mode = "shuffle"
-                        h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
-                        g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
+                            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
 
                         hall_active = layer_mode == "hallucinate"
                         if layer_mode == "hallucinate":
@@ -1678,10 +1819,11 @@ def main() -> int:
                         total_used += 1
 
                         if layer_mode == "hallucinate":
-                            h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                            g_neg_probe = goodness(
-                                h_neg_probe, batch.batch, temperature=goodness_temp
-                            ).mean().item()
+                            with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                                h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                                g_neg_probe = goodness(
+                                    h_neg_probe, batch.batch, temperature=goodness_temp
+                                ).mean().item()
                             g_pos_probe = g_pos.mean().item()
                             if g_neg_probe > g_pos_probe + neg_gate_margin:
                                 x_neg = make_negative(
@@ -1696,16 +1838,16 @@ def main() -> int:
                                 hall_gated += 1
                                 hall_active = False
 
-                        h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                        g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
-
-                        loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+                            loss = ff_loss(g_pos, g_neg, target=goodness_target)
                         _optimizer_step(
                             optim=optim,
                             loss=loss,
                             grad_clip=grad_clip,
                             clip_params=optim_params,
-                            scaler=None,
+                            scaler=step_scaler,
                         )
 
                         layer_losses += loss.item()
@@ -1754,6 +1896,24 @@ def main() -> int:
                                 max_graphs=distance_forward_max_graphs,
                             )
                             loss = loss + distance_forward_weight * dist_loss_val
+                        if self_contrastive_ff_weight > 0:
+                            x_neg_aux = make_negative(
+                                x,
+                                batch.batch,
+                                mode=self_contrastive_ff_neg_mode,
+                                noise_std=self_contrastive_ff_noise_std,
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
+                            )
+                            h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                            g_pos_aux = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                            g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp)
+                            ff_aux = ff_loss(
+                                g_pos_aux,
+                                g_neg_aux,
+                                target=self_contrastive_ff_target,
+                            )
+                            loss = loss + self_contrastive_ff_weight * ff_aux
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
                     g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
@@ -1830,9 +1990,14 @@ def main() -> int:
                         loss = loss + distance_forward_weight * dist_loss_val
 
                 energy_penalty_val = 0.0
-                if energy_penalty_weight > 0:
+                energy_penalty_weight_eff = (
+                    energy_penalty_weight * self_contrastive_energy_penalty_scale
+                    if use_mode == "self_contrastive"
+                    else energy_penalty_weight
+                )
+                if energy_penalty_weight_eff > 0:
                     energy_penalty_val = h_pos.pow(2).mean()
-                    loss = loss + energy_penalty_weight * energy_penalty_val
+                    loss = loss + energy_penalty_weight_eff * energy_penalty_val
 
                 risk_loss_val = None
                 if risk_head is not None and risk_targets_by_horizon is not None:
@@ -1861,7 +2026,7 @@ def main() -> int:
                 if hall_active:
                     hall_hardness_sum += (g_neg_val - g_pos_val)
                     hall_hardness_count += 1
-                if energy_penalty_weight > 0:
+                if energy_penalty_weight_eff > 0:
                     energy_penalty_sum += float(energy_penalty_val.detach())
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())

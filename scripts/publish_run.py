@@ -6,6 +6,7 @@ import csv
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
+from typing import Iterable
 
 
 def _utc_now() -> str:
@@ -18,6 +19,13 @@ def _copy_if_exists(src: Path, dst: Path) -> bool:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     return True
+
+
+def _copy_first_exists(srcs: Iterable[Path], dst: Path) -> tuple[bool, Path | None]:
+    for src in srcs:
+        if _copy_if_exists(src, dst):
+            return True, src
+    return False, None
 
 
 def main() -> int:
@@ -35,37 +43,54 @@ def main() -> int:
 
     ts = _utc_now()
     publish_map = [
-        ("metrics/benchmark.csv", "benchmark/latest.csv", "metric"),
-        ("plots/benchmark_speed_sep.png", "benchmark/latest_speed_sep.png", "plot"),
-        ("plots/benchmark_bar.png", "benchmark/latest_bar.png", "plot"),
-        ("metrics/ff_sweep.csv", "sweep/latest.csv", "metric"),
-        ("plots/ff_sweep_pareto.png", "sweep/latest_pareto.png", "plot"),
-        ("plots/ff_sweep_tradeoff.png", "sweep/latest_tradeoff.png", "plot"),
-        ("logs/ff_sweep_summary.txt", "sweep/latest_summary.txt", "summary"),
-        ("metrics/sweep_parallel_tune.csv", "sweep/latest_tune.csv", "metric"),
-        ("metrics/ff_train_default.csv", "train/default_latest.csv", "metric"),
-        ("plots/ff_train_default.png", "train/default_latest.png", "plot"),
-        ("metrics/ff_train_long_constituents.csv", "train/long_constituents_latest.csv", "metric"),
-        ("plots/ff_train_long_constituents.png", "train/long_constituents_latest.png", "plot"),
-        ("metrics/scenario_book.csv", "scenario/latest.csv", "metric"),
-        ("diagnostics/scenario_constraint_diagnostics.csv", "scenario/constraints_latest.csv", "diagnostic"),
-        ("metrics/stress_test_report.csv", "scenario/stress_latest.csv", "metric"),
-        ("plots/stress_test_report.png", "scenario/stress_latest.png", "plot"),
-        ("diagnostics/hallucination_calibration.json", "hallucination/calibration_latest.json", "diagnostic"),
+        (["metrics/benchmark.csv"], "benchmark/latest.csv", "metric"),
+        (["plots/benchmark_speed_sep.png"], "benchmark/latest_speed_sep.png", "plot"),
+        (["plots/benchmark_bar.png", "plots/benchmark.png"], "benchmark/latest_bar.png", "plot"),
+        (["metrics/dual_score_report.csv"], "benchmark/dual_score_latest.csv", "metric"),
+        (["logs/dual_score_report.txt"], "benchmark/dual_score_latest.txt", "summary"),
+        (["metrics/ff_sweep.csv"], "sweep/latest.csv", "metric"),
+        (["metrics/ff_sweep_e2e.csv"], "sweep/latest_e2e.csv", "metric"),
+        (["plots/ff_sweep_pareto.png"], "sweep/latest_pareto.png", "plot"),
+        (["plots/ff_sweep_tradeoff.png"], "sweep/latest_tradeoff.png", "plot"),
+        (["logs/ff_sweep_summary.txt"], "sweep/latest_summary.txt", "summary"),
+        (["logs/ff_sweep_e2e_summary.txt"], "sweep/latest_e2e_summary.txt", "summary"),
+        (["metrics/sweep_parallel_tune.csv"], "sweep/latest_tune.csv", "metric"),
+        (["metrics/ff_train_default.csv", "metrics/ff_train.csv"], "train/default_latest.csv", "metric"),
+        (["plots/ff_train_default.png", "plots/ff_train.png"], "train/default_latest.png", "plot"),
         (
-            "diagnostics/hallucination_calibration_by_ticker.csv",
+            ["metrics/ff_train_long_constituents.csv", "metrics/ff_train.csv"],
+            "train/long_constituents_latest.csv",
+            "metric",
+        ),
+        (
+            ["plots/ff_train_long_constituents.png", "plots/ff_train.png"],
+            "train/long_constituents_latest.png",
+            "plot",
+        ),
+        (["metrics/scenario_book.csv"], "scenario/latest.csv", "metric"),
+        (
+            ["diagnostics/scenario_constraint_diagnostics.csv"],
+            "scenario/constraints_latest.csv",
+            "diagnostic",
+        ),
+        (["metrics/stress_test_report.csv"], "scenario/stress_latest.csv", "metric"),
+        (["plots/stress_test_report.png"], "scenario/stress_latest.png", "plot"),
+        (["diagnostics/hallucination_calibration.json"], "hallucination/calibration_latest.json", "diagnostic"),
+        (
+            ["diagnostics/hallucination_calibration_by_ticker.csv"],
             "hallucination/calibration_by_ticker_latest.csv",
             "diagnostic",
         ),
-        ("diagnostics/hallucination_diagnostics.png", "hallucination/diagnostics_latest.png", "diagnostic"),
-        ("diagnostics/hallucination_plot.png", "hallucination/plot_latest.png", "diagnostic"),
+        (["diagnostics/hallucination_diagnostics.png"], "hallucination/diagnostics_latest.png", "diagnostic"),
+        (["diagnostics/hallucination_plot.png"], "hallucination/plot_latest.png", "diagnostic"),
     ]
 
     published_rows = []
-    for src_rel, pub_rel, kind in publish_map:
-        src = run_root / src_rel
+    for src_rels, pub_rel, kind in publish_map:
+        src_candidates = [run_root / src_rel for src_rel in src_rels]
         dst = root / "reports" / "published" / pub_rel
-        if not _copy_if_exists(src, dst):
+        copied, src = _copy_first_exists(src_candidates, dst)
+        if not copied:
             continue
         published_rows.append(
             {

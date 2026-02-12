@@ -1,0 +1,19 @@
+Dual Track FF Report
+====================
+
+Reference backprop row:
+  primary(eval_sep)=0.544248, eval_acc=0.983734, avg_epoch_s=0.862080, graphs_per_s=3275.806204
+
+[e2e_accuracy] mode=ff_e2e source=sweep_e2e
+  dual_score=1.000000, dual_score_raw=1.000000, penalty_factor=1.000000, primary(eval_sc_gap)=0.862328, eval_acc=1.000000
+  avg_epoch_s=1.666882, graphs_per_s=1694.254777, speed_ratio_vs_backprop=0.517202
+  delta_primary_vs_backprop=0.318080, delta_acc_vs_backprop=0.016266
+  acc_ratio_vs_backprop=1.016535
+  params: goodness_target=2.9671633612500012, goodness_temp=0.05, neg_mix_end=0.2, hall_steps=8, hall_lr=0.047059599999999986, hall_node_fraction=0.55, self_contrastive_ff_weight=0.1
+
+[layerwise_speed] mode=ff_layerwise source=sweep
+  dual_score=0.908505, dual_score_raw=0.908505, penalty_factor=1.000000, primary(eval_sep)=2.166068, eval_acc=0.957567
+  avg_epoch_s=1.190574, graphs_per_s=2371.974664, speed_ratio_vs_backprop=0.724089
+  delta_primary_vs_backprop=1.621820, delta_acc_vs_backprop=-0.026167
+  params: goodness_target=2.2928080518750007, goodness_temp=0.052428800000000025, neg_mix_end=0.1, hall_steps=10, hall_lr=0.047059599999999986, hall_node_fraction=0.25, self_contrastive_ff_weight=0.1
+

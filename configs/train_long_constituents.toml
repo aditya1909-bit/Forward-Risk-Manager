@@ -15,10 +15,14 @@ num_layers = 2
 dropout = 0.1
 goodness_target = 2.697421237500001
 goodness_temp = 0.052428800000000025
-self_contrastive_temp = 0.2
-self_contrastive_view_mode = "shuffle+noise"
+self_contrastive_temp = 0.15
+self_contrastive_view_mode = "noise"
 self_contrastive_view_noise_std = 0.05
-distance_forward_weight = 0.05
+self_contrastive_ff_weight = 0.1
+self_contrastive_ff_neg_mode = "shuffle+noise"
+self_contrastive_ff_noise_std = 0.05
+self_contrastive_ff_target = 2.697421237500001
+distance_forward_weight = 0.02
 distance_forward_margin = 0.15
 # FF speed knobs (preserve objective, reduce per-batch cost)
 self_contrastive_max_graphs = 96
@@ -28,7 +32,7 @@ amp = true
 amp_dtype = "float16"
 fused_optimizer = true
 ff_layerwise = false
-ff_blockwise = false
+ff_blockwise = true
 ff_block_size = 2
 ff_multiscale = true
 neg_mode = "self_contrastive"
@@ -46,7 +50,7 @@ log_csv = "runs/experiments/long_constituents/metrics/ff_train.csv"
 plot_path = "runs/experiments/long_constituents/plots/ff_train.png"
 save_model = "runs/experiments/long_constituents/models/ff_model.pt"
 auto_tune_batch = true
-auto_tune_max_batch = 128
+auto_tune_max_batch = 256
 auto_tune_factor = 2
 auto_tune_min_batch = 1
 neg_warmup_epochs = 10
@@ -57,6 +61,7 @@ neg_gate_margin = 0.6499999999999999
 grad_clip = 1.0
 energy_penalty_weight = 0.0002
 energy_penalty_mode = "last"
+self_contrastive_energy_penalty_scale = 0.0
 risk_head_enabled = true
 risk_ticker = "BWC"
 risk_horizon = 21
@@ -181,6 +186,30 @@ calibrate_target = true
 calibrate_batches = 0
 calibrate_quantiles = 31
 
+[benchmark.mode_overrides.ff_layerwise]
+neg_mode = "shuffle"
+eval_neg_mode = "shuffle"
+ff_blockwise = true
+distance_forward_weight = 0.0
+
+[benchmark.mode_overrides.ff_e2e]
+neg_mode = "self_contrastive"
+eval_neg_mode = "self_contrastive"
+self_contrastive_temp = 0.15
+self_contrastive_view_mode = "noise"
+self_contrastive_view_noise_std = 0.03
+self_contrastive_eval_view_mode = "noise"
+self_contrastive_eval_noise_std = 0.05
+self_contrastive_max_graphs = 96
+self_contrastive_ff_weight = 0.1
+self_contrastive_ff_neg_mode = "shuffle+noise"
+self_contrastive_ff_noise_std = 0.05
+self_contrastive_ff_target = 2.697421237500001
+distance_forward_weight = 0.02
+distance_forward_margin = 0.15
+distance_forward_max_graphs = 64
+distance_forward_interval = 2
+
 [sweep]
 epochs = 5
 eval_frac = 0.2
@@ -195,3 +224,61 @@ auto_expand_size = 18
 auto_expand_seed = 173
 speed_weight = 0.25
 top_k = 10
+
+[sweep.mode_overrides.ff_layerwise]
+neg_mode = "shuffle"
+eval_neg_mode = "shuffle"
+ff_blockwise = true
+distance_forward_weight = 0.0
+
+[sweep.mode_overrides.ff_e2e]
+neg_mode = "self_contrastive"
+eval_neg_mode = "self_contrastive"
+self_contrastive_temp = 0.15
+self_contrastive_view_mode = "noise"
+self_contrastive_view_noise_std = 0.03
+self_contrastive_eval_view_mode = "noise"
+self_contrastive_eval_noise_std = 0.05
+self_contrastive_max_graphs = 96
+self_contrastive_ff_weight = 0.1
+self_contrastive_ff_neg_mode = "shuffle+noise"
+self_contrastive_ff_noise_std = 0.05
+self_contrastive_ff_target = 2.697421237500001
+distance_forward_weight = 0.02
+distance_forward_margin = 0.15
+distance_forward_max_graphs = 64
+distance_forward_interval = 2
+
+[sweep_e2e]
+epochs = 10
+eval_frac = 0.2
+split_mode = "chronological"
+eval_neg_mode = "self_contrastive"
+self_contrastive_eval_view_mode = "noise"
+self_contrastive_eval_noise_std = 0.05
+timing_warmup_epochs = 1
+out_csv = "runs/experiments/long_constituents/metrics/ff_sweep_e2e.csv"
+auto_expand = true
+auto_expand_size = 24
+auto_expand_seed = 271
+speed_weight = 0.1
+top_k = 12
+modes = ["ff_e2e"]
+
+[sweep_e2e.mode_overrides.ff_e2e]
+neg_mode = "self_contrastive"
+eval_neg_mode = "self_contrastive"
+self_contrastive_temp = 0.15
+self_contrastive_view_mode = "noise"
+self_contrastive_view_noise_std = 0.03
+self_contrastive_eval_view_mode = "noise"
+self_contrastive_eval_noise_std = 0.05
+self_contrastive_max_graphs = 96
+self_contrastive_ff_weight = 0.1
+self_contrastive_ff_neg_mode = "shuffle+noise"
+self_contrastive_ff_noise_std = 0.05
+self_contrastive_ff_target = 2.697421237500001
+distance_forward_weight = 0.02
+distance_forward_margin = 0.15
+distance_forward_max_graphs = 64
+distance_forward_interval = 2
