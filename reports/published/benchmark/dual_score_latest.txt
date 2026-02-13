@@ -2,18 +2,18 @@ Dual Track FF Report
 ====================
 
 Reference backprop row:
-  primary(eval_sep)=0.000454, eval_acc=0.958924, avg_epoch_s=0.856088, graphs_per_s=3298.774734
+  primary(eval_sep)=0.000455, eval_acc=0.958924, avg_epoch_s=0.863168, graphs_per_s=3271.670742
 
 [e2e_accuracy] mode=ff_e2e source=sweep_e2e
-  dual_score=1.000000, dual_score_raw=1.000000, penalty_factor=1.000000, primary(eval_sc_gap)=0.864846, eval_acc=1.000000, eval_auroc=
-  avg_epoch_s=1.700089, graphs_per_s=1661.101391, speed_ratio_vs_backprop=0.503551
-  delta_primary_vs_backprop=0.864392, delta_acc_vs_backprop=0.041076
+  dual_score=1.000000, dual_score_raw=1.000000, penalty_factor=1.000000, primary(eval_sc_gap)=0.864860, eval_acc=1.000000, eval_auroc=
+  avg_epoch_s=1.723155, graphs_per_s=1638.913103, speed_ratio_vs_backprop=0.500941
+  delta_primary_vs_backprop=0.864405, delta_acc_vs_backprop=0.041076
   acc_ratio_vs_backprop=1.042836
   params: goodness_target=2.697421237500001, goodness_temp=0.05, neg_mix_end=0.2, hall_steps=12, hall_lr=0.03361399999999999, hall_node_fraction=0.25, self_contrastive_ff_weight=0.1
 
 [layerwise_speed] mode=ff_layerwise source=sweep
-  dual_score=0.918292, dual_score_raw=0.918292, penalty_factor=1.000000, primary(eval_sep)=0.032357, eval_acc=0.498584, eval_auroc=0.512377
-  avg_epoch_s=1.177402, graphs_per_s=2398.601739, speed_ratio_vs_backprop=0.727119
-  delta_primary_vs_backprop=0.031903, delta_acc_vs_backprop=-0.460340
-  params: goodness_target=2.697421237500001, goodness_temp=0.052428800000000025, neg_mix_end=0.1, hall_steps=10, hall_lr=0.03361399999999999, hall_node_fraction=0.4, self_contrastive_ff_weight=0.1
+  dual_score=0.927984, dual_score_raw=0.927984, penalty_factor=1.000000, primary(eval_sep)=0.059020, eval_acc=0.500000, eval_auroc=0.515830
+  avg_epoch_s=1.216471, graphs_per_s=2321.486063, speed_ratio_vs_backprop=0.709572
+  delta_primary_vs_backprop=0.058565, delta_acc_vs_backprop=-0.458924
+  params: goodness_target=2.9671633612500012, goodness_temp=0.05, neg_mix_end=0.1, hall_steps=12, hall_lr=0.047059599999999986, hall_node_fraction=0.4, self_contrastive_ff_weight=0.1
 
