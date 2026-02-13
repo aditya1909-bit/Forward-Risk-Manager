@@ -83,3 +83,44 @@ def test_hallucinate_supports_sparse_periodic_corr_penalty():
     )
     assert x_neg.shape == x.shape
     assert torch.isfinite(x_neg).all()
+
+
+def test_hallucinate_supports_adaptive_lr_moment_penalties_and_target_early_stop():
+    torch.manual_seed(0)
+    model = _IdentityModel()
+    x = torch.randn(4, 6)
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]], dtype=torch.long)
+    edge_attr = torch.full((edge_index.size(1), 1), 0.2, dtype=torch.float32)
+    batch = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    cfg = HallucinationConfig(
+        steps=12,
+        lr=0.1,
+        l2_weight=0.01,
+        mean_weight=0.01,
+        std_weight=0.01,
+        corr_weight=0.01,
+        adaptive_lr=True,
+        adaptive_lr_patience=1,
+        adaptive_lr_decay=0.5,
+        adaptive_lr_min=1e-4,
+        early_stop_on_target_hit=True,
+        target_hit_patience=1,
+        moment_mean_weight=0.05,
+        moment_var_weight=0.05,
+        moment_skew_weight=0.05,
+        return_slice_len=4,
+        moment_scope="returns",
+    )
+
+    x_neg = hallucinate_negative(
+        model=model,
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        batch=batch,
+        config=cfg,
+        constraint_monitor_fn=lambda _: {"hit": True},
+    )
+    assert x_neg.shape == x.shape
+    assert torch.isfinite(x_neg).all()

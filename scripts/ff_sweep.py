@@ -39,7 +39,7 @@ from frisk.econ_eval import (
     load_forward_returns_from_prices,
     resolve_price_ticker,
 )
-from frisk.splits import simple_split_indices
+from frisk.splits import is_walk_forward_mode, simple_split_indices, walk_forward_splits
 
 _GRAPH_CACHE: dict[str, tuple[list, list]] = {}
 _NEG_AUG_MODES = {
@@ -663,6 +663,46 @@ def _attach_primary_metrics(row: dict) -> None:
     row["primary_eval_metric_robust"] = robust_value
 
 
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return float(values[0]), 0.0
+    arr = np.asarray(values, dtype=float)
+    return float(np.mean(arr)), float(np.std(arr, ddof=1))
+
+
+def _aggregate_fold_rows(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    out: dict[str, object] = {}
+    keys = sorted({k for row in rows for k in row.keys()})
+    skip = {"mode", "row_type", "walk_forward_num_folds"}
+    for key in keys:
+        if key in skip or key.startswith("fold_"):
+            continue
+        vals: list[float] = []
+        for row in rows:
+            value = row.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.number)):
+                fv = float(value)
+                if np.isfinite(fv):
+                    vals.append(fv)
+        if vals:
+            mean_val, std_val = _mean_std(vals)
+            out[key] = mean_val
+            out[f"{key}_std"] = std_val
+    first = rows[0]
+    for key in ("eval_objective", "neg_mode_effective", "eval_neg_mode_effective"):
+        if key in first:
+            out[key] = first[key]
+    out["walk_forward_num_folds"] = len(rows)
+    out["split_mode_effective"] = "walk_forward"
+    return out
+
+
 def _compute_econ_metrics_for_eval(
     model,
     eval_graphs,
@@ -697,20 +737,75 @@ def _compute_econ_metrics_for_eval(
         signal_window=int(cfg.get("econ_signal_window", 126)),
         signal_quantile=float(cfg.get("econ_signal_quantile", 0.5)),
         turnover_cost_bps=float(cfg.get("econ_turnover_cost_bps", 0.0)),
+        slippage_bps=float(cfg.get("econ_slippage_bps", 0.0)),
+        slippage_vol_scale=float(cfg.get("econ_slippage_vol_scale", 0.0)),
+        slippage_vol_lookback=int(cfg.get("econ_slippage_vol_lookback", 21)),
         trading_days=int(cfg.get("econ_trading_days", 252)),
     )
     out.update(meta)
     return out
 
 
-def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
-    train_graphs, eval_graphs, _, eval_idx = _split_graphs(
-        graphs,
-        cfg["eval_frac"],
-        cfg["seed"],
-        cfg.get("split_mode", "chronological"),
-    )
-    eval_dates = [graph_dates[i] for i in eval_idx] if graph_dates else []
+def _run_ff_trial(
+    graphs,
+    graph_dates,
+    device,
+    cfg,
+    layerwise: bool,
+    train_graphs=None,
+    eval_graphs=None,
+    eval_dates_override=None,
+):
+    if (
+        train_graphs is None
+        and eval_graphs is None
+        and is_walk_forward_mode(str(cfg.get("split_mode", "chronological")))
+    ):
+        folds = walk_forward_splits(
+            graphs,
+            train_frac=float(cfg.get("walk_forward_train_frac", 0.6)),
+            eval_frac=float(cfg.get("walk_forward_eval_frac", cfg.get("eval_frac", 0.2))),
+            step_frac=float(cfg.get("walk_forward_step_frac", cfg.get("eval_frac", 0.2))),
+            min_train_size=int(cfg.get("walk_forward_min_train_graphs", 64)),
+            min_eval_size=int(cfg.get("walk_forward_min_eval_graphs", 16)),
+            max_folds=int(cfg.get("walk_forward_max_folds", 0)),
+        )
+        fold_rows = []
+        for fold in folds:
+            cfg_fold = dict(cfg)
+            cfg_fold["split_mode"] = "chronological"
+            eval_dates_fold = []
+            if graph_dates:
+                s = int(fold["eval_start"])
+                e = int(fold["eval_end"])
+                eval_dates_fold = list(graph_dates[s:e])
+            row = _run_ff_trial(
+                graphs,
+                graph_dates,
+                device,
+                cfg_fold,
+                layerwise=layerwise,
+                train_graphs=list(fold["train_items"]),
+                eval_graphs=list(fold["eval_items"]),
+                eval_dates_override=eval_dates_fold,
+            )
+            row["row_type"] = "fold"
+            row["fold_id"] = int(fold["fold_id"])
+            fold_rows.append(row)
+        return _aggregate_fold_rows(fold_rows)
+
+    if train_graphs is None or eval_graphs is None:
+        train_graphs, eval_graphs, _, eval_idx = _split_graphs(
+            graphs,
+            cfg["eval_frac"],
+            cfg["seed"],
+            cfg.get("split_mode", "chronological"),
+        )
+        eval_dates = [graph_dates[i] for i in eval_idx] if graph_dates else []
+    else:
+        train_graphs = list(train_graphs)
+        eval_graphs = list(eval_graphs)
+        eval_dates = list(eval_dates_override or [])
     loader_kwargs = {
         "batch_size": cfg["batch_size"],
         "shuffle": True,
@@ -732,6 +827,8 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
         hidden_dim=cfg["hidden_dim"],
         num_layers=cfg["num_layers"],
         dropout=cfg["dropout"],
+        conv_type=str(cfg.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(cfg.get("encoder_gat_heads", 2)),
     ).to(device)
     optim = _build_optimizer(
         model.parameters(),
@@ -758,6 +855,16 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
         corr_every_n_steps=int(cfg.get("hall_corr_every_n_steps", 1)),
         corr_edge_fraction=float(cfg.get("hall_corr_edge_fraction", 1.0)),
         corr_edge_min=int(cfg.get("hall_corr_edge_min", 1)),
+        adaptive_lr=bool(cfg.get("hall_adaptive_lr", False)),
+        adaptive_lr_patience=int(cfg.get("hall_adaptive_lr_patience", 2)),
+        adaptive_lr_decay=float(cfg.get("hall_adaptive_lr_decay", 0.5)),
+        adaptive_lr_min=float(cfg.get("hall_adaptive_lr_min", 1e-4)),
+        early_stop_on_target_hit=bool(cfg.get("hall_early_stop_on_target_hit", False)),
+        target_hit_patience=int(cfg.get("hall_target_hit_patience", 1)),
+        moment_mean_weight=float(cfg.get("hall_moment_mean", 0.0)),
+        moment_var_weight=float(cfg.get("hall_moment_var", 0.0)),
+        moment_skew_weight=float(cfg.get("hall_moment_skew", 0.0)),
+        moment_scope=str(cfg.get("hall_moment_scope", "returns")),
     )
     hall_cfg_layer = HallucinationConfig(
         steps=cfg["hall_steps"],
@@ -777,6 +884,16 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
         corr_every_n_steps=int(cfg.get("hall_corr_every_n_steps", 1)),
         corr_edge_fraction=float(cfg.get("hall_corr_edge_fraction", 1.0)),
         corr_edge_min=int(cfg.get("hall_corr_edge_min", 1)),
+        adaptive_lr=bool(cfg.get("hall_adaptive_lr", False)),
+        adaptive_lr_patience=int(cfg.get("hall_adaptive_lr_patience", 2)),
+        adaptive_lr_decay=float(cfg.get("hall_adaptive_lr_decay", 0.5)),
+        adaptive_lr_min=float(cfg.get("hall_adaptive_lr_min", 1e-4)),
+        early_stop_on_target_hit=bool(cfg.get("hall_early_stop_on_target_hit", False)),
+        target_hit_patience=int(cfg.get("hall_target_hit_patience", 1)),
+        moment_mean_weight=float(cfg.get("hall_moment_mean", 0.0)),
+        moment_var_weight=float(cfg.get("hall_moment_var", 0.0)),
+        moment_skew_weight=float(cfg.get("hall_moment_skew", 0.0)),
+        moment_scope=str(cfg.get("hall_moment_scope", "returns")),
     )
     sc_temp = float(cfg.get("self_contrastive_temp", 0.2))
     sc_ff_weight = max(0.0, float(cfg.get("self_contrastive_ff_weight", 0.0)))
@@ -905,7 +1022,13 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
                         for li in ff_block_endpoints:
                             g_pos = goodness(layers_pos[li], batch.batch, temperature=cfg["goodness_temp"])
                             g_neg = goodness(layers_neg[li], batch.batch, temperature=cfg["goodness_temp"])
-                            loss = loss + ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                            loss = loss + ff_loss(
+                                g_pos,
+                                g_neg,
+                                target=cfg["goodness_target"],
+                                margin=float(cfg.get("ff_margin", 0.0)),
+                                margin_weight=float(cfg.get("ff_margin_weight", 1.0)),
+                            )
                     loss = loss / max(1, len(ff_block_endpoints))
                     _optimizer_step(
                         optim=optim,
@@ -974,7 +1097,13 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                             g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
-                            loss = ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                            loss = ff_loss(
+                                g_pos,
+                                g_neg,
+                                target=cfg["goodness_target"],
+                                margin=float(cfg.get("ff_margin", 0.0)),
+                                margin_weight=float(cfg.get("ff_margin_weight", 1.0)),
+                            )
 
                         _optimizer_step(
                             optim=optim,
@@ -1029,6 +1158,8 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
                                 g_pos_aux,
                                 g_neg_aux,
                                 target=sc_ff_target,
+                                margin=float(cfg.get("ff_margin", 0.0)),
+                                margin_weight=float(cfg.get("ff_margin_weight", 1.0)),
                             )
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
@@ -1058,7 +1189,13 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
 
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                     g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
-                    loss = ff_loss(g_pos, g_neg, target=cfg["goodness_target"])
+                    loss = ff_loss(
+                        g_pos,
+                        g_neg,
+                        target=cfg["goodness_target"],
+                        margin=float(cfg.get("ff_margin", 0.0)),
+                        margin_weight=float(cfg.get("ff_margin_weight", 1.0)),
+                    )
                     if apply_distance:
                         z_pos = global_mean_pool(h_pos, batch.batch)
                         z_neg = global_mean_pool(h_neg, batch.batch)
@@ -1221,6 +1358,8 @@ def main() -> int:
         "hidden_dim": int(train_cfg.get("hidden_dim", 64)),
         "num_layers": int(train_cfg.get("num_layers", 2)),
         "dropout": float(train_cfg.get("dropout", 0.1)),
+        "encoder_conv_type": str(train_cfg.get("encoder_conv_type", "gcn")),
+        "encoder_gat_heads": int(train_cfg.get("encoder_gat_heads", 2)),
         "lr": float(train_cfg.get("lr", 1e-3)),
         "neg_mode": str(neg_mode_val),
         "noise_std": float(train_cfg.get("noise_std", 0.05)),
@@ -1230,6 +1369,8 @@ def main() -> int:
         "neg_mix_ramp_epochs": int(train_cfg.get("neg_mix_ramp_epochs", 10)),
         "goodness_target": float(train_cfg.get("goodness_target", 1.0)),
         "goodness_temp": float(train_cfg.get("goodness_temp", 1.0)),
+        "ff_margin": float(train_cfg.get("ff_margin", 0.0)),
+        "ff_margin_weight": float(train_cfg.get("ff_margin_weight", 1.0)),
         "self_contrastive_temp": float(train_cfg.get("self_contrastive_temp", 0.2)),
         "self_contrastive_view_mode": str(
             train_cfg.get("self_contrastive_view_mode", "shuffle+noise")
@@ -1275,6 +1416,17 @@ def main() -> int:
         "multiprocessing_context": str(train_cfg.get("dataloader_mp_context", "")),
         "eval_frac": float(sweep_cfg.get("eval_frac", 0.2)),
         "split_mode": str(sweep_cfg.get("split_mode", "chronological")),
+        "walk_forward_train_frac": float(sweep_cfg.get("walk_forward_train_frac", 0.6)),
+        "walk_forward_eval_frac": float(sweep_cfg.get("walk_forward_eval_frac", 0.2)),
+        "walk_forward_step_frac": float(
+            sweep_cfg.get(
+                "walk_forward_step_frac",
+                sweep_cfg.get("walk_forward_eval_frac", sweep_cfg.get("eval_frac", 0.2)),
+            )
+        ),
+        "walk_forward_min_train_graphs": int(sweep_cfg.get("walk_forward_min_train_graphs", 64)),
+        "walk_forward_min_eval_graphs": int(sweep_cfg.get("walk_forward_min_eval_graphs", 16)),
+        "walk_forward_max_folds": int(sweep_cfg.get("walk_forward_max_folds", 0)),
         "seed": int(sweep_cfg.get("seed", train_cfg.get("seed", 7))),
         "hall_steps": int(train_cfg.get("hallucinate_steps", 3)),
         "hall_lr": float(train_cfg.get("hallucinate_lr", 0.03)),
@@ -1293,6 +1445,18 @@ def main() -> int:
         "hall_freeze_non_return": bool(
             train_cfg.get("hallucinate_freeze_non_return_features", True)
         ),
+        "hall_adaptive_lr": bool(train_cfg.get("hallucinate_adaptive_lr", False)),
+        "hall_adaptive_lr_patience": int(train_cfg.get("hallucinate_adaptive_lr_patience", 2)),
+        "hall_adaptive_lr_decay": float(train_cfg.get("hallucinate_adaptive_lr_decay", 0.5)),
+        "hall_adaptive_lr_min": float(train_cfg.get("hallucinate_adaptive_lr_min", 1e-4)),
+        "hall_early_stop_on_target_hit": bool(
+            train_cfg.get("hallucinate_early_stop_on_target_hit", False)
+        ),
+        "hall_target_hit_patience": int(train_cfg.get("hallucinate_target_hit_patience", 1)),
+        "hall_moment_mean": float(train_cfg.get("hallucinate_moment_mean", 0.0)),
+        "hall_moment_var": float(train_cfg.get("hallucinate_moment_var", 0.0)),
+        "hall_moment_skew": float(train_cfg.get("hallucinate_moment_skew", 0.0)),
+        "hall_moment_scope": str(train_cfg.get("hallucinate_moment_scope", "returns")),
         "neg_gate_margin": float(train_cfg.get("neg_gate_margin", 1.0)),
         "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "auto")),
         "eval_neg_modes": sweep_cfg.get("eval_neg_modes", []),
@@ -1313,6 +1477,9 @@ def main() -> int:
         "econ_signal_window": int(sweep_cfg.get("econ_signal_window", 126)),
         "econ_signal_quantile": float(sweep_cfg.get("econ_signal_quantile", 0.5)),
         "econ_turnover_cost_bps": float(sweep_cfg.get("econ_turnover_cost_bps", 0.0)),
+        "econ_slippage_bps": float(sweep_cfg.get("econ_slippage_bps", 0.0)),
+        "econ_slippage_vol_scale": float(sweep_cfg.get("econ_slippage_vol_scale", 0.0)),
+        "econ_slippage_vol_lookback": int(sweep_cfg.get("econ_slippage_vol_lookback", 21)),
         "econ_loader_batch_size": int(sweep_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(sweep_cfg.get("econ_trading_days", 252)),
     }
@@ -1356,6 +1523,13 @@ def main() -> int:
         "epochs",
         "batch_size",
         "eval_frac",
+        "split_mode",
+        "walk_forward_train_frac",
+        "walk_forward_eval_frac",
+        "walk_forward_step_frac",
+        "walk_forward_min_train_graphs",
+        "walk_forward_min_eval_graphs",
+        "walk_forward_max_folds",
         "out_csv",
         "modes",
         "seed",
@@ -1383,6 +1557,9 @@ def main() -> int:
         "econ_signal_window",
         "econ_signal_quantile",
         "econ_turnover_cost_bps",
+        "econ_slippage_bps",
+        "econ_slippage_vol_scale",
+        "econ_slippage_vol_lookback",
         "econ_loader_batch_size",
         "econ_trading_days",
     }
@@ -1626,22 +1803,54 @@ def main() -> int:
             r["rank_value"] = rank_value
             r["rank_mode"] = rank_mode
 
-        speed_weight = float(sweep_cfg.get("speed_weight", 0.35))
-        speed_weight = _clamp(speed_weight, 0.0, 1.0)
-        quals = [float(r.get("rank_value", 0.0)) for r in results]
+        econ_metric_name = str(sweep_cfg.get("composite_econ_metric", "econ_sharpe_uplift"))
+        sep_metric_name = str(sweep_cfg.get("composite_sep_metric", "eval_sep"))
+        econ_weight = max(0.0, float(sweep_cfg.get("econ_weight", 0.45)))
+        sep_weight = max(0.0, float(sweep_cfg.get("sep_weight", 0.35)))
+        speed_weight = max(0.0, float(sweep_cfg.get("speed_weight", 0.20)))
+        wsum = econ_weight + sep_weight + speed_weight
+        if wsum <= 0:
+            econ_weight, sep_weight, speed_weight = 0.45, 0.35, 0.20
+            wsum = 1.0
+        econ_weight /= wsum
+        sep_weight /= wsum
+        speed_weight /= wsum
+
+        def _metric_or_fallback(row: dict, key: str, fallback: str | None = None) -> float:
+            val = _to_float(row.get(key), float("nan"))
+            if np.isfinite(val):
+                return val
+            if fallback:
+                v2 = _to_float(row.get(fallback), float("nan"))
+                if np.isfinite(v2):
+                    return v2
+            return _to_float(row.get("rank_value"), 0.0)
+
+        econ_vals = [
+            _metric_or_fallback(r, econ_metric_name, fallback="econ_ann_return_uplift")
+            for r in results
+        ]
+        sep_vals = [_metric_or_fallback(r, sep_metric_name, fallback="eval_sc_gap") for r in results]
         speeds = [float(r.get("graphs_per_s", 0.0)) for r in results]
-        qual_min, qual_max = min(quals), max(quals)
+
+        econ_min, econ_max = min(econ_vals), max(econ_vals)
+        sep_min, sep_max = min(sep_vals), max(sep_vals)
         spd_min, spd_max = min(speeds), max(speeds)
-        qual_den = qual_max - qual_min
+        econ_den = econ_max - econ_min
+        sep_den = sep_max - sep_min
         spd_den = spd_max - spd_min
         for r in results:
-            qual_norm = (
-                0.0
-                if qual_den <= 0
-                else (float(r.get("rank_value", 0.0)) - qual_min) / qual_den
-            )
+            econ_raw = _metric_or_fallback(r, econ_metric_name, fallback="econ_ann_return_uplift")
+            sep_raw = _metric_or_fallback(r, sep_metric_name, fallback="eval_sc_gap")
+            econ_norm = 0.0 if econ_den <= 0 else (econ_raw - econ_min) / econ_den
+            sep_norm = 0.0 if sep_den <= 0 else (sep_raw - sep_min) / sep_den
             speed_norm = 0.0 if spd_den <= 0 else (float(r.get("graphs_per_s", 0.0)) - spd_min) / spd_den
-            r["score"] = (1.0 - speed_weight) * qual_norm + speed_weight * speed_norm
+            r["composite_econ_metric"] = econ_metric_name
+            r["composite_sep_metric"] = sep_metric_name
+            r["econ_weight"] = econ_weight
+            r["sep_weight"] = sep_weight
+            r["speed_weight"] = speed_weight
+            r["score"] = econ_weight * econ_norm + sep_weight * sep_norm + speed_weight * speed_norm
 
     out_path = Path(sweep_cfg.get("out_csv", "runs/experiments/manual/metrics/ff_sweep.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)

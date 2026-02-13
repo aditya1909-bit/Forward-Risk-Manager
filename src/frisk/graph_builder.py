@@ -27,6 +27,13 @@ class GraphBuildConfig:
     mdy_ticker: str = "AUTO"
     edge_norm: bool = True
     edge_weight_mode: str = "raw"
+    cross_sectional_norm: bool = False
+    corr_method: str = "pearson"  # "pearson", "partial"
+    partial_corr_ridge: float = 1e-3
+    edge_select_mode: str = "top_k"  # "top_k", "threshold", "significance"
+    significance_alpha: float = 0.05
+    edge_node_weighting: str = "none"  # "none", "volume", "market_cap", "volume_market_cap"
+    edge_node_weight_power: float = 0.5
     # Leakage controls: build graph inputs at t using only data up to t-lag.
     corr_lag_days: int = 0
     feature_lag_days: int = 0
@@ -38,6 +45,9 @@ def _select_edges(
     top_k: int | None,
     corr_threshold: float | None,
     symmetric: bool,
+    mode: str = "top_k",
+    significance_alpha: float = 0.05,
+    n_obs: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = corr.shape[0]
     corr = corr.copy()
@@ -48,7 +58,11 @@ def _select_edges(
     w: List[float] = []
     seen = set()
 
-    if top_k is not None:
+    mode_norm = str(mode).strip().lower()
+    if mode_norm in ("", "auto"):
+        mode_norm = "top_k" if top_k is not None else "threshold"
+
+    if mode_norm == "top_k" and top_k is not None:
         k = max(1, min(top_k, n - 1))
         for i in range(n):
             row = corr[i]
@@ -67,7 +81,7 @@ def _select_edges(
                     src.append(j)
                     dst.append(i)
                     w.append(float(row[j]))
-    elif corr_threshold is not None:
+    elif mode_norm == "threshold" and corr_threshold is not None:
         mask = np.abs(corr) >= corr_threshold
         np.fill_diagonal(mask, False)
         idx = np.argwhere(mask)
@@ -83,8 +97,57 @@ def _select_edges(
                 src.append(int(j))
                 dst.append(int(i))
                 w.append(float(corr[i, j]))
+    elif mode_norm == "significance":
+        if n_obs <= 3:
+            return np.array(src), np.array(dst), np.array(w)
+        alpha = float(np.clip(significance_alpha, 1e-8, 0.5))
+        p = torch.tensor(1.0 - alpha / 2.0, dtype=torch.float64)
+        z_crit = float(np.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0).item())
+        z_stat = np.abs(np.arctanh(np.clip(corr, -0.999999, 0.999999))) * np.sqrt(n_obs - 3.0)
+        mask = z_stat >= z_crit
+        np.fill_diagonal(mask, False)
+        if corr_threshold is not None:
+            mask &= np.abs(corr) >= float(corr_threshold)
+
+        if top_k is not None:
+            k = max(1, min(int(top_k), n - 1))
+            for i in range(n):
+                row_idx = np.where(mask[i])[0]
+                if row_idx.size == 0:
+                    continue
+                row_vals = np.abs(corr[i, row_idx])
+                ord_idx = row_idx[np.argsort(-row_vals)[:k]]
+                for j in ord_idx.tolist():
+                    if i == j or (i, j) in seen:
+                        continue
+                    seen.add((i, j))
+                    src.append(i)
+                    dst.append(j)
+                    w.append(float(corr[i, j]))
+                    if symmetric and (j, i) not in seen:
+                        seen.add((j, i))
+                        src.append(j)
+                        dst.append(i)
+                        w.append(float(corr[i, j]))
+        else:
+            idx = np.argwhere(mask)
+            for i, j in idx:
+                if (i, j) in seen:
+                    continue
+                seen.add((i, j))
+                src.append(int(i))
+                dst.append(int(j))
+                w.append(float(corr[i, j]))
+                if symmetric and (j, i) not in seen:
+                    seen.add((j, i))
+                    src.append(int(j))
+                    dst.append(int(i))
+                    w.append(float(corr[i, j]))
     else:
-        raise ValueError("Either top_k or corr_threshold must be set")
+        raise ValueError(
+            "Invalid edge selection settings. "
+            f"mode={mode!r}, top_k={top_k}, corr_threshold={corr_threshold}"
+        )
 
     return np.array(src), np.array(dst), np.array(w)
 
@@ -177,6 +240,27 @@ def _safe_corr_matrix(window_df: pd.DataFrame) -> np.ndarray:
     return corr
 
 
+def _safe_partial_corr_matrix(window_df: pd.DataFrame, ridge: float = 1e-3) -> np.ndarray:
+    x = window_df.to_numpy(dtype=float)
+    x = x - np.nanmean(x, axis=0, keepdims=True)
+    cov = np.nan_to_num((x.T @ x) / max(1, x.shape[0] - 1))
+    n = cov.shape[0]
+    if n == 0:
+        return cov
+    ridge_scale = float(max(0.0, ridge))
+    diag_scale = float(np.nanmean(np.diag(cov))) if np.isfinite(cov).any() else 1.0
+    if not np.isfinite(diag_scale) or diag_scale <= 0:
+        diag_scale = 1.0
+    cov_reg = cov + (ridge_scale * diag_scale) * np.eye(n, dtype=cov.dtype)
+    precision = np.linalg.pinv(cov_reg)
+    d = np.sqrt(np.clip(np.diag(precision), 1e-12, None))
+    denom = d[:, None] * d[None, :]
+    partial = np.divide(-precision, denom, out=np.zeros_like(precision), where=denom > 0)
+    np.fill_diagonal(partial, 0.0)
+    partial = np.nan_to_num(partial, nan=0.0, posinf=0.0, neginf=0.0)
+    return partial
+
+
 def _prepare_fundamentals_panel(
     fundamentals: pd.DataFrame | None,
     dates: List[str],
@@ -203,13 +287,34 @@ def _prepare_fundamentals_panel(
     return panel, cols
 
 
+def _prepare_macro_panel(
+    macro: pd.DataFrame | None,
+    dates: List[str],
+) -> tuple[pd.DataFrame | None, List[str]]:
+    if macro is None or macro.empty:
+        return None, []
+    panel = macro.copy()
+    if "date" in panel.columns:
+        panel = panel.set_index("date")
+    panel.index = panel.index.astype(str)
+    cols = [c for c in panel.columns]
+    if not cols:
+        return None, []
+    panel = panel[cols].apply(pd.to_numeric, errors="coerce")
+    panel = panel.reindex(dates).ffill()
+    panel = panel.fillna(0.0)
+    return panel, cols
+
+
 def _build_node_features(
     window_df: pd.DataFrame,
     volume_df: pd.DataFrame | None,
     feature_mode: str,
     normalize: bool,
+    cross_sectional_norm: bool,
     mdy_ticker: str,
     rsi_period: int,
+    macro_features: np.ndarray | None = None,
     fund_features: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     if feature_mode == "window":
@@ -220,6 +325,11 @@ def _build_node_features(
         values = window_df.to_numpy().T
     else:
         raise ValueError(f"Unknown feature_mode: {feature_mode}")
+
+    if cross_sectional_norm and values.size:
+        cs_mean = np.nanmean(values, axis=0, keepdims=True)
+        cs_std = np.nanstd(values, axis=0, keepdims=True) + 1e-8
+        values = (values - cs_mean) / cs_std
 
     ret_mean = None
     ret_std = None
@@ -235,6 +345,14 @@ def _build_node_features(
             s_std = np.nanstd(summary, axis=0, keepdims=True) + 1e-8
             summary = (summary - s_mean) / s_std
         values = np.concatenate([values, summary], axis=1)
+
+    if macro_features is not None and macro_features.size:
+        macro = macro_features.copy()
+        if normalize:
+            m_mean = np.nanmean(macro, axis=0, keepdims=True)
+            m_std = np.nanstd(macro, axis=0, keepdims=True) + 1e-8
+            macro = (macro - m_mean) / m_std
+        values = np.concatenate([values, macro], axis=1)
 
     if feature_mode == "window_plus_summary_fund" and fund_features is not None:
         fund = fund_features.copy()
@@ -262,6 +380,8 @@ def _window_to_graph_data(
     config: GraphBuildConfig,
     fund_panel: pd.DataFrame | None,
     fund_cols: List[str],
+    macro_panel: pd.DataFrame | None,
+    macro_cols: List[str],
 ):
     end_date = dates[end_idx]
     corr_end_idx = end_idx - max(0, int(config.corr_lag_days))
@@ -313,12 +433,25 @@ def _window_to_graph_data(
     if window_df.shape[1] < config.min_nodes:
         return None, "min_nodes"
 
-    corr = _safe_corr_matrix(corr_window_df)
-    src, dst, w = _select_edges(corr, config.top_k, config.corr_threshold, config.symmetric)
+    corr_method = str(config.corr_method).strip().lower()
+    if corr_method == "partial":
+        corr = _safe_partial_corr_matrix(corr_window_df, ridge=float(config.partial_corr_ridge))
+    else:
+        corr = _safe_corr_matrix(corr_window_df)
+    src, dst, w = _select_edges(
+        corr,
+        config.top_k,
+        config.corr_threshold,
+        config.symmetric,
+        mode=config.edge_select_mode,
+        significance_alpha=float(config.significance_alpha),
+        n_obs=int(corr_window_df.shape[0]),
+    )
     if len(src) == 0:
         return None, "no_edges"
 
     fund_features = None
+    fund_slice = None
     if config.feature_mode == "window_plus_summary_fund" and fund_panel is not None:
         feature_end_date = dates[feature_end_idx]
         try:
@@ -339,13 +472,49 @@ def _window_to_graph_data(
                 # Fallback: skip fundamentals for this window if misaligned
                 fund_features = None
 
+    macro_features = None
+    if macro_panel is not None and macro_cols:
+        feature_end_date = dates[feature_end_idx]
+        if feature_end_date in macro_panel.index:
+            macro_vec = macro_panel.loc[feature_end_date, macro_cols].to_numpy(dtype=float)
+            macro_features = np.tile(macro_vec[None, :], (len(cols), 1))
+
+    node_weight_mode = str(config.edge_node_weighting).strip().lower()
+    if node_weight_mode not in {"none", "volume", "market_cap", "volume_market_cap"}:
+        node_weight_mode = "none"
+    if node_weight_mode != "none":
+        node_w = np.ones(len(cols), dtype=float)
+        if node_weight_mode in {"volume", "volume_market_cap"} and window_volume is not None:
+            vol_w = window_volume.mean(axis=0).to_numpy(dtype=float)
+            vol_w = np.nan_to_num(vol_w, nan=1.0, posinf=1.0, neginf=1.0)
+            vol_w = np.clip(vol_w, 1e-8, None)
+            node_w *= vol_w
+        if node_weight_mode in {"market_cap", "volume_market_cap"}:
+            cap_w = np.ones(len(cols), dtype=float)
+            if fund_slice is not None and "market_cap" in getattr(fund_slice, "columns", []):
+                cap_s = fund_slice.reindex(cols, axis=0)["market_cap"]
+                cap_w = cap_s.to_numpy(dtype=float)
+                cap_w = np.nan_to_num(cap_w, nan=1.0, posinf=1.0, neginf=1.0)
+                cap_w = np.clip(cap_w, 1e-8, None)
+            node_w *= cap_w
+
+        med = float(np.nanmedian(node_w)) if np.isfinite(node_w).any() else 1.0
+        if not np.isfinite(med) or med <= 0:
+            med = 1.0
+        node_w = np.clip(node_w / med, 1e-3, 1e3)
+        power = float(max(0.0, config.edge_node_weight_power))
+        edge_scale = np.power(node_w[src] * node_w[dst], power)
+        w = w * edge_scale
+
     x, ret_mean, ret_std = _build_node_features(
         window_df,
         window_volume,
         config.feature_mode,
         config.normalize,
+        config.cross_sectional_norm,
         config.mdy_ticker,
         config.rsi_period,
+        macro_features,
         fund_features,
     )
     return (end_date, list(window_df.columns), src, dst, w, x, ret_mean, ret_std), "ok"
@@ -357,6 +526,7 @@ def build_rolling_corr_graphs(
     membership_map: Dict[str, List[str]],
     config: GraphBuildConfig,
     fundamentals: pd.DataFrame | None = None,
+    macro: pd.DataFrame | None = None,
     num_workers: int = 1,
     parallel_backend: str | None = "threadpool",
     joblib_prefer: str = "threads",
@@ -365,6 +535,7 @@ def build_rolling_corr_graphs(
 ) -> Tuple[List[Data], List[str], List[List[str]], Dict[str, int]]:
     dates = list(returns.index)
     fund_panel, fund_cols = _prepare_fundamentals_panel(fundamentals, dates)
+    macro_panel, macro_cols = _prepare_macro_panel(macro, dates)
     graphs: List[Data] = []
     graph_dates: List[str] = []
     node_tickers: List[List[str]] = []
@@ -390,6 +561,8 @@ def build_rolling_corr_graphs(
             config,
             fund_panel,
             fund_cols,
+            macro_panel,
+            macro_cols,
         )
 
     backend = (parallel_backend or "threadpool").lower()

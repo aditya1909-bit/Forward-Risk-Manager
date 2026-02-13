@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from frisk.ff import (
+    ff_loss,
     goodness,
     make_negative,
     pairwise_distance_forward_loss,
@@ -175,3 +176,11 @@ def test_pairwise_distance_forward_loss_prefers_farther_negatives():
     loss_far = pairwise_distance_forward_loss(z_pos, z_neg_far, margin=0.1)
 
     assert float(loss_close) > float(loss_far)
+
+
+def test_ff_loss_margin_penalizes_small_positive_negative_gap():
+    g_pos = torch.tensor([1.1, 1.0, 1.2], dtype=torch.float32)
+    g_neg = torch.tensor([1.0, 0.95, 1.05], dtype=torch.float32)
+    base = ff_loss(g_pos, g_neg, target=1.0, margin=0.0, margin_weight=1.0)
+    with_margin = ff_loss(g_pos, g_neg, target=1.0, margin=0.3, margin_weight=1.0)
+    assert float(with_margin) > float(base)

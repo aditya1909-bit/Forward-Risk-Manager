@@ -184,11 +184,17 @@ def ff_loss(
     g_pos: torch.Tensor,
     g_neg: torch.Tensor,
     target: float = 1.0,
+    margin: float = 0.0,
+    margin_weight: float = 1.0,
 ) -> torch.Tensor:
     # Encourage g_pos > target and g_neg < target
     loss_pos = F.softplus(target - g_pos)
     loss_neg = F.softplus(g_neg - target)
-    return (loss_pos + loss_neg).mean()
+    loss = loss_pos + loss_neg
+    if margin > 0 and margin_weight > 0:
+        gap = g_pos - g_neg
+        loss = loss + float(margin_weight) * F.softplus(float(margin) - gap)
+    return loss.mean()
 
 
 def permute_graph_embeddings(z: torch.Tensor) -> torch.Tensor:

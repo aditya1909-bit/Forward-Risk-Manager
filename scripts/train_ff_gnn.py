@@ -472,6 +472,8 @@ def _try_batch_size(
     distance_forward_weight: float,
     distance_forward_margin: float,
     distance_forward_max_graphs: int,
+    ff_margin: float,
+    ff_margin_weight: float,
 ):
     loader = DataLoader(
         graphs,
@@ -555,6 +557,8 @@ def _try_batch_size(
                     g_pos_aux,
                     g_neg_aux,
                     target=self_contrastive_ff_target,
+                    margin=ff_margin,
+                    margin_weight=ff_margin_weight,
                 )
         else:
             if neg_mode == "hallucinate":
@@ -596,8 +600,20 @@ def _try_batch_size(
                 g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
                 g_neg_h = goodness(h_neg_h, batch.batch, temperature=goodness_temp, critic=critic)
                 g_neg_t = goodness(h_neg_t, batch.batch, temperature=goodness_temp, critic=critic)
-                loss = loss + ff_loss(g_pos, g_neg_h, target=goodness_target)
-                loss = loss + ff_loss(g_pos, g_neg_t, target=goodness_target)
+                loss = loss + ff_loss(
+                    g_pos,
+                    g_neg_h,
+                    target=goodness_target,
+                    margin=ff_margin,
+                    margin_weight=ff_margin_weight,
+                )
+                loss = loss + ff_loss(
+                    g_pos,
+                    g_neg_t,
+                    target=goodness_target,
+                    margin=ff_margin,
+                    margin_weight=ff_margin_weight,
+                )
             loss = loss / max(1, len(layers_pos))
             if distance_forward_weight > 0:
                 z_pos = global_mean_pool(layers_pos[-1], batch.batch)
@@ -659,6 +675,8 @@ def _try_batch_size(
                     g_pos_aux,
                     g_neg_aux,
                     target=self_contrastive_ff_target,
+                    margin=ff_margin,
+                    margin_weight=ff_margin_weight,
                 )
         else:
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
@@ -684,7 +702,13 @@ def _try_batch_size(
                 )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
-            loss = ff_loss(g_pos, g_neg, target=goodness_target)
+            loss = ff_loss(
+                g_pos,
+                g_neg,
+                target=goodness_target,
+                margin=ff_margin,
+                margin_weight=ff_margin_weight,
+            )
             if distance_forward_weight > 0:
                 z_pos = global_mean_pool(h_pos, batch.batch)
                 z_neg = global_mean_pool(h_neg, batch.batch)
@@ -717,6 +741,12 @@ def main() -> int:
     parser.add_argument("--hidden-dim", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--num-layers", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--dropout", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--encoder-conv-type",
+        choices=["gcn", "sage", "gat"],
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--encoder-gat-heads", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--goodness-target", type=float, default=argparse.SUPPRESS)
     parser.add_argument(
         "--neg-mode",
@@ -798,8 +828,12 @@ def main() -> int:
     hidden_dim = _get_setting(args, section, "hidden_dim", 64)
     num_layers = _get_setting(args, section, "num_layers", 2)
     dropout = _get_setting(args, section, "dropout", 0.1)
+    encoder_conv_type = str(_get_setting(args, section, "encoder_conv_type", "gcn")).strip().lower()
+    encoder_gat_heads = int(_get_setting(args, section, "encoder_gat_heads", 2))
     goodness_target = _get_setting(args, section, "goodness_target", 1.0)
     goodness_temp = _get_setting(args, section, "goodness_temp", 1.0)
+    ff_margin = float(_get_setting(args, section, "ff_margin", 0.0))
+    ff_margin_weight = float(_get_setting(args, section, "ff_margin_weight", 1.0))
     temp_sweep = _get_setting(args, section, "temp_sweep", "")
     neg_mode = _get_setting(args, section, "neg_mode", "shuffle")
     noise_std = _get_setting(args, section, "noise_std", 0.05)
@@ -924,6 +958,26 @@ def main() -> int:
     hall_corr_edge_min = int(
         _get_setting(args, section, "hallucinate_corr_edge_min", 1)
     )
+    hall_adaptive_lr = _to_bool(_get_setting(args, section, "hallucinate_adaptive_lr", False))
+    hall_adaptive_lr_patience = int(
+        _get_setting(args, section, "hallucinate_adaptive_lr_patience", 2)
+    )
+    hall_adaptive_lr_decay = float(
+        _get_setting(args, section, "hallucinate_adaptive_lr_decay", 0.5)
+    )
+    hall_adaptive_lr_min = float(
+        _get_setting(args, section, "hallucinate_adaptive_lr_min", 1e-4)
+    )
+    hall_early_stop_on_target_hit = _to_bool(
+        _get_setting(args, section, "hallucinate_early_stop_on_target_hit", False)
+    )
+    hall_target_hit_patience = int(
+        _get_setting(args, section, "hallucinate_target_hit_patience", 1)
+    )
+    hall_moment_mean = float(_get_setting(args, section, "hallucinate_moment_mean", 0.0))
+    hall_moment_var = float(_get_setting(args, section, "hallucinate_moment_var", 0.0))
+    hall_moment_skew = float(_get_setting(args, section, "hallucinate_moment_skew", 0.0))
+    hall_moment_scope = str(_get_setting(args, section, "hallucinate_moment_scope", "returns"))
     hall_freeze_non_return = _to_bool(
         _get_setting(args, section, "hallucinate_freeze_non_return_features", True)
     )
@@ -931,6 +985,8 @@ def main() -> int:
         hall_penalty_scope = "returns"
     if hall_corr_scope not in {"all", "returns"}:
         hall_corr_scope = "returns"
+    if hall_moment_scope not in {"all", "returns"}:
+        hall_moment_scope = "returns"
     hall_corr_every_n_steps = max(1, int(hall_corr_every_n_steps))
     hall_corr_edge_fraction = _clamp(float(hall_corr_edge_fraction), 0.0, 1.0)
     hall_corr_edge_min = max(1, int(hall_corr_edge_min))
@@ -1028,12 +1084,17 @@ def main() -> int:
     distance_forward_margin = max(0.0, float(distance_forward_margin))
     distance_forward_max_graphs = max(0, int(distance_forward_max_graphs))
     distance_forward_interval = max(1, int(distance_forward_interval))
+    ff_margin = max(0.0, float(ff_margin))
+    ff_margin_weight = max(0.0, float(ff_margin_weight))
     critic_hidden_dim = max(1, int(critic_hidden_dim))
     critic_num_layers = max(1, int(critic_num_layers))
     critic_dropout = max(0.0, float(critic_dropout))
     critic_positive_activation = str(critic_positive_activation).strip().lower()
     if critic_positive_activation not in {"softplus", "square"}:
         critic_positive_activation = "softplus"
+    if encoder_conv_type not in {"gcn", "sage", "gat"}:
+        encoder_conv_type = "gcn"
+    encoder_gat_heads = max(1, int(encoder_gat_heads))
 
     if strict_component_split and neg_mode == "self_contrastive":
         if "time_flip" in self_contrastive_view_mode:
@@ -1082,6 +1143,16 @@ def main() -> int:
                 corr_every_n_steps=hall_corr_every_n_steps,
                 corr_edge_fraction=hall_corr_edge_fraction,
                 corr_edge_min=hall_corr_edge_min,
+                adaptive_lr=hall_adaptive_lr,
+                adaptive_lr_patience=hall_adaptive_lr_patience,
+                adaptive_lr_decay=hall_adaptive_lr_decay,
+                adaptive_lr_min=hall_adaptive_lr_min,
+                early_stop_on_target_hit=hall_early_stop_on_target_hit,
+                target_hit_patience=hall_target_hit_patience,
+                moment_mean_weight=hall_moment_mean,
+                moment_var_weight=hall_moment_var,
+                moment_skew_weight=hall_moment_skew,
+                moment_scope=hall_moment_scope,
             )
 
         if epoch < hall_curr_start:
@@ -1128,6 +1199,16 @@ def main() -> int:
             corr_every_n_steps=hall_corr_every_n_steps,
             corr_edge_fraction=hall_corr_edge_fraction,
             corr_edge_min=hall_corr_edge_min,
+            adaptive_lr=hall_adaptive_lr,
+            adaptive_lr_patience=hall_adaptive_lr_patience,
+            adaptive_lr_decay=hall_adaptive_lr_decay,
+            adaptive_lr_min=hall_adaptive_lr_min,
+            early_stop_on_target_hit=hall_early_stop_on_target_hit,
+            target_hit_patience=hall_target_hit_patience,
+            moment_mean_weight=hall_moment_mean,
+            moment_var_weight=hall_moment_var,
+            moment_skew_weight=hall_moment_skew,
+            moment_scope=hall_moment_scope,
         )
 
     set_seed(seed)
@@ -1270,6 +1351,8 @@ def main() -> int:
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         dropout=dropout,
+        conv_type=encoder_conv_type,
+        gat_heads=encoder_gat_heads,
     ).to(device)
     critic = EnergyCritic(
         in_dim=hidden_dim,
@@ -1420,6 +1503,8 @@ def main() -> int:
                     distance_forward_weight,
                     distance_forward_margin,
                     distance_forward_max_graphs,
+                    ff_margin,
+                    ff_margin_weight,
                 )
                 best_bs = test_bs
                 test_bs = int(test_bs * auto_tune_factor)
@@ -1463,6 +1548,8 @@ def main() -> int:
                         distance_forward_weight,
                         distance_forward_margin,
                         distance_forward_max_graphs,
+                        ff_margin,
+                        ff_margin_weight,
                     )
                     best_bs = test_bs
                     break
@@ -1658,6 +1745,8 @@ def main() -> int:
                                 g_pos_aux,
                                 g_neg_aux,
                                 target=self_contrastive_ff_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
                             )
                             batch_loss = batch_loss + self_contrastive_ff_weight * ff_aux
                 else:
@@ -1747,8 +1836,20 @@ def main() -> int:
                         g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
                         g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp, critic=critic)
                         g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp, critic=critic)
-                        batch_loss += ff_loss(g_p, g_n_h, target=goodness_target)
-                        batch_loss += ff_loss(g_p, g_n_t, target=goodness_target)
+                        batch_loss += ff_loss(
+                            g_p,
+                            g_n_h,
+                            target=goodness_target,
+                            margin=ff_margin,
+                            margin_weight=ff_margin_weight,
+                        )
+                        batch_loss += ff_loss(
+                            g_p,
+                            g_n_t,
+                            target=goodness_target,
+                            margin=ff_margin,
+                            margin_weight=ff_margin_weight,
+                        )
                     batch_loss = batch_loss / max(1, len(layers_pos))
 
                     if apply_distance:
@@ -1914,7 +2015,13 @@ def main() -> int:
                                 critic=critic,
                             )
                             g_neg = goodness(layers_neg[li], batch.batch, temperature=goodness_temp, critic=critic)
-                            block_loss = block_loss + ff_loss(g_pos, g_neg, target=goodness_target)
+                            block_loss = block_loss + ff_loss(
+                                g_pos,
+                                g_neg,
+                                target=goodness_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
+                            )
                             block_gpos += g_pos.mean().item()
                             block_gneg += g_neg.mean().item()
                     block_loss = block_loss / max(1, len(ff_block_endpoints))
@@ -2013,7 +2120,13 @@ def main() -> int:
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
-                            loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                            loss = ff_loss(
+                                g_pos,
+                                g_neg,
+                                target=goodness_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
+                            )
                         _optimizer_step(
                             optim=optim,
                             loss=loss,
@@ -2089,6 +2202,8 @@ def main() -> int:
                                 g_pos_aux,
                                 g_neg_aux,
                                 target=self_contrastive_ff_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
                             )
                             loss = loss + self_contrastive_ff_weight * ff_aux
                 else:
@@ -2153,7 +2268,13 @@ def main() -> int:
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                     g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
 
-                    loss = ff_loss(g_pos, g_neg, target=goodness_target)
+                    loss = ff_loss(
+                        g_pos,
+                        g_neg,
+                        target=goodness_target,
+                        margin=ff_margin,
+                        margin_weight=ff_margin_weight,
+                    )
                     g_pos_val = g_pos.mean().item()
                     g_neg_val = g_neg.mean().item()
                     if apply_distance:

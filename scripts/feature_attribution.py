@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+import random
+import sys
+import tomllib
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "src"))
+
+from frisk.ff import goodness
+from frisk.models import EnergyCritic, GCNEncoder
+
+
+def _load_config(path: str) -> dict:
+    with Path(path).open("rb") as f:
+        return tomllib.load(f)
+
+
+def _load_state_dict_compat(path: str):
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict):
+        if isinstance(state.get("state_dict"), dict):
+            return state["state_dict"]
+        if isinstance(state.get("model"), dict):
+            return state["model"]
+    return state
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Compute gradient x input attributions for FF graph features."
+    )
+    parser.add_argument("--config", required=True, help="Path to config TOML")
+    parser.add_argument("--graphs", default="", help="Override graphs .pt path")
+    parser.add_argument("--model", default="", help="Override encoder checkpoint path")
+    parser.add_argument("--critic-model", default="", help="Optional critic checkpoint path")
+    parser.add_argument("--num-graphs", type=int, default=128, help="Number of graphs to sample")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--out",
+        default="runs/experiments/default/diagnostics/feature_attribution.csv",
+        help="Output CSV path",
+    )
+    args = parser.parse_args()
+
+    cfg = _load_config(args.config)
+    train_cfg = cfg.get("train", {})
+
+    graphs_path = Path(args.graphs or train_cfg.get("graphs", "data/processed/graphs.pt"))
+    payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
+    graphs = payload["graphs"] if isinstance(payload, dict) else payload
+    dates = payload.get("dates", []) if isinstance(payload, dict) else []
+    if not graphs:
+        raise ValueError("No graphs found.")
+
+    model_path = str(args.model or train_cfg.get("save_encoder", train_cfg.get("save_model", ""))).strip()
+    if not model_path:
+        raise ValueError("No encoder checkpoint path provided.")
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found: {model_path}")
+
+    model = GCNEncoder(
+        in_dim=graphs[0].x.shape[1],
+        hidden_dim=int(train_cfg.get("hidden_dim", 64)),
+        num_layers=int(train_cfg.get("num_layers", 2)),
+        dropout=float(train_cfg.get("dropout", 0.1)),
+        conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
+    )
+    model.load_state_dict(_load_state_dict_compat(model_path))
+    model.eval()
+
+    critic = None
+    critic_path = str(args.critic_model or train_cfg.get("save_critic", "")).strip()
+    if critic_path and Path(critic_path).exists():
+        critic = EnergyCritic(
+            in_dim=int(train_cfg.get("hidden_dim", 64)),
+            hidden_dim=int(train_cfg.get("critic_hidden_dim", train_cfg.get("hidden_dim", 64))),
+            num_layers=int(train_cfg.get("critic_num_layers", 2)),
+            dropout=float(train_cfg.get("critic_dropout", train_cfg.get("dropout", 0.1))),
+            positive_activation=str(train_cfg.get("critic_positive_activation", "softplus")).strip().lower(),
+        )
+        critic.load_state_dict(_load_state_dict_compat(critic_path))
+        critic.eval()
+
+    rng = random.Random(args.seed)
+    idxs = list(range(len(graphs)))
+    rng.shuffle(idxs)
+    idxs = idxs[: max(1, min(len(idxs), int(args.num_graphs)))]
+
+    total_attr = torch.zeros(graphs[0].x.shape[1], dtype=torch.float32)
+    energy_rows: list[dict] = []
+    for idx in idxs:
+        g = graphs[idx]
+        x = g.x.detach().clone().requires_grad_(True)
+        batch = torch.zeros(g.num_nodes, dtype=torch.long)
+        edge_weight = getattr(g, "edge_weight", None)
+        h = model(x, g.edge_index, edge_weight=edge_weight)
+        energy = goodness(
+            h,
+            batch,
+            temperature=float(train_cfg.get("goodness_temp", 1.0)),
+            critic=critic,
+        ).mean()
+        energy.backward()
+        attr = (x.grad * x).abs().mean(dim=0).detach().cpu()
+        total_attr += attr
+        energy_rows.append(
+            {
+                "graph_index": int(idx),
+                "date": dates[idx] if idx < len(dates) else "",
+                "energy": float(energy.detach().item()),
+            }
+        )
+
+    avg_attr = total_attr / max(1, len(idxs))
+    denom = float(avg_attr.sum().item()) + 1e-12
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["feature_idx", "importance", "importance_norm"],
+        )
+        w.writeheader()
+        for i in range(avg_attr.numel()):
+            imp = float(avg_attr[i].item())
+            w.writerow(
+                {
+                    "feature_idx": i,
+                    "importance": imp,
+                    "importance_norm": imp / denom,
+                }
+            )
+
+    energy_out = out_path.with_name(f"{out_path.stem}_graph_energy.csv")
+    with energy_out.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["graph_index", "date", "energy"])
+        w.writeheader()
+        for row in energy_rows:
+            w.writerow(row)
+
+    top = torch.argsort(avg_attr, descending=True)[: min(10, avg_attr.numel())].tolist()
+    print(f"Wrote {out_path}")
+    print(f"Wrote {energy_out}")
+    print("Top features:", ", ".join(str(int(i)) for i in top))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -236,6 +236,58 @@ def main() -> int:
         help="Node fraction increment per retry when delta too small",
     )
     parser.add_argument(
+        "--hall-adaptive-lr",
+        action="store_true",
+        help="Enable adaptive hallucination learning-rate decay on plateaus.",
+    )
+    parser.add_argument(
+        "--hall-adaptive-lr-patience",
+        type=int,
+        default=2,
+        help="Plateau patience (steps) before reducing hallucination LR.",
+    )
+    parser.add_argument(
+        "--hall-adaptive-lr-decay",
+        type=float,
+        default=0.5,
+        help="LR decay factor applied when adaptive LR triggers.",
+    )
+    parser.add_argument(
+        "--hall-adaptive-lr-min",
+        type=float,
+        default=1e-4,
+        help="Minimum LR when adaptive LR is enabled.",
+    )
+    parser.add_argument(
+        "--early-stop-on-target-hit",
+        action="store_true",
+        help="Stop hallucination early after consecutive target hits.",
+    )
+    parser.add_argument(
+        "--target-hit-patience",
+        type=int,
+        default=1,
+        help="Consecutive hit steps required for early-stop.",
+    )
+    parser.add_argument(
+        "--hall-moment-mean",
+        type=float,
+        default=0.0,
+        help="Moment-matching mean penalty weight for hallucination.",
+    )
+    parser.add_argument(
+        "--hall-moment-var",
+        type=float,
+        default=0.0,
+        help="Moment-matching variance penalty weight for hallucination.",
+    )
+    parser.add_argument(
+        "--hall-moment-skew",
+        type=float,
+        default=0.0,
+        help="Moment-matching skewness penalty weight for hallucination.",
+    )
+    parser.add_argument(
         "--adaptive",
         action="store_true",
         help="Adapt hallucination hyperparameters until constraint hit rate is met",
@@ -501,6 +553,15 @@ def main() -> int:
     _maybe_override("hall_retry_steps_inc", "--hall-retry-steps-inc", int)
     _maybe_override("hall_retry_clamp_inc", "--hall-retry-clamp-inc", float)
     _maybe_override("hall_retry_node_inc", "--hall-retry-node-inc", float)
+    _maybe_override("hall_adaptive_lr", "--hall-adaptive-lr", bool)
+    _maybe_override("hall_adaptive_lr_patience", "--hall-adaptive-lr-patience", int)
+    _maybe_override("hall_adaptive_lr_decay", "--hall-adaptive-lr-decay", float)
+    _maybe_override("hall_adaptive_lr_min", "--hall-adaptive-lr-min", float)
+    _maybe_override("early_stop_on_target_hit", "--early-stop-on-target-hit", bool)
+    _maybe_override("target_hit_patience", "--target-hit-patience", int)
+    _maybe_override("hall_moment_mean", "--hall-moment-mean", float)
+    _maybe_override("hall_moment_var", "--hall-moment-var", float)
+    _maybe_override("hall_moment_skew", "--hall-moment-skew", float)
 
     if args.target_ticker:
         args.target_ticker = args.target_ticker.strip().upper()
@@ -579,6 +640,8 @@ def main() -> int:
         hidden_dim=int(train_cfg.get("hidden_dim", 64)),
         num_layers=int(train_cfg.get("num_layers", 2)),
         dropout=float(train_cfg.get("dropout", 0.1)),
+        conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
     )
     model_path = train_cfg.get("save_model", "")
     if model_path and Path(model_path).exists():
@@ -666,6 +729,16 @@ def main() -> int:
         corr_every_n_steps=int(train_cfg.get("hallucinate_corr_every_n_steps", 1)),
         corr_edge_fraction=float(train_cfg.get("hallucinate_corr_edge_fraction", 1.0)),
         corr_edge_min=int(train_cfg.get("hallucinate_corr_edge_min", 1)),
+        adaptive_lr=bool(args.hall_adaptive_lr),
+        adaptive_lr_patience=int(args.hall_adaptive_lr_patience),
+        adaptive_lr_decay=float(args.hall_adaptive_lr_decay),
+        adaptive_lr_min=float(args.hall_adaptive_lr_min),
+        early_stop_on_target_hit=bool(args.early_stop_on_target_hit),
+        target_hit_patience=int(args.target_hit_patience),
+        moment_mean_weight=float(args.hall_moment_mean),
+        moment_var_weight=float(args.hall_moment_var),
+        moment_skew_weight=float(args.hall_moment_skew),
+        moment_scope=str(train_cfg.get("hallucinate_moment_scope", "returns")),
     )
 
     out = Path(args.out)
@@ -701,6 +774,7 @@ def main() -> int:
                 pos_returns = x_pos[:, :returns_len]
 
             constraint_fn = None
+            constraint_monitor_fn = None
             force_indices = None
             target_idx = None
             nontarget_mean_abs_delta = None
@@ -748,7 +822,33 @@ def main() -> int:
                             loss = loss + float(nontarget_drift_weight) * drift.pow(2)
                     return loss
 
+                def _constraint_monitor(x_var, idx=target_idx):
+                    if ret_mean_t is not None and ret_std_t is not None:
+                        rets = x_var[idx, :returns_len] * ret_std_t[idx] + ret_mean_t[idx]
+                    else:
+                        rets = x_var[idx, :returns_len]
+                    cum = torch.exp(rets.sum()) - 1.0
+                    diff_t = _constraint_diff(
+                        cum,
+                        args.target_drop,
+                        args.constraint_mode,
+                        args.constraint_tolerance,
+                    )
+                    hall_minus_target = float(cum.detach().item() - args.target_drop)
+                    hit = _constraint_hit(
+                        hall_minus_target,
+                        args.target_drop,
+                        args.constraint_mode,
+                        args.target_tolerance,
+                    )
+                    return {
+                        "hit": bool(hit),
+                        "diff": float(diff_t.detach().abs().item()),
+                        "hall_minus_target": hall_minus_target,
+                    }
+
                 constraint_fn = _constraint
+                constraint_monitor_fn = _constraint_monitor
 
             attempt = 0
             hcfg_local = hcfg
@@ -762,6 +862,7 @@ def main() -> int:
                     hcfg_local,
                     edge_weight=getattr(data, "edge_weight", None),
                     constraint_fn=constraint_fn,
+                    constraint_monitor_fn=constraint_monitor_fn,
                     force_indices=force_indices,
                     critic=critic,
                 )

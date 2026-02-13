@@ -232,6 +232,9 @@ def _compute_econ_metrics_for_eval(
         signal_window=int(config.get("econ_signal_window", 126)),
         signal_quantile=float(config.get("econ_signal_quantile", 0.5)),
         turnover_cost_bps=float(config.get("econ_turnover_cost_bps", 0.0)),
+        slippage_bps=float(config.get("econ_slippage_bps", 0.0)),
+        slippage_vol_scale=float(config.get("econ_slippage_vol_scale", 0.0)),
+        slippage_vol_lookback=int(config.get("econ_slippage_vol_lookback", 21)),
         trading_days=int(config.get("econ_trading_days", 252)),
     )
     out.update(meta)
@@ -740,6 +743,8 @@ def _benchmark_ff(
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
         dropout=config["dropout"],
+        conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(config.get("encoder_gat_heads", 2)),
     ).to(device)
     optim = _build_optimizer(
         model.parameters(),
@@ -767,6 +772,16 @@ def _benchmark_ff(
         corr_every_n_steps=int(config.get("hall_corr_every_n_steps", 1)),
         corr_edge_fraction=float(config.get("hall_corr_edge_fraction", 1.0)),
         corr_edge_min=int(config.get("hall_corr_edge_min", 1)),
+        adaptive_lr=bool(config.get("hall_adaptive_lr", False)),
+        adaptive_lr_patience=int(config.get("hall_adaptive_lr_patience", 2)),
+        adaptive_lr_decay=float(config.get("hall_adaptive_lr_decay", 0.5)),
+        adaptive_lr_min=float(config.get("hall_adaptive_lr_min", 1e-4)),
+        early_stop_on_target_hit=bool(config.get("hall_early_stop_on_target_hit", False)),
+        target_hit_patience=int(config.get("hall_target_hit_patience", 1)),
+        moment_mean_weight=float(config.get("hall_moment_mean", 0.0)),
+        moment_var_weight=float(config.get("hall_moment_var", 0.0)),
+        moment_skew_weight=float(config.get("hall_moment_skew", 0.0)),
+        moment_scope=str(config.get("hall_moment_scope", "returns")),
     )
     sc_temp = float(config.get("self_contrastive_temp", 0.2))
     sc_max_graphs = int(config.get("self_contrastive_max_graphs", 0))
@@ -888,7 +903,13 @@ def _benchmark_ff(
                         for li in ff_block_endpoints:
                             g_pos = goodness(layers_pos[li], batch.batch, temperature=config["goodness_temp"])
                             g_neg = goodness(layers_neg[li], batch.batch, temperature=config["goodness_temp"])
-                            loss = loss + ff_loss(g_pos, g_neg, target=config["goodness_target"])
+                            loss = loss + ff_loss(
+                                g_pos,
+                                g_neg,
+                                target=config["goodness_target"],
+                                margin=float(config.get("ff_margin", 0.0)),
+                                margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                            )
                     loss = loss / max(1, len(ff_block_endpoints))
                     _optimizer_step(
                         optim=optim,
@@ -923,7 +944,13 @@ def _benchmark_ff(
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                             g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
-                            loss = ff_loss(g_pos, g_neg, target=config["goodness_target"])
+                            loss = ff_loss(
+                                g_pos,
+                                g_neg,
+                                target=config["goodness_target"],
+                                margin=float(config.get("ff_margin", 0.0)),
+                                margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                            )
                         _optimizer_step(
                             optim=optim,
                             loss=loss,
@@ -977,6 +1004,8 @@ def _benchmark_ff(
                                 g_pos_aux,
                                 g_neg_aux,
                                 target=sc_ff_target,
+                                margin=float(config.get("ff_margin", 0.0)),
+                                margin_weight=float(config.get("ff_margin_weight", 1.0)),
                             )
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
@@ -996,7 +1025,13 @@ def _benchmark_ff(
                     )
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                     g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
-                    loss = ff_loss(g_pos, g_neg, target=config["goodness_target"])
+                    loss = ff_loss(
+                        g_pos,
+                        g_neg,
+                        target=config["goodness_target"],
+                        margin=float(config.get("ff_margin", 0.0)),
+                        margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                    )
                     if apply_distance:
                         z_pos = global_mean_pool(h_pos, batch.batch)
                         z_neg = global_mean_pool(h_neg, batch.batch)
@@ -1165,6 +1200,8 @@ def _benchmark_backprop(
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
         dropout=config["dropout"],
+        conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(config.get("encoder_gat_heads", 2)),
     ).to(device)
     head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
     optim_params = list(model.parameters()) + list(head.parameters())
@@ -1197,6 +1234,16 @@ def _benchmark_backprop(
         corr_every_n_steps=int(config.get("hall_corr_every_n_steps", 1)),
         corr_edge_fraction=float(config.get("hall_corr_edge_fraction", 1.0)),
         corr_edge_min=int(config.get("hall_corr_edge_min", 1)),
+        adaptive_lr=bool(config.get("hall_adaptive_lr", False)),
+        adaptive_lr_patience=int(config.get("hall_adaptive_lr_patience", 2)),
+        adaptive_lr_decay=float(config.get("hall_adaptive_lr_decay", 0.5)),
+        adaptive_lr_min=float(config.get("hall_adaptive_lr_min", 1e-4)),
+        early_stop_on_target_hit=bool(config.get("hall_early_stop_on_target_hit", False)),
+        target_hit_patience=int(config.get("hall_target_hit_patience", 1)),
+        moment_mean_weight=float(config.get("hall_moment_mean", 0.0)),
+        moment_var_weight=float(config.get("hall_moment_var", 0.0)),
+        moment_skew_weight=float(config.get("hall_moment_skew", 0.0)),
+        moment_scope=str(config.get("hall_moment_scope", "returns")),
     )
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if train_neg_mode == "self_contrastive":
@@ -1434,6 +1481,8 @@ def main() -> int:
         "hidden_dim": int(train_cfg.get("hidden_dim", 64)),
         "num_layers": int(train_cfg.get("num_layers", 2)),
         "dropout": float(train_cfg.get("dropout", 0.1)),
+        "encoder_conv_type": str(train_cfg.get("encoder_conv_type", "gcn")),
+        "encoder_gat_heads": int(train_cfg.get("encoder_gat_heads", 2)),
         "lr": float(train_cfg.get("lr", 1e-3)),
         "neg_mode": str(bench_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))),
         "eval_neg_mode": str(bench_cfg.get("eval_neg_mode", "auto")),
@@ -1444,6 +1493,8 @@ def main() -> int:
         "neg_mix_ramp_epochs": int(train_cfg.get("neg_mix_ramp_epochs", 10)),
         "goodness_target": float(train_cfg.get("goodness_target", 1.0)),
         "goodness_temp": float(train_cfg.get("goodness_temp", 1.0)),
+        "ff_margin": float(train_cfg.get("ff_margin", 0.0)),
+        "ff_margin_weight": float(train_cfg.get("ff_margin_weight", 1.0)),
         "self_contrastive_temp": float(train_cfg.get("self_contrastive_temp", 0.2)),
         "self_contrastive_view_mode": str(
             train_cfg.get("self_contrastive_view_mode", "shuffle+noise")
@@ -1532,6 +1583,18 @@ def main() -> int:
         "hall_freeze_non_return": bool(
             train_cfg.get("hallucinate_freeze_non_return_features", True)
         ),
+        "hall_adaptive_lr": bool(train_cfg.get("hallucinate_adaptive_lr", False)),
+        "hall_adaptive_lr_patience": int(train_cfg.get("hallucinate_adaptive_lr_patience", 2)),
+        "hall_adaptive_lr_decay": float(train_cfg.get("hallucinate_adaptive_lr_decay", 0.5)),
+        "hall_adaptive_lr_min": float(train_cfg.get("hallucinate_adaptive_lr_min", 1e-4)),
+        "hall_early_stop_on_target_hit": bool(
+            train_cfg.get("hallucinate_early_stop_on_target_hit", False)
+        ),
+        "hall_target_hit_patience": int(train_cfg.get("hallucinate_target_hit_patience", 1)),
+        "hall_moment_mean": float(train_cfg.get("hallucinate_moment_mean", 0.0)),
+        "hall_moment_var": float(train_cfg.get("hallucinate_moment_var", 0.0)),
+        "hall_moment_skew": float(train_cfg.get("hallucinate_moment_skew", 0.0)),
+        "hall_moment_scope": str(train_cfg.get("hallucinate_moment_scope", "returns")),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
         "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
@@ -1548,6 +1611,9 @@ def main() -> int:
         "econ_signal_window": int(bench_cfg.get("econ_signal_window", 126)),
         "econ_signal_quantile": float(bench_cfg.get("econ_signal_quantile", 0.5)),
         "econ_turnover_cost_bps": float(bench_cfg.get("econ_turnover_cost_bps", 0.0)),
+        "econ_slippage_bps": float(bench_cfg.get("econ_slippage_bps", 0.0)),
+        "econ_slippage_vol_scale": float(bench_cfg.get("econ_slippage_vol_scale", 0.0)),
+        "econ_slippage_vol_lookback": int(bench_cfg.get("econ_slippage_vol_lookback", 21)),
         "econ_loader_batch_size": int(bench_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
     }

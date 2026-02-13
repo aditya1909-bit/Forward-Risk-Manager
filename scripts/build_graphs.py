@@ -18,6 +18,7 @@ from frisk.data import (
     build_membership_map_ffill,
     build_membership_map_all,
     load_fundamentals,
+    load_macro_features,
 )
 from frisk.graph_builder import GraphBuildConfig, build_rolling_corr_graphs
 
@@ -49,6 +50,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--fundamentals", help="Optional fundamentals CSV", default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--macro", help="Optional macro feature CSV (date + feature columns)", default=argparse.SUPPRESS
     )
     parser.add_argument("--out", help="Output .pt file", default=argparse.SUPPRESS)
     parser.add_argument("--window", type=int, help="Rolling window size in days", default=argparse.SUPPRESS)
@@ -103,6 +107,48 @@ def main() -> int:
     parser.add_argument("--mdy-ticker", default=argparse.SUPPRESS)
     parser.add_argument("--edge-norm", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--edge-weight-mode", choices=["abs", "raw", "ones"], default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--corr-method",
+        choices=["pearson", "partial"],
+        default=argparse.SUPPRESS,
+        help="Correlation estimator to use for graph edges.",
+    )
+    parser.add_argument(
+        "--partial-corr-ridge",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Ridge regularization strength for partial correlation.",
+    )
+    parser.add_argument(
+        "--edge-select-mode",
+        choices=["top_k", "threshold", "significance"],
+        default=argparse.SUPPRESS,
+        help="Edge selection method.",
+    )
+    parser.add_argument(
+        "--significance-alpha",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Two-sided alpha for significance-based edge selection.",
+    )
+    parser.add_argument(
+        "--cross-sectional-norm",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Apply cross-sectional z-score normalization across nodes for each date slice.",
+    )
+    parser.add_argument(
+        "--edge-node-weighting",
+        choices=["none", "volume", "market_cap", "volume_market_cap"],
+        default=argparse.SUPPRESS,
+        help="Optional node-derived weighting applied to edge strengths.",
+    )
+    parser.add_argument(
+        "--edge-node-weight-power",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Power for node-derived edge scaling.",
+    )
     parser.add_argument(
         "--no-normalize", action="store_true", help="Disable per-node z-score normalization"
     )
@@ -159,6 +205,7 @@ def main() -> int:
     prices_path = _get_setting(args, section, "prices", None)
     constituents_path = _get_setting(args, section, "constituents", None)
     fundamentals_path = _get_setting(args, section, "fundamentals", None)
+    macro_path = _get_setting(args, section, "macro", None)
     out_path = _get_setting(args, section, "out", "data/processed/graphs.pt")
 
     if not prices_path:
@@ -177,6 +224,13 @@ def main() -> int:
     mdy_ticker = _get_setting(args, section, "mdy_ticker", "AUTO")
     edge_norm = _get_setting(args, section, "edge_norm", True)
     edge_weight_mode = _get_setting(args, section, "edge_weight_mode", "raw")
+    corr_method = _get_setting(args, section, "corr_method", "pearson")
+    partial_corr_ridge = _get_setting(args, section, "partial_corr_ridge", 1e-3)
+    edge_select_mode = _get_setting(args, section, "edge_select_mode", "top_k")
+    significance_alpha = _get_setting(args, section, "significance_alpha", 0.05)
+    cross_sectional_norm = _get_setting(args, section, "cross_sectional_norm", False)
+    edge_node_weighting = _get_setting(args, section, "edge_node_weighting", "none")
+    edge_node_weight_power = _get_setting(args, section, "edge_node_weight_power", 0.5)
     normalize = _get_setting(args, section, "normalize", True)
     symmetric = _get_setting(args, section, "symmetric", True)
     membership_mode = _get_setting(args, section, "membership_mode", "constituents")
@@ -257,6 +311,14 @@ def main() -> int:
         if end_date:
             fundamentals = fundamentals[fundamentals["date"] <= end_date]
 
+    macro = None
+    if macro_path:
+        macro = load_macro_features(Path(macro_path))
+        if start_date:
+            macro = macro[macro.index >= start_date]
+        if end_date:
+            macro = macro[macro.index <= end_date]
+
     cfg = GraphBuildConfig(
         window=window,
         step=step,
@@ -273,6 +335,13 @@ def main() -> int:
         mdy_ticker=mdy_ticker,
         edge_norm=edge_norm,
         edge_weight_mode=edge_weight_mode,
+        cross_sectional_norm=bool(cross_sectional_norm),
+        corr_method=str(corr_method),
+        partial_corr_ridge=float(partial_corr_ridge),
+        edge_select_mode=str(edge_select_mode),
+        significance_alpha=float(significance_alpha),
+        edge_node_weighting=str(edge_node_weighting),
+        edge_node_weight_power=float(edge_node_weight_power),
     )
 
     graphs, dates, tickers, stats = build_rolling_corr_graphs(
@@ -281,6 +350,7 @@ def main() -> int:
         membership_map,
         cfg,
         fundamentals=fundamentals,
+        macro=macro,
         num_workers=workers,
         parallel_backend=parallel_backend,
         joblib_prefer=joblib_prefer,

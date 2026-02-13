@@ -5,6 +5,7 @@ import torch
 from frisk.graph_builder import (
     GraphBuildConfig,
     _build_node_features,
+    _select_edges,
     _safe_corr_matrix,
     build_rolling_corr_graphs,
 )
@@ -54,6 +55,7 @@ def test_build_node_features_window_plus_summary_fund():
         volume_df,
         feature_mode="window_plus_summary_fund",
         normalize=True,
+        cross_sectional_norm=False,
         mdy_ticker="MDY",
         rsi_period=14,
         fund_features=fund,
@@ -79,6 +81,7 @@ def test_build_node_features_auto_market_proxy_beta_is_finite():
         volume_df=None,
         feature_mode="window_plus_summary",
         normalize=False,
+        cross_sectional_norm=False,
         mdy_ticker="AUTO",
         rsi_period=14,
         fund_features=None,
@@ -229,3 +232,157 @@ def test_build_rolling_corr_graphs_with_lags_avoids_lookahead():
     expected_date = dates[2]  # feature lag of 1 day for graph date dates[3]
     expected = np.array([returns.loc[expected_date, t] for t in first_tickers], dtype=float)
     assert np.allclose(x_last, expected, atol=1e-8)
+
+
+def test_build_node_features_cross_sectional_norm_zero_centered_by_date():
+    window_df = pd.DataFrame(
+        {
+            "AAA": [1.0, 3.0, 5.0],
+            "BBB": [2.0, 4.0, 6.0],
+        }
+    )
+    x, _, _ = _build_node_features(
+        window_df,
+        volume_df=None,
+        feature_mode="window",
+        normalize=False,
+        cross_sectional_norm=True,
+        mdy_ticker="AUTO",
+        rsi_period=14,
+        fund_features=None,
+    )
+    assert np.allclose(x.mean(axis=0), 0.0, atol=1e-8)
+
+
+def test_select_edges_significance_filters_weak_links():
+    corr = np.array(
+        [
+            [0.0, 0.9, 0.1],
+            [0.9, 0.0, 0.02],
+            [0.1, 0.02, 0.0],
+        ]
+    )
+    src, dst, _ = _select_edges(
+        corr,
+        top_k=None,
+        corr_threshold=None,
+        symmetric=True,
+        mode="significance",
+        significance_alpha=0.05,
+        n_obs=120,
+    )
+    pairs = set(zip(src.tolist(), dst.tolist()))
+    assert (0, 1) in pairs
+    assert (1, 0) in pairs
+    assert (0, 2) not in pairs
+
+
+def test_build_rolling_corr_graphs_supports_macro_and_edge_node_weighting():
+    dates = pd.date_range("2020-01-01", periods=6, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.02, 0.01, -0.01, 0.00, 0.01],
+            "BBB": [0.00, 0.01, 0.02, 0.01, -0.01, -0.02],
+            "CCC": [0.02, 0.01, 0.00, -0.01, 0.00, 0.01],
+        },
+        index=dates,
+    )
+    volume = pd.DataFrame(
+        {
+            "AAA": [100, 100, 100, 100, 100, 100],
+            "BBB": [300, 300, 300, 300, 300, 300],
+            "CCC": [50, 50, 50, 50, 50, 50],
+        },
+        index=dates,
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    macro = pd.DataFrame(
+        {
+            "m1": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+            "m2": [10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+        },
+        index=dates,
+    )
+    cfg_none = GraphBuildConfig(
+        window=3,
+        step=1,
+        top_k=1,
+        min_nodes=2,
+        feature_mode="window_plus_summary",
+        normalize=True,
+        cross_sectional_norm=True,
+        edge_node_weighting="none",
+    )
+    cfg_weighted = GraphBuildConfig(
+        window=3,
+        step=1,
+        top_k=1,
+        min_nodes=2,
+        feature_mode="window_plus_summary",
+        normalize=True,
+        cross_sectional_norm=True,
+        edge_node_weighting="volume",
+        edge_node_weight_power=0.5,
+    )
+    g_none, _, _, _ = build_rolling_corr_graphs(
+        returns,
+        volume,
+        membership,
+        cfg_none,
+        fundamentals=None,
+        macro=macro,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    g_w, _, _, _ = build_rolling_corr_graphs(
+        returns,
+        volume,
+        membership,
+        cfg_weighted,
+        fundamentals=None,
+        macro=macro,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    # window(3) + summary(5) + macro(2)
+    assert g_w[0].x.shape[1] == 10
+    assert not torch.allclose(g_none[0].edge_attr, g_w[0].edge_attr)
+
+
+def test_build_rolling_corr_graphs_partial_corr_mode_builds_graphs():
+    dates = pd.date_range("2020-01-01", periods=6, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.02, 0.03, 0.02, 0.01, 0.00],
+            "BBB": [0.00, 0.01, 0.01, 0.00, -0.01, -0.02],
+            "CCC": [0.02, 0.02, 0.01, 0.01, 0.00, -0.01],
+        },
+        index=dates,
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    cfg = GraphBuildConfig(
+        window=4,
+        step=1,
+        top_k=1,
+        min_nodes=2,
+        feature_mode="window",
+        normalize=True,
+        corr_method="partial",
+        partial_corr_ridge=1e-3,
+        edge_select_mode="top_k",
+    )
+    graphs, _, _, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        macro=None,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    assert stats["built"] >= 1
+    assert torch.isfinite(graphs[0].edge_attr).all()

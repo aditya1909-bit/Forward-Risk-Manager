@@ -33,7 +33,10 @@ def strategy_stats(
             "ann_return": float("nan"),
             "ann_vol": float("nan"),
             "sharpe": float("nan"),
+            "sortino": float("nan"),
+            "calmar": float("nan"),
             "max_drawdown": float("nan"),
+            "max_drawdown_duration_days": float("nan"),
             "cvar_95_daily": float("nan"),
             "hit_rate_daily": float("nan"),
         }
@@ -42,6 +45,27 @@ def strategy_stats(
     ann_return = float(equity[-1] ** (trading_days / max(1, r.size)) - 1.0)
     ann_vol = float(np.std(r, ddof=1) * np.sqrt(trading_days)) if r.size > 1 else 0.0
     sharpe = float(ann_return / ann_vol) if ann_vol > 1e-12 else float("nan")
+    downside = np.minimum(r, 0.0)
+    downside_vol = (
+        float(np.sqrt(np.mean(downside**2)) * np.sqrt(trading_days))
+        if r.size > 0
+        else float("nan")
+    )
+    sortino = float(ann_return / downside_vol) if downside_vol > 1e-12 else float("nan")
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity / peak - 1.0
+    underwater = drawdown < 0.0
+    max_dd_duration = 0
+    run = 0
+    for is_under in underwater:
+        if bool(is_under):
+            run += 1
+            if run > max_dd_duration:
+                max_dd_duration = run
+        else:
+            run = 0
+    mdd = max_drawdown(equity)
+    calmar = float(ann_return / abs(mdd)) if abs(mdd) > 1e-12 else float("nan")
     cvar_cut = np.quantile(r, 0.05)
     cvar_95 = float(r[r <= cvar_cut].mean()) if np.any(r <= cvar_cut) else float(cvar_cut)
     return {
@@ -51,7 +75,10 @@ def strategy_stats(
         "ann_return": ann_return,
         "ann_vol": ann_vol,
         "sharpe": sharpe,
-        "max_drawdown": max_drawdown(equity),
+        "sortino": sortino,
+        "calmar": calmar,
+        "max_drawdown": mdd,
+        "max_drawdown_duration_days": float(max_dd_duration),
         "cvar_95_daily": cvar_95,
         "hit_rate_daily": float(np.mean(r > 0)),
     }
@@ -201,6 +228,9 @@ def evaluate_goodness_strategy(
     signal_window: int = 126,
     signal_quantile: float = 0.5,
     turnover_cost_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    slippage_vol_scale: float = 0.0,
+    slippage_vol_lookback: int = 21,
     trading_days: int = 252,
 ) -> dict[str, float]:
     out = {
@@ -209,25 +239,38 @@ def evaluate_goodness_strategy(
         "econ_bh_ann_return": float("nan"),
         "econ_bh_ann_vol": float("nan"),
         "econ_bh_sharpe": float("nan"),
+        "econ_bh_sortino": float("nan"),
+        "econ_bh_calmar": float("nan"),
         "econ_bh_max_drawdown": float("nan"),
+        "econ_bh_max_drawdown_duration_days": float("nan"),
         "econ_bh_cvar_95_daily": float("nan"),
         "econ_bh_hit_rate_daily": float("nan"),
         "econ_strategy_total_return": float("nan"),
         "econ_strategy_ann_return": float("nan"),
         "econ_strategy_ann_vol": float("nan"),
         "econ_strategy_sharpe": float("nan"),
+        "econ_strategy_sortino": float("nan"),
+        "econ_strategy_calmar": float("nan"),
         "econ_strategy_max_drawdown": float("nan"),
+        "econ_strategy_max_drawdown_duration_days": float("nan"),
         "econ_strategy_cvar_95_daily": float("nan"),
         "econ_strategy_hit_rate_daily": float("nan"),
         "econ_ann_return_uplift": float("nan"),
         "econ_sharpe_uplift": float("nan"),
+        "econ_sortino_uplift": float("nan"),
+        "econ_calmar_uplift": float("nan"),
         "econ_max_drawdown_delta": float("nan"),
+        "econ_max_drawdown_duration_delta": float("nan"),
         "econ_cvar_95_daily_delta": float("nan"),
         "econ_hit_rate_delta": float("nan"),
         "econ_turnover_mean_daily": float("nan"),
+        "econ_avg_cost_bps_applied": float("nan"),
         "econ_signal_window": float(signal_window),
         "econ_signal_quantile": float(signal_quantile),
         "econ_turnover_cost_bps": float(turnover_cost_bps),
+        "econ_slippage_bps": float(slippage_bps),
+        "econ_slippage_vol_scale": float(slippage_vol_scale),
+        "econ_slippage_vol_lookback": float(slippage_vol_lookback),
     }
 
     if fwd_ret_1 is None or len(fwd_ret_1) == 0:
@@ -265,9 +308,22 @@ def evaluate_goodness_strategy(
     bench_ret_1 = df["fwd_ret_1"].to_numpy(dtype=float)
     strat_ret_1 = signal.to_numpy(dtype=float) * bench_ret_1
     turnover = signal.diff().abs().fillna(0.0).to_numpy(dtype=float)
-    cost = max(0.0, float(turnover_cost_bps)) * 1e-4
-    if cost > 0:
-        strat_ret_1 = strat_ret_1 - cost * turnover
+    base_cost_bps = max(0.0, float(turnover_cost_bps))
+    slip_bps = max(0.0, float(slippage_bps))
+    slip_scale = max(0.0, float(slippage_vol_scale))
+    vol_lb = max(2, int(slippage_vol_lookback))
+    roll_vol = (
+        pd.Series(bench_ret_1)
+        .rolling(vol_lb, min_periods=max(2, vol_lb // 3))
+        .std()
+        .fillna(0.0)
+        .to_numpy(dtype=float)
+    )
+    # slippage_vol_scale is interpreted as additional bps per 1% daily rolling vol.
+    slip_curve_bps = slip_bps + (slip_scale * (100.0 * np.maximum(0.0, roll_vol)))
+    total_cost_rate = (base_cost_bps + slip_curve_bps) * 1e-4
+    if np.any(total_cost_rate > 0):
+        strat_ret_1 = strat_ret_1 - total_cost_rate * turnover
 
     bh = strategy_stats("benchmark_buy_and_hold", bench_ret_1, trading_days=trading_days)
     st = strategy_stats("goodness_risk_on_off", strat_ret_1, trading_days=trading_days)
@@ -278,25 +334,43 @@ def evaluate_goodness_strategy(
             "econ_bh_ann_return": float(bh["ann_return"]),
             "econ_bh_ann_vol": float(bh["ann_vol"]),
             "econ_bh_sharpe": float(bh["sharpe"]),
+            "econ_bh_sortino": float(bh["sortino"]),
+            "econ_bh_calmar": float(bh["calmar"]),
             "econ_bh_max_drawdown": float(bh["max_drawdown"]),
+            "econ_bh_max_drawdown_duration_days": float(bh["max_drawdown_duration_days"]),
             "econ_bh_cvar_95_daily": float(bh["cvar_95_daily"]),
             "econ_bh_hit_rate_daily": float(bh["hit_rate_daily"]),
             "econ_strategy_total_return": float(st["total_return"]),
             "econ_strategy_ann_return": float(st["ann_return"]),
             "econ_strategy_ann_vol": float(st["ann_vol"]),
             "econ_strategy_sharpe": float(st["sharpe"]),
+            "econ_strategy_sortino": float(st["sortino"]),
+            "econ_strategy_calmar": float(st["calmar"]),
             "econ_strategy_max_drawdown": float(st["max_drawdown"]),
+            "econ_strategy_max_drawdown_duration_days": float(st["max_drawdown_duration_days"]),
             "econ_strategy_cvar_95_daily": float(st["cvar_95_daily"]),
             "econ_strategy_hit_rate_daily": float(st["hit_rate_daily"]),
             "econ_ann_return_uplift": _nan_sub(float(st["ann_return"]), float(bh["ann_return"])),
             "econ_sharpe_uplift": _nan_sub(float(st["sharpe"]), float(bh["sharpe"])),
+            "econ_sortino_uplift": _nan_sub(float(st["sortino"]), float(bh["sortino"])),
+            "econ_calmar_uplift": _nan_sub(float(st["calmar"]), float(bh["calmar"])),
             "econ_max_drawdown_delta": _nan_sub(float(st["max_drawdown"]), float(bh["max_drawdown"])),
+            "econ_max_drawdown_duration_delta": _nan_sub(
+                float(st["max_drawdown_duration_days"]),
+                float(bh["max_drawdown_duration_days"]),
+            ),
             "econ_cvar_95_daily_delta": _nan_sub(float(st["cvar_95_daily"]), float(bh["cvar_95_daily"])),
             "econ_hit_rate_delta": _nan_sub(float(st["hit_rate_daily"]), float(bh["hit_rate_daily"])),
             "econ_turnover_mean_daily": float(np.nanmean(turnover)) if turnover.size else 0.0,
+            "econ_avg_cost_bps_applied": float(np.nanmean((base_cost_bps + slip_curve_bps) * turnover))
+            if turnover.size
+            else 0.0,
             "econ_signal_window": float(sw),
             "econ_signal_quantile": float(sq),
             "econ_turnover_cost_bps": float(turnover_cost_bps),
+            "econ_slippage_bps": float(slippage_bps),
+            "econ_slippage_vol_scale": float(slippage_vol_scale),
+            "econ_slippage_vol_lookback": float(vol_lb),
         }
     )
     return out

@@ -175,3 +175,26 @@ def load_fundamentals(path: Path) -> pd.DataFrame:
         df["debt_equity"] = df["debt_equity"].apply(_parse_debt_equity)
     df = df.dropna(subset=["date", "ticker"])
     return df
+
+
+def load_macro_features(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "date" not in df.columns:
+        raise ValueError("macro.csv must include a 'date' column")
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["date"])
+
+    value_cols = [c for c in df.columns if c != "date"]
+    if not value_cols:
+        raise ValueError("macro.csv must include at least one feature column besides date")
+    for col in value_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    macro = (
+        df.groupby("date", as_index=True)[value_cols]
+        .mean()
+        .sort_index()
+    )
+    macro = macro.replace([np.inf, -np.inf], np.nan)
+    return macro

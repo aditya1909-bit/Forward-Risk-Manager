@@ -78,6 +78,14 @@ def main() -> int:
         ),
         (["diagnostics/hallucination_diagnostics.png"], "hallucination/diagnostics_latest.png", "diagnostic"),
         (["diagnostics/hallucination_plot.png"], "hallucination/plot_latest.png", "diagnostic"),
+        (["diagnostics/feature_attribution.csv"], "diagnostics/feature_attribution_latest.csv", "diagnostic"),
+        (
+            ["diagnostics/embedding_projection.csv"],
+            "diagnostics/embedding_projection_latest.csv",
+            "diagnostic",
+        ),
+        (["diagnostics/scenario_delta_report.csv"], "diagnostics/scenario_delta_latest.csv", "diagnostic"),
+        (["metrics/ff_optuna_best.json"], "sweep/optuna_best_latest.json", "summary"),
     ]
     run_name = run_id.lower()
     if "long_constituents" in run_name:

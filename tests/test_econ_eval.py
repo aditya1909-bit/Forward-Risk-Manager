@@ -28,7 +28,42 @@ def test_evaluate_goodness_strategy_reports_uplift():
     assert out["econ_num_days"] > 0
     assert np.isfinite(out["econ_strategy_ann_return"])
     assert np.isfinite(out["econ_bh_ann_return"])
+    assert np.isfinite(out["econ_strategy_sortino"])
+    assert np.isfinite(out["econ_bh_calmar"])
+    assert np.isfinite(out["econ_strategy_max_drawdown_duration_days"])
     assert out["econ_ann_return_uplift"] > -1e-6
+
+
+def test_evaluate_goodness_strategy_slippage_reduces_strategy_returns():
+    dates = pd.date_range("2020-01-01", periods=80, freq="D")
+    goodness = np.sin(np.linspace(0, 8, num=80))
+    fwd = pd.Series(0.005 + 0.01 * np.sin(np.linspace(0, 10, num=80)), index=dates)
+
+    no_slip = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=20,
+        signal_quantile=0.5,
+        turnover_cost_bps=0.0,
+        slippage_bps=0.0,
+        slippage_vol_scale=0.0,
+        slippage_vol_lookback=10,
+    )
+    with_slip = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=20,
+        signal_quantile=0.5,
+        turnover_cost_bps=10.0,
+        slippage_bps=5.0,
+        slippage_vol_scale=20.0,
+        slippage_vol_lookback=10,
+    )
+
+    assert with_slip["econ_avg_cost_bps_applied"] >= 0.0
+    assert with_slip["econ_strategy_total_return"] <= no_slip["econ_strategy_total_return"] + 1e-9
 
 
 def test_load_forward_returns_from_prices_uses_close_and_dedups(tmp_path):

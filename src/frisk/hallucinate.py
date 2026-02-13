@@ -28,6 +28,16 @@ class HallucinationConfig:
     corr_every_n_steps: int = 1
     corr_edge_fraction: float = 1.0
     corr_edge_min: int = 1
+    adaptive_lr: bool = False
+    adaptive_lr_patience: int = 2
+    adaptive_lr_decay: float = 0.5
+    adaptive_lr_min: float = 1e-4
+    early_stop_on_target_hit: bool = False
+    target_hit_patience: int = 1
+    moment_mean_weight: float = 0.0
+    moment_var_weight: float = 0.0
+    moment_skew_weight: float = 0.0
+    moment_scope: str = "returns"  # "returns" or "all"
 
 
 def _edge_corr_loss(
@@ -74,6 +84,7 @@ def hallucinate_negative(
     edge_weight: Optional[torch.Tensor] = None,
     forward_fn=None,
     constraint_fn=None,
+    constraint_monitor_fn=None,
     force_indices: Optional[list[int]] = None,
     critic=None,
 ) -> torch.Tensor:
@@ -142,6 +153,24 @@ def hallucinate_negative(
         corr_edge_fraction = float(max(0.0, min(1.0, config.corr_edge_fraction)))
         corr_edge_min = max(1, int(config.corr_edge_min))
         num_edges = int(edge_index.size(1))
+        adapt_lr = bool(config.adaptive_lr)
+        adapt_patience = max(1, int(config.adaptive_lr_patience))
+        adapt_decay = float(max(0.01, min(0.99, config.adaptive_lr_decay)))
+        adapt_lr_min = float(max(1e-8, config.adaptive_lr_min))
+        best_loss = float("inf")
+        bad_steps = 0
+        hit_streak = 0
+        target_hit_patience = max(1, int(config.target_hit_patience))
+        use_moment_return_scope = (
+            return_slice_len > 0
+            and x0.size(1) >= return_slice_len
+            and str(config.moment_scope).strip().lower() == "returns"
+        )
+
+        def _skewness(v: torch.Tensor) -> torch.Tensor:
+            c = v - v.mean()
+            s = c.std(unbiased=False) + 1e-6
+            return (c.pow(3).mean()) / (s.pow(3) + 1e-6)
 
         for step_i in range(config.steps):
             if forward_fn is not None:
@@ -174,12 +203,29 @@ def hallucinate_negative(
             else:
                 corr_pen = torch.zeros((), device=x_var.device, dtype=x_var.dtype)
 
+            if use_moment_return_scope:
+                x_m = x_var[:, :return_slice_len]
+                x0_m = x0[:, :return_slice_len]
+            else:
+                x_m = x_var
+                x0_m = x0
+            x_m_flat = x_m.reshape(-1)
+            x0_m_flat = x0_m.reshape(-1)
+            moment_mean_pen = (x_m_flat.mean() - x0_m_flat.mean()).pow(2)
+            moment_var_pen = (
+                x_m_flat.var(unbiased=False) - x0_m_flat.var(unbiased=False)
+            ).pow(2)
+            moment_skew_pen = (_skewness(x_m_flat) - _skewness(x0_m_flat)).pow(2)
+
             loss = (
                 -g
                 + config.l2_weight * l2
                 + config.mean_weight * mean_pen
                 + config.std_weight * std_pen
                 + config.corr_weight * corr_pen
+                + float(config.moment_mean_weight) * moment_mean_pen
+                + float(config.moment_var_weight) * moment_var_pen
+                + float(config.moment_skew_weight) * moment_skew_pen
             )
             if constraint_fn is not None:
                 loss = loss + constraint_fn(x_var)
@@ -201,6 +247,28 @@ def hallucinate_negative(
                     x_var.data[:, :return_slice_len].clamp_(clamp_min, clamp_max)
                 else:
                     x_var.data.clamp_(clamp_min, clamp_max)
+
+            if adapt_lr:
+                loss_val = float(loss.detach().item())
+                if loss_val + 1e-8 < best_loss:
+                    best_loss = loss_val
+                    bad_steps = 0
+                else:
+                    bad_steps += 1
+                    if bad_steps >= adapt_patience:
+                        for pg in opt.param_groups:
+                            pg["lr"] = max(adapt_lr_min, float(pg["lr"]) * adapt_decay)
+                        bad_steps = 0
+
+            if config.early_stop_on_target_hit and constraint_monitor_fn is not None:
+                monitor = constraint_monitor_fn(x_var.detach())
+                hit = bool(monitor.get("hit", False)) if isinstance(monitor, dict) else bool(monitor)
+                if hit:
+                    hit_streak += 1
+                else:
+                    hit_streak = 0
+                if hit_streak >= target_hit_patience:
+                    break
 
         return x_var.detach()
     finally:
