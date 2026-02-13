@@ -28,6 +28,13 @@ def _copy_first_exists(srcs: Iterable[Path], dst: Path) -> tuple[bool, Path | No
     return False, None
 
 
+def _remove_if_exists(path: Path) -> bool:
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Publish curated artifacts from runs/experiments/<run_id> to reports/published."
@@ -55,18 +62,6 @@ def main() -> int:
         (["logs/ff_sweep_summary.txt"], "sweep/latest_summary.txt", "summary"),
         (["logs/ff_sweep_e2e_summary.txt"], "sweep/latest_e2e_summary.txt", "summary"),
         (["metrics/sweep_parallel_tune.csv"], "sweep/latest_tune.csv", "metric"),
-        (["metrics/ff_train_default.csv", "metrics/ff_train.csv"], "train/default_latest.csv", "metric"),
-        (["plots/ff_train_default.png", "plots/ff_train.png"], "train/default_latest.png", "plot"),
-        (
-            ["metrics/ff_train_long_constituents.csv", "metrics/ff_train.csv"],
-            "train/long_constituents_latest.csv",
-            "metric",
-        ),
-        (
-            ["plots/ff_train_long_constituents.png", "plots/ff_train.png"],
-            "train/long_constituents_latest.png",
-            "plot",
-        ),
         (["metrics/scenario_book.csv"], "scenario/latest.csv", "metric"),
         (
             ["diagnostics/scenario_constraint_diagnostics.csv"],
@@ -84,13 +79,48 @@ def main() -> int:
         (["diagnostics/hallucination_diagnostics.png"], "hallucination/diagnostics_latest.png", "diagnostic"),
         (["diagnostics/hallucination_plot.png"], "hallucination/plot_latest.png", "diagnostic"),
     ]
+    run_name = run_id.lower()
+    if "long_constituents" in run_name:
+        publish_map.extend(
+            [
+                (["metrics/ff_train_long_constituents.csv", "metrics/ff_train.csv"], "train/long_constituents_latest.csv", "metric"),
+                (["plots/ff_train_long_constituents.png", "plots/ff_train.png"], "train/long_constituents_latest.png", "plot"),
+            ]
+        )
+    if run_name == "default" or run_name.startswith("default_"):
+        publish_map.extend(
+            [
+                (["metrics/ff_train_default.csv", "metrics/ff_train.csv"], "train/default_latest.csv", "metric"),
+                (["plots/ff_train_default.png", "plots/ff_train.png"], "train/default_latest.png", "plot"),
+            ]
+        )
+    # Keep train track outputs disjoint by profile; remove opposite-track latest files.
+    if "long_constituents" in run_name:
+        publish_map.extend(
+            [
+                ([], "train/default_latest.csv", "metric"),
+                ([], "train/default_latest.png", "plot"),
+            ]
+        )
+    if run_name == "default" or run_name.startswith("default_"):
+        publish_map.extend(
+            [
+                ([], "train/long_constituents_latest.csv", "metric"),
+                ([], "train/long_constituents_latest.png", "plot"),
+            ]
+        )
 
     published_rows = []
+    touched_keys = set()
     for src_rels, pub_rel, kind in publish_map:
+        key = (pub_rel.split("/", 1)[0], Path(pub_rel).name)
+        touched_keys.add(key)
         src_candidates = [run_root / src_rel for src_rel in src_rels]
         dst = root / "reports" / "published" / pub_rel
         copied, src = _copy_first_exists(src_candidates, dst)
         if not copied:
+            if _remove_if_exists(dst):
+                print(f"Removed stale artifact: {dst.relative_to(root)}")
             continue
         published_rows.append(
             {
@@ -110,8 +140,7 @@ def main() -> int:
             reader = csv.DictReader(f)
             existing = list(reader)
 
-    key_set = {(r["category"], r["name"]) for r in published_rows}
-    existing = [r for r in existing if (r.get("category"), r.get("name")) not in key_set]
+    existing = [r for r in existing if (r.get("category"), r.get("name")) not in touched_keys]
     existing.extend(published_rows)
     existing.sort(key=lambda r: (r.get("category", ""), r.get("name", "")))
 

@@ -95,6 +95,8 @@ def _apply_to_config(path: Path, section: str, updates: dict) -> None:
 def _pick_rank_column(rows: list[dict], rank_by: str) -> str:
     if rank_by != "auto":
         return rank_by
+    if any(_to_float(r.get("primary_eval_metric_robust")) is not None for r in rows):
+        return "primary_eval_metric_robust"
     if any(_to_float(r.get("rank_value")) is not None for r in rows):
         return "rank_value"
     objectives = [str(r.get("eval_objective", "")).strip().lower() for r in rows]
@@ -107,7 +109,8 @@ def _pick_rank_column(rows: list[dict], rank_by: str) -> str:
         if any(_to_float(r.get(key)) is not None for r in rows):
             return key
     raise ValueError(
-        "No numeric ranking column found. Expected rank_value/eval_sc_gap/score/eval_sep/eval_acc/graphs_per_s."
+        "No numeric ranking column found. Expected primary_eval_metric_robust/"
+        "rank_value/eval_sc_gap/score/eval_sep/eval_acc/graphs_per_s."
     )
 
 
@@ -195,7 +198,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--rank-by",
-        choices=["auto", "rank_value", "score", "eval_sc_gap", "eval_sep", "eval_acc", "graphs_per_s"],
+        choices=[
+            "auto",
+            "primary_eval_metric_robust",
+            "rank_value",
+            "score",
+            "eval_sc_gap",
+            "eval_sep",
+            "eval_acc",
+            "graphs_per_s",
+        ],
         default="auto",
         help="Column to maximize when selecting best row",
     )
@@ -242,6 +254,7 @@ def main() -> int:
                 rank_col: _to_float(row.get(rank_col)),
                 "rank_metric": row.get("rank_metric"),
                 "rank_value": _to_float(row.get("rank_value")),
+                "primary_eval_metric_robust": _to_float(row.get("primary_eval_metric_robust")),
                 "eval_sc_gap": _to_float(row.get("eval_sc_gap")),
                 "eval_sep": _to_float(row.get("eval_sep")),
                 "eval_acc": _to_float(row.get("eval_acc")),

@@ -12,6 +12,7 @@ import numpy as np
 
 def _load_pairs(path: Path):
     data = {}
+    target_values = set()
     with path.open() as f:
         r = csv.DictReader(f)
         if not r.fieldnames:
@@ -34,6 +35,9 @@ def _load_pairs(path: Path):
             ticker = row["ticker"]
             series = row["series"]
             t = int(row[id_col])
+            target_val = str(row.get("target_ticker", "")).strip().upper()
+            if target_val:
+                target_values.add(target_val)
             vals = np.array([float(row[c]) for c in ret_cols], dtype=float)
             data[(ticker, t, series)] = vals
 
@@ -48,7 +52,10 @@ def _load_pairs(path: Path):
 
     if not pairs:
         raise ValueError("No real/halluc pairs found.")
-    return dict(pairs)
+    if len(target_values) > 1:
+        raise ValueError(f"Multiple target_ticker values found in scenario CSV: {sorted(target_values)}")
+    inferred_target = next(iter(target_values)) if target_values else ""
+    return dict(pairs), inferred_target
 
 
 def _kl_js(real, hall, bins=60, eps=1e-8):
@@ -103,11 +110,35 @@ def main() -> int:
         help="Optional per-ticker calibration CSV (empty to disable).",
     )
     parser.add_argument("--target-ticker", default="", help="Optional target ticker for focused diagnostics.")
+    parser.add_argument(
+        "--strict-target-check",
+        dest="strict_target_check",
+        action="store_true",
+        default=True,
+        help="Fail when explicit target ticker disagrees with scenario CSV target_ticker metadata.",
+    )
+    parser.add_argument(
+        "--no-strict-target-check",
+        dest="strict_target_check",
+        action="store_false",
+        help="Disable strict target ticker consistency checks.",
+    )
     parser.add_argument("--bins", type=int, default=60)
     args = parser.parse_args()
     target_ticker = args.target_ticker.strip().upper() if args.target_ticker else ""
 
-    pairs = _load_pairs(Path(args.csv))
+    pairs, inferred_target = _load_pairs(Path(args.csv))
+    if target_ticker and inferred_target and target_ticker != inferred_target:
+        msg = (
+            "Requested --target-ticker does not match scenario CSV target_ticker metadata: "
+            f"requested={target_ticker}, inferred={inferred_target}"
+        )
+        if args.strict_target_check:
+            raise ValueError(msg)
+        print(f"warning: {msg}")
+    if not target_ticker and inferred_target:
+        target_ticker = inferred_target
+        print(f"Using target_ticker from scenario CSV metadata: {target_ticker}")
     ticker_rows = []
     real_all = []
     hall_all = []

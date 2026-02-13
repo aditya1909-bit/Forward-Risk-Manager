@@ -18,6 +18,19 @@ def _load_rows(path: Path):
     return rows
 
 
+def _infer_target_ticker(rows) -> str:
+    vals = {
+        str(row.get("target_ticker", "")).strip().upper()
+        for row in rows
+        if str(row.get("target_ticker", "")).strip()
+    }
+    if not vals:
+        return ""
+    if len(vals) > 1:
+        raise ValueError(f"Multiple target_ticker values found in scenario CSV: {sorted(vals)}")
+    return next(iter(vals))
+
+
 def _infer_return_cols(rows):
     cols = [c for c in rows[0].keys() if c.startswith("r")]
     cols = sorted(cols, key=lambda x: int(x[1:]))
@@ -89,10 +102,36 @@ def main() -> int:
         help="Output PNG",
     )
     parser.add_argument("--target-ticker", default="", help="Optional target ticker for focused diagnostics.")
+    parser.add_argument(
+        "--strict-target-check",
+        dest="strict_target_check",
+        action="store_true",
+        default=True,
+        help="Fail when explicit target ticker disagrees with scenario CSV target_ticker metadata.",
+    )
+    parser.add_argument(
+        "--no-strict-target-check",
+        dest="strict_target_check",
+        action="store_false",
+        help="Disable strict target ticker consistency checks.",
+    )
     args = parser.parse_args()
     target_ticker = args.target_ticker.strip().upper() if args.target_ticker else ""
 
     rows = _load_rows(Path(args.csv))
+    inferred_target = _infer_target_ticker(rows)
+    if target_ticker and inferred_target and target_ticker != inferred_target:
+        msg = (
+            "Requested --target-ticker does not match scenario CSV target_ticker metadata: "
+            f"requested={target_ticker}, inferred={inferred_target}"
+        )
+        if args.strict_target_check:
+            raise ValueError(msg)
+        print(f"warning: {msg}")
+    if not target_ticker and inferred_target:
+        target_ticker = inferred_target
+        print(f"Using target_ticker from scenario CSV metadata: {target_ticker}")
+
     ret_cols = _infer_return_cols(rows)
 
     scenario_col = "scenario_id" if "scenario_id" in rows[0] else "t"

@@ -549,6 +549,62 @@ def _eval_ff_metrics(
     }
 
 
+def _finite_or_none(value):
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
+
+
+def _objective_primary_metric(metrics: dict) -> tuple[str, float]:
+    objective = str(metrics.get("eval_objective", "")).strip().lower()
+    if objective == "self_contrastive":
+        for key in ("eval_sc_gap", "eval_sep", "eval_sc_acc", "eval_acc"):
+            v = _finite_or_none(metrics.get(key))
+            if v is not None:
+                return key, v
+    if objective in {"bce", "backprop"}:
+        for key in ("eval_auroc", "eval_auprc", "eval_sep", "eval_acc"):
+            v = _finite_or_none(metrics.get(key))
+            if v is not None:
+                return key, v
+    for key in ("eval_sep", "eval_auroc", "eval_auprc", "eval_acc"):
+        v = _finite_or_none(metrics.get(key))
+        if v is not None:
+            return key, v
+    return "none", float("nan")
+
+
+def _objective_track(objective: str) -> str:
+    obj = str(objective).strip().lower()
+    if obj == "self_contrastive":
+        return "encoder"
+    if obj in {"ff", "forward_forward", "forward-forward"} or obj.startswith("ff_"):
+        return "critic"
+    if obj in {"bce", "backprop"}:
+        return "classifier"
+    return "unknown"
+
+
+def _objective_primary_metric_robust(metrics: dict) -> tuple[str, float]:
+    # Robust metric intentionally mirrors objective-primary metric.
+    # Time-flip discrimination belongs to critic evaluation/sanity checks, not self-contrastive ranking.
+    return _objective_primary_metric(metrics)
+
+
+def _attach_primary_metrics(out: dict) -> None:
+    metric_name, metric_val = _objective_primary_metric(out)
+    robust_name, robust_val = _objective_primary_metric_robust(out)
+    out["objective_track"] = _objective_track(out.get("eval_objective", ""))
+    out["primary_eval_metric_name"] = metric_name
+    out["primary_eval_metric"] = metric_val
+    out["primary_eval_metric_robust_name"] = robust_name
+    out["primary_eval_metric_robust"] = robust_val
+
+
 def _calibrate_goodness_target(
     model,
     loader,
@@ -1032,7 +1088,12 @@ def _benchmark_ff(
     extra_modes = [str(m).strip().lower() for m in eval_neg_modes if str(m).strip()]
     if extra_modes:
         reported = []
+        skipped = []
+        objective_track = _objective_track(out.get("eval_objective", ""))
         for mode in extra_modes:
+            if objective_track == "encoder" and "time_flip" in mode:
+                skipped.append(mode)
+                continue
             mode_metrics = _eval_ff_metrics(
                 model,
                 eval_loader,
@@ -1057,6 +1118,9 @@ def _benchmark_ff(
             out[f"eval_{mode_key}_ece"] = mode_metrics.get("eval_ece")
             reported.append(mode)
         out["eval_neg_modes_reported"] = ",".join(reported)
+        if skipped:
+            out["eval_neg_modes_skipped"] = ",".join(skipped)
+    _attach_primary_metrics(out)
     return out
 
 
@@ -1318,6 +1382,7 @@ def _benchmark_backprop(
     )
     if econ:
         out.update(econ)
+    _attach_primary_metrics(out)
     return out
 
 

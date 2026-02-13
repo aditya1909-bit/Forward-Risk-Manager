@@ -186,6 +186,9 @@ def _objective_rank_metric(result: dict, rank_mode: str = "objective") -> tuple[
 
     objective = str(result.get("eval_objective", "ff")).strip().lower()
     if objective == "self_contrastive":
+        robust = _to_float(result.get("primary_eval_metric_robust"))
+        if np.isfinite(robust):
+            return "primary_eval_metric_robust", robust
         if np.isfinite(_to_float(result.get("eval_sc_gap"))):
             return "eval_sc_gap", _to_float(result.get("eval_sc_gap"), 0.0)
         if np.isfinite(_to_float(result.get("eval_sep"))):
@@ -198,6 +201,17 @@ def _objective_rank_metric(result: dict, rank_mode: str = "objective") -> tuple[
     if np.isfinite(_to_float(result.get("eval_auroc"))):
         return "eval_auroc", _to_float(result.get("eval_auroc"), 0.0)
     return "eval_acc", _to_float(result.get("eval_acc"), 0.0)
+
+
+def _objective_track(objective: str) -> str:
+    obj = str(objective).strip().lower()
+    if obj == "self_contrastive":
+        return "encoder"
+    if obj in {"ff", "forward_forward", "forward-forward"} or obj.startswith("ff_"):
+        return "critic"
+    if obj in {"bce", "backprop"}:
+        return "classifier"
+    return "unknown"
 
 
 def _uniq_values(values, *, as_int: bool = False) -> list:
@@ -605,6 +619,48 @@ def _eval_ff_metrics(
         "eval_acc": float(acc),
         **cls_metrics,
     }
+
+
+def _metric_value_or_none(row: dict, key: str):
+    value = _to_float(row.get(key), float("nan"))
+    if not np.isfinite(value):
+        return None
+    return float(value)
+
+
+def _objective_primary_metric(row: dict) -> tuple[str, float]:
+    objective = str(row.get("eval_objective", "")).strip().lower()
+    if objective == "self_contrastive":
+        for key in ("eval_sc_gap", "eval_sep", "eval_sc_acc", "eval_acc"):
+            value = _metric_value_or_none(row, key)
+            if value is not None:
+                return key, value
+    if objective in {"bce", "backprop"}:
+        for key in ("eval_auroc", "eval_auprc", "eval_sep", "eval_acc"):
+            value = _metric_value_or_none(row, key)
+            if value is not None:
+                return key, value
+    for key in ("eval_sep", "eval_auroc", "eval_auprc", "eval_acc"):
+        value = _metric_value_or_none(row, key)
+        if value is not None:
+            return key, value
+    return "none", float("nan")
+
+
+def _objective_primary_metric_robust(row: dict) -> tuple[str, float]:
+    # Robust metric intentionally mirrors objective-primary metric.
+    # Time-flip discrimination belongs to critic evaluation/sanity checks, not self-contrastive ranking.
+    return _objective_primary_metric(row)
+
+
+def _attach_primary_metrics(row: dict) -> None:
+    metric_name, metric_value = _objective_primary_metric(row)
+    robust_name, robust_value = _objective_primary_metric_robust(row)
+    row["objective_track"] = _objective_track(row.get("eval_objective", ""))
+    row["primary_eval_metric_name"] = metric_name
+    row["primary_eval_metric"] = metric_value
+    row["primary_eval_metric_robust_name"] = robust_name
+    row["primary_eval_metric_robust"] = robust_value
 
 
 def _compute_econ_metrics_for_eval(
@@ -1068,7 +1124,12 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
     extra_modes = [str(m).strip().lower() for m in eval_neg_modes if str(m).strip()]
     if extra_modes:
         reported = []
+        skipped = []
+        objective_track = _objective_track(out.get("eval_objective", ""))
         for mode in extra_modes:
+            if objective_track == "encoder" and "time_flip" in mode:
+                skipped.append(mode)
+                continue
             mode_metrics = _eval_ff_metrics(
                 model,
                 eval_loader,
@@ -1093,6 +1154,9 @@ def _run_ff_trial(graphs, graph_dates, device, cfg, layerwise: bool):
             out[f"eval_{mode_key}_ece"] = mode_metrics.get("eval_ece")
             reported.append(mode)
         out["eval_neg_modes_reported"] = ",".join(reported)
+        if skipped:
+            out["eval_neg_modes_skipped"] = ",".join(skipped)
+    _attach_primary_metrics(out)
     return out
 
 

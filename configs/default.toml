@@ -66,6 +66,17 @@ seed = 7
 log_csv = "runs/experiments/default/metrics/ff_train.csv"
 plot_path = "runs/experiments/default/plots/ff_train.png"
 save_model = "runs/experiments/default/models/ff_model.pt"
+save_encoder = "runs/experiments/default/models/encoder.pt"
+save_critic = "runs/experiments/default/models/critic.pt"
+encoder_checkpoint_in = ""
+critic_checkpoint_in = ""
+strict_component_split = false
+freeze_encoder = false
+freeze_critic = false
+critic_hidden_dim = 128
+critic_num_layers = 2
+critic_dropout = 0.1
+critic_positive_activation = "softplus"
 auto_tune_batch = true
 auto_tune_max_batch = 32
 auto_tune_factor = 2
@@ -239,5 +250,19 @@ adaptive = true
 target_hit_rate = 0.6
 target_tolerance = 0.01
 max_adapt_steps = 40
+critic_model = "runs/experiments/default/models/critic.pt"
 diag_out = "runs/experiments/default/diagnostics/scenario_constraint_diagnostics.csv"
 out = "runs/experiments/default/metrics/scenario_book.csv"
+
+[encoder]
+neg_mode = "self_contrastive"
+strict_component_split = true
+freeze_critic = true
+save_encoder = "runs/experiments/default/models/encoder.pt"
+
+[critic]
+neg_mode = "time_flip+noise"
+strict_component_split = true
+freeze_encoder = true
+encoder_checkpoint_in = "runs/experiments/default/models/encoder.pt"
+save_critic = "runs/experiments/default/models/critic.pt"

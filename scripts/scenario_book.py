@@ -14,13 +14,26 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.models import GCNEncoder
+from frisk.models import EnergyCritic, GCNEncoder
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 
 
 def _load_config(path: str) -> dict:
     with Path(path).open("rb") as f:
         return tomllib.load(f)
+
+
+def _load_state_dict_compat(path: str):
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict):
+        if isinstance(state.get("state_dict"), dict):
+            return state["state_dict"]
+        if isinstance(state.get("model"), dict):
+            return state["model"]
+    return state
 
 
 def _select_indices(dates, num_scenarios, seed, indices, date_list):
@@ -104,6 +117,11 @@ def _constraint_hit(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a scenario book of hallucinated windows.")
     parser.add_argument("--config", required=True, help="Path to TOML config")
+    parser.add_argument(
+        "--critic-model",
+        default="",
+        help="Path to critic checkpoint (defaults to train.save_critic / train.critic_checkpoint_in).",
+    )
     parser.add_argument("--num-scenarios", type=int, default=10, help="Number of scenarios")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--indices", default="", help="Comma-separated graph indices")
@@ -439,6 +457,7 @@ def main() -> int:
     _maybe_override("max_tickers", "--max-tickers", int)
     _maybe_override("diag_out", "--diag-out")
     _maybe_override("out", "--out")
+    _maybe_override("critic_model", "--critic-model")
     _maybe_override("adaptive", "--adaptive", bool)
     _maybe_override("target_hit_rate", "--target-hit-rate", float)
     _maybe_override("target_tolerance", "--target-tolerance", float)
@@ -569,6 +588,44 @@ def main() -> int:
             state = torch.load(model_path, map_location="cpu")
         model.load_state_dict(state)
     model.eval()
+
+    critic = None
+    strict_split = bool(train_cfg.get("strict_component_split", False))
+    critic_path = (
+        str(args.critic_model).strip()
+        or str(train_cfg.get("save_critic", "")).strip()
+        or str(train_cfg.get("critic_checkpoint_in", "")).strip()
+    )
+    if critic_path:
+        critic = EnergyCritic(
+            in_dim=int(train_cfg.get("hidden_dim", 64)),
+            hidden_dim=int(train_cfg.get("critic_hidden_dim", train_cfg.get("hidden_dim", 64))),
+            num_layers=int(train_cfg.get("critic_num_layers", 2)),
+            dropout=float(train_cfg.get("critic_dropout", train_cfg.get("dropout", 0.1))),
+            positive_activation=str(train_cfg.get("critic_positive_activation", "softplus"))
+            .strip()
+            .lower(),
+        )
+        cpath = Path(critic_path)
+        if not cpath.exists():
+            raise FileNotFoundError(f"Critic checkpoint not found: {cpath}")
+        critic.load_state_dict(_load_state_dict_compat(str(cpath)))
+        critic.eval()
+        critic_path = str(cpath)
+    elif strict_split:
+        raise ValueError(
+            "strict_component_split is enabled, but no critic checkpoint was provided. "
+            "Set --critic-model or train.save_critic."
+        )
+    else:
+        critic_path = ""
+
+    encoder_checkpoint = str(model_path).strip()
+    critic_checkpoint = str(critic_path).strip()
+    objective_track = "critic" if critic is not None else "encoder_proxy"
+    energy_component = "critic_energy" if critic is not None else "encoder_squared"
+    split_mode = "strict" if strict_split else "legacy"
+    train_neg_mode = str(train_cfg.get("neg_mode", "")).strip().lower()
 
     hall_cfg = HallucinationConfig(
         steps=int(args.hall_steps)
@@ -706,6 +763,7 @@ def main() -> int:
                     edge_weight=getattr(data, "edge_weight", None),
                     constraint_fn=constraint_fn,
                     force_indices=force_indices,
+                    critic=critic,
                 )
 
                 if ret_mean is not None and ret_std is not None:
@@ -776,6 +834,12 @@ def main() -> int:
                         "hall_minus_target": diff,
                         "abs_error": abs(diff),
                         "nontarget_mean_abs_delta": nontarget_mean_abs_delta,
+                        "objective_track": objective_track,
+                        "energy_component": energy_component,
+                        "component_split_mode": split_mode,
+                        "encoder_checkpoint": encoder_checkpoint,
+                        "critic_checkpoint": critic_checkpoint,
+                        "train_neg_mode": train_neg_mode,
                         "hit": int(
                             _constraint_hit(
                                 diff,
@@ -801,10 +865,38 @@ def main() -> int:
 
             for i in selected:
                 scenario_rows.append(
-                    [scenario_id, idx, date, tickers[i], "real"] + list(pos_returns_np[i])
+                    [
+                        scenario_id,
+                        idx,
+                        date,
+                        (args.target_ticker or ""),
+                        tickers[i],
+                        "real",
+                        objective_track,
+                        energy_component,
+                        split_mode,
+                        encoder_checkpoint,
+                        critic_checkpoint,
+                        train_neg_mode,
+                    ]
+                    + list(pos_returns_np[i])
                 )
                 scenario_rows.append(
-                    [scenario_id, idx, date, tickers[i], "halluc"] + list(neg_returns_np[i])
+                    [
+                        scenario_id,
+                        idx,
+                        date,
+                        (args.target_ticker or ""),
+                        tickers[i],
+                        "halluc",
+                        objective_track,
+                        energy_component,
+                        split_mode,
+                        encoder_checkpoint,
+                        critic_checkpoint,
+                        train_neg_mode,
+                    ]
+                    + list(neg_returns_np[i])
                 )
 
         return scenario_rows, diag_rows
@@ -1009,7 +1101,20 @@ def main() -> int:
     # Write final scenario book
     with out.open("w", newline="") as f:
         w = csv.writer(f)
-        header = ["scenario_id", "graph_index", "date", "ticker", "series"] + [
+        header = [
+            "scenario_id",
+            "graph_index",
+            "date",
+            "target_ticker",
+            "ticker",
+            "series",
+            "objective_track",
+            "energy_component",
+            "component_split_mode",
+            "encoder_checkpoint",
+            "critic_checkpoint",
+            "train_neg_mode",
+        ] + [
             f"r{i}" for i in range(returns_len)
         ]
         w.writerow(header)
@@ -1037,6 +1142,12 @@ def main() -> int:
                     "hall_minus_target",
                     "abs_error",
                     "nontarget_mean_abs_delta",
+                    "objective_track",
+                    "energy_component",
+                    "component_split_mode",
+                    "encoder_checkpoint",
+                    "critic_checkpoint",
+                    "train_neg_mode",
                     "hit",
                 ],
             )

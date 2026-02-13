@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import csv
+import re
 
 import numpy as np
 import pandas as pd
@@ -108,15 +109,37 @@ def resolve_price_ticker(
     if not counts:
         raise ValueError(f"no tickers found in prices file: {prices_path}")
 
-    req = str(requested_ticker or "").upper().strip()
-    min_rows = max(1, int(min_rows))
-    is_auto = req in {"", "AUTO", "AUTO_DETECT", "AUTO-DETECT"}
+    req_raw = str(requested_ticker or "").upper().strip()
+    req_tokens = [t.strip() for t in re.split(r"[,;|]+", req_raw) if t.strip()] if req_raw else []
+    if not req_tokens:
+        req_tokens = ["AUTO"]
 
-    if not is_auto:
-        n = int(counts.get(req, 0))
+    min_rows = max(1, int(min_rows))
+    auto_tokens = {"", "AUTO", "AUTO_DETECT", "AUTO-DETECT"}
+    explicit_tokens = [t for t in req_tokens if t not in auto_tokens]
+    has_auto_fallback = any(t in auto_tokens for t in req_tokens)
+
+    best_explicit = None
+    for token in explicit_tokens:
+        n = int(counts.get(token, 0))
         if n <= 0:
-            raise ValueError(f"requested ticker {req} not found in {prices_path}")
-        return req, "requested", n
+            continue
+        if n >= min_rows:
+            return token, "requested_priority" if len(req_tokens) > 1 else "requested", n
+        if best_explicit is None or n > best_explicit[1]:
+            best_explicit = (token, n)
+
+    if explicit_tokens and not has_auto_fallback:
+        if best_explicit is not None:
+            token, n = best_explicit
+            if len(explicit_tokens) == 1:
+                return token, "requested", n
+            return token, "requested_priority_no_min_match", n
+        if len(explicit_tokens) == 1:
+            raise ValueError(f"requested ticker {explicit_tokens[0]} not found in {prices_path}")
+        raise ValueError(
+            f"none of requested tickers {explicit_tokens} found in {prices_path}"
+        )
 
     if prefer_tickers:
         for t in prefer_tickers:

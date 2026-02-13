@@ -79,3 +79,57 @@ def test_resolve_price_ticker_auto_and_requested(tmp_path):
     assert t_req == "BBB"
     assert src_req == "requested"
     assert rows_req == 1
+
+
+def test_resolve_price_ticker_requested_priority_with_auto_fallback(tmp_path):
+    csv_path = tmp_path / "prices.csv"
+    df = pd.DataFrame(
+        {
+            "date": [
+                "2020-01-01",
+                "2020-01-02",
+                "2020-01-03",
+                "2020-01-01",
+                "2020-01-02",
+            ],
+            "ticker": ["AAA", "AAA", "AAA", "BBB", "BBB"],
+            "close": [10.0, 10.1, 10.2, 9.9, 10.0],
+        }
+    )
+    df.to_csv(csv_path, index=False)
+
+    ticker, src, rows = resolve_price_ticker(
+        csv_path,
+        requested_ticker="SPY,BBB,AUTO",
+        min_rows=2,
+    )
+    assert ticker == "BBB"
+    assert src == "requested_priority"
+    assert rows == 2
+
+
+def test_resolve_price_ticker_requested_list_handles_whitespace(tmp_path):
+    csv_path = tmp_path / "prices.csv"
+    df = pd.DataFrame(
+        {
+            "date": [
+                "2020-01-01",
+                "2020-01-02",
+                "2020-01-03",
+                "2020-01-01",
+                "2020-01-02",
+            ],
+            "ticker": ["AAA", "AAA", "AAA", "BBB", "BBB"],
+            "close": [10.0, 10.1, 10.2, 9.9, 10.0],
+        }
+    )
+    df.to_csv(csv_path, index=False)
+
+    ticker, src, rows = resolve_price_ticker(
+        csv_path,
+        requested_ticker="SPY, BBB, AUTO",
+        min_rows=2,
+    )
+    assert ticker == "BBB"
+    assert src == "requested_priority"
+    assert rows == 2

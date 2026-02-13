@@ -25,13 +25,35 @@ def _segment_logsumexp(
     return max_vals + torch.log(sum_vals.clamp_min(1e-12))
 
 
-def goodness(h: torch.Tensor, batch: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+def goodness(
+    h: torch.Tensor,
+    batch: torch.Tensor,
+    temperature: float = 1.0,
+    critic: torch.nn.Module | None = None,
+) -> torch.Tensor:
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
     if h.numel() == 0:
         return torch.empty(0, device=h.device, dtype=h.dtype)
 
-    node_energy = (h * h).mean(dim=1)
+    if critic is not None:
+        graph_energy_fn = getattr(critic, "graph_energy", None)
+        if callable(graph_energy_fn):
+            return graph_energy_fn(h, batch, temperature=temperature)
+        node_energy_fn = getattr(critic, "node_energy", None)
+        if callable(node_energy_fn):
+            node_energy = node_energy_fn(h)
+        else:
+            node_energy = critic(h)
+            if node_energy.ndim == 2 and node_energy.size(1) == 1:
+                node_energy = node_energy.squeeze(1)
+            if node_energy.ndim != 1:
+                raise ValueError(
+                    f"Critic output must be [num_nodes] or [num_nodes, 1], got {tuple(node_energy.shape)}"
+                )
+            node_energy = F.softplus(node_energy)
+    else:
+        node_energy = (h * h).mean(dim=1)
     _, segment_ids = torch.unique(batch, sorted=True, return_inverse=True)
     scaled = node_energy / temperature
     lse = _segment_logsumexp(scaled, segment_ids, int(segment_ids.max().item()) + 1)

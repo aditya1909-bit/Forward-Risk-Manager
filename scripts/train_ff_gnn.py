@@ -21,7 +21,7 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.models import GCNEncoder
+from frisk.models import EnergyCritic, GCNEncoder
 from frisk.ff import (
     ff_loss,
     goodness,
@@ -64,6 +64,19 @@ def _get_setting(args: argparse.Namespace, section: dict, key: str, default):
     if key in section:
         return section[key]
     return default
+
+
+def _load_state_dict_compat(path: str):
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict):
+        if isinstance(state.get("state_dict"), dict):
+            return state["state_dict"]
+        if isinstance(state.get("model"), dict):
+            return state["model"]
+    return state
 
 
 def _is_oom(exc: Exception) -> bool:
@@ -436,6 +449,7 @@ def _make_self_contrastive_view(
 def _try_batch_size(
     graphs,
     model,
+    critic,
     device,
     batch_size,
     loader_workers,
@@ -525,8 +539,18 @@ def _try_batch_size(
                     edge_weight=edge_weight,
                     return_all=True,
                 )
-                g_pos_aux = goodness(layers_pos[-1], batch.batch, temperature=goodness_temp)
-                g_neg_aux = goodness(layers_neg_aux[-1], batch.batch, temperature=goodness_temp)
+                g_pos_aux = goodness(
+                    layers_pos[-1],
+                    batch.batch,
+                    temperature=goodness_temp,
+                    critic=critic,
+                )
+                g_neg_aux = goodness(
+                    layers_neg_aux[-1],
+                    batch.batch,
+                    temperature=goodness_temp,
+                    critic=critic,
+                )
                 loss = loss + self_contrastive_ff_weight * ff_loss(
                     g_pos_aux,
                     g_neg_aux,
@@ -542,6 +566,7 @@ def _try_batch_size(
                     batch.batch,
                     hall_cfg,
                     edge_weight=edge_weight,
+                    critic=critic,
                 )
             else:
                 x_neg_hall = make_negative(
@@ -568,9 +593,9 @@ def _try_batch_size(
             )
             loss = 0.0
             for h_pos, h_neg_h, h_neg_t in zip(layers_pos, layers_neg_h, layers_neg_t):
-                g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
-                g_neg_h = goodness(h_neg_h, batch.batch, temperature=goodness_temp)
-                g_neg_t = goodness(h_neg_t, batch.batch, temperature=goodness_temp)
+                g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+                g_neg_h = goodness(h_neg_h, batch.batch, temperature=goodness_temp, critic=critic)
+                g_neg_t = goodness(h_neg_t, batch.batch, temperature=goodness_temp, critic=critic)
                 loss = loss + ff_loss(g_pos, g_neg_h, target=goodness_target)
                 loss = loss + ff_loss(g_pos, g_neg_t, target=goodness_target)
             loss = loss / max(1, len(layers_pos))
@@ -628,15 +653,15 @@ def _try_batch_size(
                     summary_dim=summary_dim,
                 )
                 h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
-                g_pos_aux = goodness(h_pos, batch.batch, temperature=goodness_temp)
-                g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp)
+                g_pos_aux = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+                g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp, critic=critic)
                 loss = loss + self_contrastive_ff_weight * ff_loss(
                     g_pos_aux,
                     g_neg_aux,
                     target=self_contrastive_ff_target,
                 )
         else:
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
             if neg_mode == "hallucinate":
                 x_neg = hallucinate_negative(
                     model,
@@ -646,6 +671,7 @@ def _try_batch_size(
                     batch.batch,
                     hall_cfg,
                     edge_weight=edge_weight,
+                    critic=critic,
                 )
             else:
                 x_neg = make_negative(
@@ -657,7 +683,7 @@ def _try_batch_size(
                     summary_dim=summary_dim,
                 )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
             loss = ff_loss(g_pos, g_neg, target=goodness_target)
             if distance_forward_weight > 0:
                 z_pos = global_mean_pool(h_pos, batch.batch)
@@ -670,6 +696,8 @@ def _try_batch_size(
                 )
     loss.backward()
     model.zero_grad(set_to_none=True)
+    if critic is not None:
+        critic.zero_grad(set_to_none=True)
 
 
 def set_seed(seed: int) -> None:
@@ -739,6 +767,21 @@ def main() -> int:
     parser.add_argument("--ff-blockwise", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--ff-block-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--ff-multiscale", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--strict-component-split", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--freeze-encoder", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--freeze-critic", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--encoder-checkpoint-in", default=argparse.SUPPRESS)
+    parser.add_argument("--critic-checkpoint-in", default=argparse.SUPPRESS)
+    parser.add_argument("--save-encoder", default=argparse.SUPPRESS)
+    parser.add_argument("--save-critic", default=argparse.SUPPRESS)
+    parser.add_argument("--critic-hidden-dim", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--critic-num-layers", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--critic-dropout", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--critic-positive-activation",
+        choices=["softplus", "square"],
+        default=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -772,6 +815,21 @@ def main() -> int:
     log_csv = _get_setting(args, section, "log_csv", "")
     plot_path = _get_setting(args, section, "plot_path", "")
     save_model = _get_setting(args, section, "save_model", "")
+    save_encoder = _get_setting(args, section, "save_encoder", save_model)
+    save_critic = _get_setting(args, section, "save_critic", "")
+    encoder_checkpoint_in = _get_setting(args, section, "encoder_checkpoint_in", "")
+    critic_checkpoint_in = _get_setting(args, section, "critic_checkpoint_in", "")
+    strict_component_split = _to_bool(
+        _get_setting(args, section, "strict_component_split", False)
+    )
+    freeze_encoder = _to_bool(_get_setting(args, section, "freeze_encoder", False))
+    freeze_critic = _to_bool(_get_setting(args, section, "freeze_critic", False))
+    critic_hidden_dim = int(_get_setting(args, section, "critic_hidden_dim", hidden_dim))
+    critic_num_layers = int(_get_setting(args, section, "critic_num_layers", 2))
+    critic_dropout = float(_get_setting(args, section, "critic_dropout", dropout))
+    critic_positive_activation = str(
+        _get_setting(args, section, "critic_positive_activation", "softplus")
+    )
     auto_tune = _get_setting(args, section, "auto_tune_batch", False)
     auto_tune_max = _get_setting(args, section, "auto_tune_max_batch", 64)
     auto_tune_factor = _get_setting(args, section, "auto_tune_factor", 2)
@@ -970,6 +1028,32 @@ def main() -> int:
     distance_forward_margin = max(0.0, float(distance_forward_margin))
     distance_forward_max_graphs = max(0, int(distance_forward_max_graphs))
     distance_forward_interval = max(1, int(distance_forward_interval))
+    critic_hidden_dim = max(1, int(critic_hidden_dim))
+    critic_num_layers = max(1, int(critic_num_layers))
+    critic_dropout = max(0.0, float(critic_dropout))
+    critic_positive_activation = str(critic_positive_activation).strip().lower()
+    if critic_positive_activation not in {"softplus", "square"}:
+        critic_positive_activation = "softplus"
+
+    if strict_component_split and neg_mode == "self_contrastive":
+        if "time_flip" in self_contrastive_view_mode:
+            print(
+                "strict_component_split: removing time_flip from self_contrastive views "
+                "(arrow-of-time belongs to critic stage)."
+            )
+            self_contrastive_view_mode = "shuffle+noise"
+        if self_contrastive_ff_weight > 0:
+            print("strict_component_split: disabling self_contrastive_ff_weight for encoder stage.")
+            self_contrastive_ff_weight = 0.0
+        freeze_critic = True
+    elif strict_component_split:
+        freeze_encoder = True
+        if not encoder_checkpoint_in:
+            print(
+                "strict_component_split: critic stage expects encoder_checkpoint_in; "
+                "continuing with current encoder initialization."
+            )
+
     if neg_mode == "self_contrastive" and adaptive_target_enabled:
         print("adaptive_goodness_target disabled for self_contrastive mode.")
         adaptive_target_enabled = False
@@ -1187,6 +1271,41 @@ def main() -> int:
         num_layers=num_layers,
         dropout=dropout,
     ).to(device)
+    critic = EnergyCritic(
+        in_dim=hidden_dim,
+        hidden_dim=critic_hidden_dim,
+        num_layers=critic_num_layers,
+        dropout=critic_dropout,
+        positive_activation=critic_positive_activation,
+    ).to(device)
+    if encoder_checkpoint_in:
+        ckpt = Path(str(encoder_checkpoint_in))
+        if not ckpt.exists():
+            raise FileNotFoundError(f"encoder_checkpoint_in not found: {ckpt}")
+        model.load_state_dict(_load_state_dict_compat(str(ckpt)))
+        print(f"loaded encoder checkpoint: {ckpt}")
+    if critic_checkpoint_in:
+        ckpt = Path(str(critic_checkpoint_in))
+        if not ckpt.exists():
+            raise FileNotFoundError(f"critic_checkpoint_in not found: {ckpt}")
+        critic.load_state_dict(_load_state_dict_compat(str(ckpt)))
+        print(f"loaded critic checkpoint: {ckpt}")
+    if freeze_encoder:
+        for p in model.parameters():
+            p.requires_grad_(False)
+    if freeze_critic:
+        for p in critic.parameters():
+            p.requires_grad_(False)
+
+    print(
+        "component_split: "
+        f"strict={strict_component_split}, freeze_encoder={freeze_encoder}, freeze_critic={freeze_critic}"
+    )
+    print(
+        "critic: "
+        f"layers={critic_num_layers}, hidden_dim={critic_hidden_dim}, "
+        f"dropout={critic_dropout}, positive={critic_positive_activation}"
+    )
     ff_block_endpoints = (
         _block_endpoint_indices(len(model.layers), ff_block_size) if ff_blockwise else []
     )
@@ -1262,7 +1381,7 @@ def main() -> int:
         edge_weight = getattr(batch, "edge_weight", None)
         h = model(x, batch.edge_index, edge_weight=edge_weight)
         for t in temps:
-            g = goodness(h, batch.batch, temperature=t).mean().item()
+            g = goodness(h, batch.batch, temperature=t, critic=critic).mean().item()
             print(f"goodness_temp={t} -> mean_goodness={g:.4f}")
         return 0
 
@@ -1278,6 +1397,7 @@ def main() -> int:
                 _try_batch_size(
                     graphs,
                     model,
+                    critic,
                     device,
                     test_bs,
                     loader_workers,
@@ -1320,6 +1440,7 @@ def main() -> int:
                     _try_batch_size(
                         graphs,
                         model,
+                        critic,
                         device,
                         test_bs,
                         loader_workers,
@@ -1370,9 +1491,12 @@ def main() -> int:
         if dataloader_mp_context:
             loader_kwargs["multiprocessing_context"] = dataloader_mp_context
     loader = DataLoader(graphs, **loader_kwargs)
-    optim_params = list(model.parameters())
+    optim_params = [p for p in model.parameters() if p.requires_grad]
+    optim_params.extend(p for p in critic.parameters() if p.requires_grad)
     if risk_head is not None:
-        optim_params.extend(list(risk_head.parameters()))
+        optim_params.extend(p for p in risk_head.parameters() if p.requires_grad)
+    if not optim_params:
+        raise ValueError("No trainable parameters. Check freeze_encoder/freeze_critic settings.")
     optim = _build_optimizer(optim_params, lr=lr, device=device, use_fused=fused_optimizer)
 
     if log_csv:
@@ -1395,6 +1519,7 @@ def main() -> int:
     )
     for epoch in epoch_iter:
         model.train()
+        critic.train(any(p.requires_grad for p in critic.parameters()))
         epoch_goodness_target = float(goodness_target)
         epoch_neg_mix_end = float(neg_mix_end)
         epoch_neg_gate_margin = float(neg_gate_margin)
@@ -1524,10 +1649,10 @@ def main() -> int:
                                 return_all=True,
                             )
                             g_pos_aux = goodness(
-                                layers_pos[-1], batch.batch, temperature=goodness_temp
+                                layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
                             )
                             g_neg_aux = goodness(
-                                layers_neg_aux[-1], batch.batch, temperature=goodness_temp
+                                layers_neg_aux[-1], batch.batch, temperature=goodness_temp, critic=critic
                             )
                             ff_aux = ff_loss(
                                 g_pos_aux,
@@ -1546,6 +1671,7 @@ def main() -> int:
                             batch.batch,
                             hall_cfg,
                             edge_weight=edge_weight,
+                            critic=critic,
                         )
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (
@@ -1592,10 +1718,10 @@ def main() -> int:
 
                     if use_mode == "hallucinate":
                         g_pos_probe = goodness(
-                            layers_pos[-1], batch.batch, temperature=goodness_temp
+                            layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
                         ).mean().item()
                         g_neg_probe = goodness(
-                            layers_neg_h[-1], batch.batch, temperature=goodness_temp
+                            layers_neg_h[-1], batch.batch, temperature=goodness_temp, critic=critic
                         ).mean().item()
                         if g_neg_probe > g_pos_probe + neg_gate_margin:
                             x_neg_hall = make_negative(
@@ -1618,9 +1744,9 @@ def main() -> int:
 
                     batch_loss = 0.0
                     for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
-                        g_p = goodness(h_p, batch.batch, temperature=goodness_temp)
-                        g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp)
-                        g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp)
+                        g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
+                        g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp, critic=critic)
+                        g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp, critic=critic)
                         batch_loss += ff_loss(g_p, g_n_h, target=goodness_target)
                         batch_loss += ff_loss(g_p, g_n_t, target=goodness_target)
                     batch_loss = batch_loss / max(1, len(layers_pos))
@@ -1645,13 +1771,13 @@ def main() -> int:
                         batch_loss = batch_loss + distance_forward_weight * dist_loss_val
 
                     g_pos_last = goodness(
-                        layers_pos[-1], batch.batch, temperature=goodness_temp
+                        layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
                     ).mean().item()
                     g_neg_h_last = goodness(
-                        layers_neg_h[-1], batch.batch, temperature=goodness_temp
+                        layers_neg_h[-1], batch.batch, temperature=goodness_temp, critic=critic
                     ).mean().item()
                     g_neg_t_last = goodness(
-                        layers_neg_t[-1], batch.batch, temperature=goodness_temp
+                        layers_neg_t[-1], batch.batch, temperature=goodness_temp, critic=critic
                     ).mean().item()
                     g_neg_last = (g_neg_h_last + g_neg_t_last) / 2.0
 
@@ -1721,6 +1847,7 @@ def main() -> int:
                             batch.batch,
                             hall_cfg_layer,
                             edge_weight=edge_weight,
+                            critic=critic,
                         )
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
@@ -1753,10 +1880,10 @@ def main() -> int:
                         last_idx = ff_block_endpoints[-1]
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             g_pos_probe = goodness(
-                                layers_pos[last_idx], batch.batch, temperature=goodness_temp
+                                layers_pos[last_idx], batch.batch, temperature=goodness_temp, critic=critic
                             ).mean().item()
                             g_neg_probe = goodness(
-                                layers_neg[last_idx], batch.batch, temperature=goodness_temp
+                                layers_neg[last_idx], batch.batch, temperature=goodness_temp, critic=critic
                             ).mean().item()
                         if g_neg_probe > g_pos_probe + neg_gate_margin:
                             x_neg = make_negative(
@@ -1780,8 +1907,13 @@ def main() -> int:
                     block_gneg = 0.0
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         for li in ff_block_endpoints:
-                            g_pos = goodness(layers_pos[li], batch.batch, temperature=goodness_temp)
-                            g_neg = goodness(layers_neg[li], batch.batch, temperature=goodness_temp)
+                            g_pos = goodness(
+                                layers_pos[li],
+                                batch.batch,
+                                temperature=goodness_temp,
+                                critic=critic,
+                            )
+                            g_neg = goodness(layers_neg[li], batch.batch, temperature=goodness_temp, critic=critic)
                             block_loss = block_loss + ff_loss(g_pos, g_neg, target=goodness_target)
                             block_gpos += g_pos.mean().item()
                             block_gneg += g_neg.mean().item()
@@ -1813,7 +1945,7 @@ def main() -> int:
                             layer_mode = "shuffle"
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
-                            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
                         hall_active = layer_mode == "hallucinate"
                         if layer_mode == "hallucinate":
@@ -1829,6 +1961,7 @@ def main() -> int:
                                 hall_cfg_layer,
                                 edge_weight=edge_weight,
                                 forward_fn=forward_fn,
+                                critic=critic,
                             )
                             if hall_min_delta and hall_min_delta > 0:
                                 delta = (
@@ -1861,7 +1994,7 @@ def main() -> int:
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
                                 h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                                 g_neg_probe = goodness(
-                                    h_neg_probe, batch.batch, temperature=goodness_temp
+                                    h_neg_probe, batch.batch, temperature=goodness_temp, critic=critic
                                 ).mean().item()
                             g_pos_probe = g_pos.mean().item()
                             if g_neg_probe > g_pos_probe + neg_gate_margin:
@@ -1879,7 +2012,7 @@ def main() -> int:
 
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+                            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
                             loss = ff_loss(g_pos, g_neg, target=goodness_target)
                         _optimizer_step(
                             optim=optim,
@@ -1945,8 +2078,13 @@ def main() -> int:
                                 summary_dim=summary_dim,
                             )
                             h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
-                            g_pos_aux = goodness(h_pos, batch.batch, temperature=goodness_temp)
-                            g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp)
+                            g_pos_aux = goodness(
+                                h_pos,
+                                batch.batch,
+                                temperature=goodness_temp,
+                                critic=critic,
+                            )
+                            g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp, critic=critic)
                             ff_aux = ff_loss(
                                 g_pos_aux,
                                 g_neg_aux,
@@ -1955,7 +2093,7 @@ def main() -> int:
                             loss = loss + self_contrastive_ff_weight * ff_aux
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+                    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
@@ -1967,6 +2105,7 @@ def main() -> int:
                             batch.batch,
                             hall_cfg,
                             edge_weight=edge_weight,
+                            critic=critic,
                         )
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
@@ -1996,7 +2135,7 @@ def main() -> int:
                     if use_mode == "hallucinate":
                         h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                         g_neg_probe = goodness(
-                            h_neg_probe, batch.batch, temperature=goodness_temp
+                            h_neg_probe, batch.batch, temperature=goodness_temp, critic=critic
                         ).mean().item()
                         g_pos_probe = g_pos.mean().item()
                         if g_neg_probe > g_pos_probe + neg_gate_margin:
@@ -2012,7 +2151,7 @@ def main() -> int:
                             hall_gated += 1
                             hall_active = False
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+                    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
 
                     loss = ff_loss(g_pos, g_neg, target=goodness_target)
                     g_pos_val = g_pos.mean().item()
@@ -2211,10 +2350,20 @@ def main() -> int:
                     f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f}\n"
                 )
 
-    if save_model:
-        save_path = Path(save_model)
+    if save_encoder:
+        save_path = Path(str(save_encoder))
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_path)
+    elif save_model:
+        # Backward-compat: if only save_model is provided, treat it as encoder checkpoint output.
+        save_path = Path(str(save_model))
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_path)
+
+    if save_critic:
+        save_path = Path(str(save_critic))
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(critic.state_dict(), save_path)
 
     if log_csv and plot_path:
         try:

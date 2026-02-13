@@ -75,14 +75,24 @@ def hallucinate_negative(
     forward_fn=None,
     constraint_fn=None,
     force_indices: Optional[list[int]] = None,
+    critic=None,
 ) -> torch.Tensor:
     # Freeze model params during hallucination steps
     req_grad = [p.requires_grad for p in model.parameters()]
     train_state = model.training
+    critic_req_grad = []
+    critic_train_state = None
+    if critic is not None:
+        critic_req_grad = [p.requires_grad for p in critic.parameters()]
+        critic_train_state = bool(critic.training)
     try:
         for p in model.parameters():
             p.requires_grad_(False)
         model.eval()
+        if critic is not None:
+            for p in critic.parameters():
+                p.requires_grad_(False)
+            critic.eval()
 
         x0 = x.detach()
         return_slice_len = int(config.return_slice_len)
@@ -138,7 +148,7 @@ def hallucinate_negative(
                 h = forward_fn(x_var)
             else:
                 h = model(x_var, edge_index, edge_weight=edge_weight)
-            g = goodness(h, batch, temperature=config.goodness_temp).mean()
+            g = goodness(h, batch, temperature=config.goodness_temp, critic=critic).mean()
 
             if use_return_scope:
                 x_var_scope = x_var[:, :return_slice_len]
@@ -197,3 +207,7 @@ def hallucinate_negative(
         for p, rg in zip(model.parameters(), req_grad):
             p.requires_grad_(rg)
         model.train(train_state)
+        if critic is not None:
+            for p, rg in zip(critic.parameters(), critic_req_grad):
+                p.requires_grad_(rg)
+            critic.train(critic_train_state)

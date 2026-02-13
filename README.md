@@ -146,6 +146,35 @@ Train a simple Forward-Forward GNN that uses graph topology during message passi
 python scripts/train_ff_gnn.py --config configs/default.toml
 ```
 
+### Encoder/Critic Split (Recommended)
+Use explicit two-component training when you want strict role separation:
+
+1. Encoder stage (`self_contrastive`, no time-flip gating):
+```bash
+python scripts/train_ff_gnn.py --config configs/default.toml \
+  --neg-mode self_contrastive \
+  --strict-component-split \
+  --save-encoder runs/experiments/default/models/encoder.pt
+```
+
+2. Critic stage (FF discrimination with time-flip negatives, frozen encoder):
+```bash
+python scripts/train_ff_gnn.py --config configs/default.toml \
+  --neg-mode time_flip+noise \
+  --strict-component-split \
+  --encoder-checkpoint-in runs/experiments/default/models/encoder.pt \
+  --freeze-encoder \
+  --save-critic runs/experiments/default/models/critic.pt
+```
+
+Or run both stages in sequence:
+```bash
+python scripts/train_two_stage.py --config configs/default.toml
+```
+`train_two_stage.py` reads optional `[encoder]` and `[critic]` sections for stage-specific overrides.
+
+`scenario_book.py` now accepts `--critic-model` and, when `strict_component_split = true`, requires a critic checkpoint.
+
 ## Device Selection (Colab + macOS)
 This scaffold uses PyTorch Geometric (PyG). The configs now default to `device = "auto"`, which picks:
 - `cuda` first (recommended on Colab T4/A100/L4)
@@ -359,6 +388,8 @@ The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_s
 It also appends economic columns (`econ_strategy_*`, `econ_bh_*`, `econ_ann_return_uplift`, `econ_sharpe_uplift`) computed from goodness-driven risk-on/off signals on the eval window.
 If `eval_neg_mode = "auto"` with `neg_mode = "self_contrastive"`, benchmarking reports contrastive metrics (`eval_sc_loss`, `eval_sc_pos`, `eval_sc_neg`, `eval_sc_gap`, `eval_sc_acc`) and maps `eval_sep/eval_acc` to that objective.
 `self_contrastive_eval_view_mode` and `self_contrastive_eval_noise_std` let you make retrieval eval harder than plain tiny-noise views.
+Benchmark/sweep outputs include `objective_track` (`encoder`, `critic`, or `classifier`).
+For `encoder` rows, extra `time_flip*` eval modes are skipped and listed in `eval_neg_modes_skipped` so arrow-of-time checks stay critic-only.
 This means `ff_e2e` can report near-1.0 `eval_acc` without being directly comparable to FF-separation rows; compare `eval_sc_gap` for self-contrastive rows and `eval_sep` for FF rows.
 If `self_contrastive_eval_view_mode` is much harsher than training views (e.g. `time_flip+noise` at higher noise), `eval_sc_acc` can collapse even when training loss improves.
 For e2e stability, start with matching views (`self_contrastive_view_mode = "noise"` and `self_contrastive_eval_view_mode = "noise"`) before increasing augmentation strength.
@@ -441,6 +472,10 @@ Generate a scenario book from multiple windows:
 ```bash
 python scripts/scenario_book.py --config configs/default.toml --num-scenarios 10 --out runs/experiments/default/metrics/scenario_book.csv
 ```
+You can pin the critic checkpoint explicitly:
+```bash
+python scripts/scenario_book.py --config configs/default.toml --critic-model runs/experiments/default/models/critic.pt
+```
 
 You can also set defaults in `configs/default.toml`:
 ```
@@ -451,6 +486,7 @@ target_drop = -0.10
 constraint_mode = "exact"
 constraint_tolerance = 0.01
 constraint_weight = 20.0
+critic_model = "runs/experiments/default/models/critic.pt"
 adaptive = true
 target_hit_rate = 0.6
 target_tolerance = 0.01
@@ -458,6 +494,7 @@ max_adapt_steps = 40
 diag_out = "runs/experiments/default/diagnostics/scenario_constraint_diagnostics.csv"
 out = "runs/experiments/default/metrics/scenario_book.csv"
 ```
+Scenario rows include metadata columns: `objective_track`, `energy_component`, `component_split_mode`, `encoder_checkpoint`, `critic_checkpoint`, `train_neg_mode`.
 Then run:
 ```bash
 python scripts/scenario_book.py --config configs/default.toml

@@ -52,6 +52,17 @@ seed = 7
 log_csv = "runs/experiments/baseline/metrics/ff_train.csv"
 plot_path = "runs/experiments/baseline/plots/ff_train.png"
 save_model = "runs/experiments/baseline/models/ff_model.pt"
+save_encoder = "runs/experiments/baseline/models/encoder.pt"
+save_critic = "runs/experiments/baseline/models/critic.pt"
+encoder_checkpoint_in = ""
+critic_checkpoint_in = ""
+strict_component_split = false
+freeze_encoder = false
+freeze_critic = false
+critic_hidden_dim = 64
+critic_num_layers = 2
+critic_dropout = 0.1
+critic_positive_activation = "softplus"
 auto_tune_batch = true
 auto_tune_max_batch = 32
 auto_tune_factor = 2
@@ -209,3 +220,21 @@ node_fraction_start = 0.2
 node_fraction_end = 0.5
 node_min_start = 10
 node_min_end = 20
+
+[scenario_book]
+critic_model = "runs/experiments/baseline/models/critic.pt"
+diag_out = "runs/experiments/baseline/diagnostics/scenario_constraint_diagnostics.csv"
+out = "runs/experiments/baseline/metrics/scenario_book.csv"
+
+[encoder]
+neg_mode = "self_contrastive"
+strict_component_split = true
+freeze_critic = true
+save_encoder = "runs/experiments/baseline/models/encoder.pt"
+
+[critic]
+neg_mode = "time_flip+noise"
+strict_component_split = true
+freeze_encoder = true
+encoder_checkpoint_in = "runs/experiments/baseline/models/encoder.pt"
+save_critic = "runs/experiments/baseline/models/critic.pt"

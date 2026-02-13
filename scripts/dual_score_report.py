@@ -30,11 +30,24 @@ def _load_rows(path: Path):
 
 
 def _primary_metric(row):
+    robust = _to_float(row.get("primary_eval_metric_robust"))
+    if robust is not None:
+        robust_name = str(row.get("primary_eval_metric_robust_name", "")).strip()
+        return robust_name or "primary_eval_metric_robust", robust
+
     objective = str(row.get("eval_objective", "")).strip().lower()
     if objective == "self_contrastive":
         sc_gap = _to_float(row.get("eval_sc_gap"))
         if sc_gap is not None:
             return "eval_sc_gap", sc_gap
+
+    if objective in {"bce", "backprop"}:
+        auroc = _to_float(row.get("eval_auroc"))
+        if auroc is not None:
+            return "eval_auroc", auroc
+        auprc = _to_float(row.get("eval_auprc"))
+        if auprc is not None:
+            return "eval_auprc", auprc
 
     sep = _to_float(row.get("eval_sep"))
     if sep is not None:
@@ -85,6 +98,8 @@ def _attach_derived(rows, source):
         copy["_eval_acc"] = _to_float(copy.get("eval_acc"))
         copy["_eval_auroc"] = _to_float(copy.get("eval_auroc"))
         copy["_eval_auprc"] = _to_float(copy.get("eval_auprc"))
+        copy["_eval_time_flip_auroc"] = _to_float(copy.get("eval_time_flip_auroc"))
+        copy["_eval_time_flip_sep"] = _to_float(copy.get("eval_time_flip_sep"))
         copy["_avg_epoch_s"] = _to_float(copy.get("avg_epoch_s"))
         copy["_graphs_per_s"] = _to_float(copy.get("graphs_per_s"))
         out.append(copy)
@@ -94,14 +109,20 @@ def _attach_derived(rows, source):
 def _score_e2e(rows, primary_weight):
     lo_p, hi_p = _range(r.get("_primary_value") for r in rows)
     lo_a, hi_a = _range(r.get("_eval_auroc") for r in rows)
-    use_acc_fallback = hi_a <= lo_a
-    if use_acc_fallback:
-        lo_a, hi_a = _range(r.get("_eval_acc") for r in rows)
+    aux_key = "_eval_auroc"
+    if hi_a <= lo_a:
+        lo_tf, hi_tf = _range(r.get("_eval_time_flip_auroc") for r in rows)
+        if hi_tf > lo_tf:
+            lo_a, hi_a = lo_tf, hi_tf
+            aux_key = "_eval_time_flip_auroc"
+        else:
+            aux_key = "_eval_acc"
+            lo_a, hi_a = _range(r.get("_eval_acc") for r in rows)
     speed_weight = 1.0 - primary_weight
     scored = []
     for row in rows:
         p = _minmax_norm(row.get("_primary_value"), lo_p, hi_p)
-        aux_val = row.get("_eval_acc") if use_acc_fallback else row.get("_eval_auroc")
+        aux_val = row.get(aux_key)
         a = _minmax_norm(aux_val, lo_a, hi_a)
         row = dict(row)
         row["_dual_score"] = primary_weight * p + speed_weight * a
