@@ -32,7 +32,7 @@ Publish curated artifacts from a run:
 python scripts/publish_run.py --run-id <run_id>
 ```
 
-## Current Results Snapshot (as of 2026-02-13)
+## Current Results Snapshot (as of 2026-02-14)
 Latest notebook run IDs:
 - Latest benchmark rerun: `runs/experiments/e2e_runbook_20260213_235152/`
 - Latest full end-to-end run (sweep/scenario/calibration/backtest): `runs/experiments/e2e_runbook_20260213_205538/`
@@ -54,21 +54,21 @@ Notes:
 - On this rerun, objective separation on standard eval is near-zero for all modes (`eval_sep ~= 0`).
 - Time-flip sanity still passes strongly (`best eval_time_flip_sep = 0.9115`, threshold `0.05`).
 
-Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, generated 2026-02-14):
+Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, focused `risk_head` rerun generated 2026-02-14 21:32):
 
 | ablation_id | mode | eval_sep | delta_eval_sep_vs_baseline | econ_sharpe_uplift | delta_econ_sharpe_uplift_vs_baseline | econ_ann_return_uplift | delta_econ_ann_return_uplift_vs_baseline |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `baseline_updated` | `ff_e2e` | `0.857273` | `0.000000` | `0.486007` | `0.000000` | `-0.016364` | `0.000000` |
-| `risk_head_weight_low` | `ff_e2e` | `0.857514` | `+0.000242` | `0.660381` | `+0.174374` | `0.028862` | `+0.045227` |
-| `graph_threshold_pearson` | `ff_e2e` | `0.915798` | `+0.058525` | `0.164615` | `-0.321392` | `-0.097643` | `-0.081278` |
-| `goodtemp_050_margin010` | `ff_e2e` | `0.857561` | `+0.000289` | `-1.062746` | `-1.548753` | `-0.359101` | `-0.342736` |
-| `split_walk_forward_tighter_step` | `ff_e2e` (`walk_forward`, 5-fold aggregate) | `0.870083` | `+0.012811` | `-0.007149` | `-0.493156` | `-0.166357` | `-0.149993` |
+| `baseline_updated` | `ff_e2e` | `6.760634` | `0.000000` | `0.958215` | `0.000000` | `0.018112` | `0.000000` |
+| `risk_head_weight_low` (`0.02`) | `ff_e2e` | `6.760453` | `-0.000181` | `0.958215` | `0.000000` | `0.018112` | `0.000000` |
+| `risk_head_weight_lower` (`0.01`) | `ff_e2e` | `6.780601` | `+0.019966` | `1.041995` | `+0.083781` | `0.031896` | `+0.013783` |
+| `risk_head_weight_min` (`0.005`) | `ff_e2e` | `6.794633` | `+0.033999` | `1.061382` | `+0.103168` | `0.035976` | `+0.017864` |
+| `risk_head_off` | `ff_e2e` | `7.141854` | `+0.381220` | `-0.182601` | `-1.140815` | `-0.185359` | `-0.203472` |
 
-Recovery ablation interpretation:
-- Best single-factor recovery was `risk_head_weight_low` (`train.risk_loss_weight = 0.02`), which improved both economics and separation for `ff_e2e`.
-- `neg_shuffle_noise` was effectively neutral versus baseline in all three modes, so it is a low-risk simplification.
-- Graph-density and goodness-temperature changes often increased `eval_sep` while hurting economic metrics, so separation alone was a misleading target in this matrix.
-- `ff_layerwise` stayed high-separation but economically negative across tested settings; `backprop` could increase separation (especially with `graph_topk10_partial`) but generally did not improve economics.
+Recovery ablation interpretation (latest focused rerun):
+- `risk_head_weight_low` (`0.02`) is effectively the new baseline (same economics), because `configs/default.toml` now defaults to `train.risk_loss_weight = 0.02`.
+- Best economics came from keeping risk-head enabled but lowering weight to `0.005` (`risk_head_weight_min`): strongest `ff_e2e` Sharpe/return uplift and best `backprop` Sharpe uplift.
+- Disabling risk-head (`risk_head_off`) increased separation but hurt economics sharply for `ff_e2e` and `backprop`; this confirms separation alone is not a sufficient selection target.
+- `ff_layerwise` remained economically negative across all tested risk-head settings (Sharpe uplift ~`-0.713` except worse when risk-head is off).
 
 Sweep best from latest full run (`runs/experiments/e2e_runbook_20260213_205538/metrics/ff_sweep.csv`):
 - Best finance-first rank metric: `econ_sharpe_uplift = 0.5596` (`ff_layerwise`).
