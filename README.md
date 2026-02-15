@@ -34,25 +34,33 @@ python scripts/publish_run.py --run-id <run_id>
 
 ## Current Results Snapshot (as of 2026-02-15)
 Latest notebook run IDs:
-- Latest benchmark rerun: `runs/experiments/e2e_runbook_20260215_143702/`
+- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260215_180439/`
 - Latest full end-to-end run (sweep/scenario/calibration/backtest): `runs/experiments/e2e_runbook_20260215_143702/`
+- Recovery ablation outputs: `runs/experiments/recovery_ablation/`
 
 Published index status (`reports/index.csv`):
 - Published benchmark/scenario/sweep/hallucination/train snapshots currently point to `long_constituents` (timestamp `2026-02-13T00:40:52Z`).
 - `sweep/latest_tune.csv` still points to `legacy-20260211-colab`.
-- Notebook runbook artifacts (`e2e_runbook_*`) are local run artifacts until promoted/published.
+- Notebook runbook artifacts (`e2e_runbook_*` and `paper_final_500_*`) are local run artifacts until promoted/published.
 
-Benchmark rerun (`runs/experiments/e2e_runbook_20260215_143702/metrics/benchmark.csv`, walk-forward with 3 folds):
+Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260215_180439/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
 
-| mode | objective | eval_sep | eval_auroc | eval_auprc | avg_epoch_s | graphs_per_s | econ_ann_return_uplift | econ_sharpe_uplift |
+| mode | quality metric | quality value | eval_auroc | eval_auprc | avg_epoch_s | graphs_per_s | econ_ann_return_uplift | econ_sharpe_uplift |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| `ff_layerwise` | `ff` | `1.42353` | `0.96047` | `0.95873` | `0.962` | `1503.3` | `-29.40%` | `-0.948` |
-| `ff_e2e` | `ff` | `6.32328` | `0.99994` | `0.99994` | `0.694` | `2082.1` | `-5.72%` | `+0.432` |
-| `backprop` | `bce` | `14.14122` | `1.00000` | `1.00000` | `0.591` | `2444.3` | `-12.79%` | `+0.020` |
+| `ff_layerwise` | `eval_sep` | `9.32724` | `0.97611` | `0.98411` | `0.609` | `2372.2` | `-12.36%` | `+0.013` |
+| `ff_e2e` | `eval_sep` | `24.23168` | `0.99997` | `0.99997` | `0.418` | `3447.8` | `-12.89%` | `+0.016` |
+| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.359` | `4027.6` | `-21.73%` | `-0.405` |
 
-Notes:
-- `ff_e2e` is the best benchmark tradeoff in this run (strong separation + positive Sharpe uplift).
-- `backprop` classification metrics saturate, but economics remain below `ff_e2e`.
+Latest completed benchmark status:
+- Best quality: `ff_e2e` (`eval_sep=24.23168`, `eval_auroc=0.99997`).
+- Fastest mode: `backprop` (`4027.6` graphs/s).
+- Best economics in this run: `ff_e2e` (`econ_sharpe_uplift=+0.016`, `econ_ann_return_uplift=-12.89%`).
+
+How to read this latest paper result:
+- Quality and economics are not aligned in this run: `backprop` saturates classification metrics but has the weakest economics (`econ_sharpe_uplift=-0.405`).
+- `ff_e2e` wins on both quality and relative economics, but Sharpe uplift is only marginally positive because economics are unstable across walk-forward folds.
+- Fold-level `ff_e2e` economics (`runs/experiments/paper_final_500_20260215_180439/metrics/benchmark_walk_forward_folds.csv`): Sharpe uplift `+0.201`, `+0.843`, `-0.997`; annual return uplift `-1.00%`, `-1.35%`, `-36.32%`.
+- Conclusion for this run: if target metric is Sharpe, choose `ff_e2e` among the 3 modes, but treat it as regime-sensitive rather than consistently better.
 
 Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, focused `risk_head` rerun generated 2026-02-14 21:32):
 
@@ -67,7 +75,7 @@ Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs 
 Recovery ablation interpretation (latest focused rerun):
 - In this focused rerun, baseline used `train.risk_loss_weight = 0.02`; `risk_head_weight_low` therefore matched baseline economics.
 - Best economics came from keeping risk-head enabled but lowering weight to `0.005` (`risk_head_weight_min`): strongest `ff_e2e` Sharpe/return uplift and best `backprop` Sharpe uplift. The repo default is now `train.risk_loss_weight = 0.005`.
-- Disabling risk-head (`risk_head_off`) increased separation but hurt economics sharply for `ff_e2e` and `backprop`; this confirms separation alone is not a sufficient selection target.
+- Disabling risk-head (`risk_head_off`) increased separation but hurt economics sharply for `ff_e2e` and `backprop`; this matches the 500-epoch benchmark trend that higher separation alone does not guarantee higher Sharpe.
 - `ff_layerwise` remained economically negative across all tested risk-head settings (Sharpe uplift ~`-0.713` except worse when risk-head is off).
 
 Sweep best from latest full run (`runs/experiments/e2e_runbook_20260215_143702/metrics/ff_sweep.csv`):

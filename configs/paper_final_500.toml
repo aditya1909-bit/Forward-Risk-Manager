@@ -66,6 +66,9 @@ risk_cache_dir = "runs/cache"
 risk_max_abs_logret = 0.5
 neg_mode = "shuffle+noise"
 noise_std = 0.05
+amp = true
+amp_dtype = "float16"
+fused_optimizer = true
 device = "auto"
 loader_workers = 0
 torch_num_threads = 2
@@ -104,6 +107,15 @@ layerwise_noise_std = 0.12
 layerwise_hall_corr = 0.0
 layerwise_hall_mean = 0.01
 layerwise_hall_std = 0.01
+ff_blockwise = false
+ff_block_size = 2
+distance_forward_max_graphs = 0
+distance_forward_interval = 1
+self_contrastive_max_graphs = 0
+self_contrastive_ff_weight = 0.0
+self_contrastive_ff_neg_mode = "shuffle+noise"
+self_contrastive_ff_noise_std = 0.05
+self_contrastive_ff_target = 2.0
 hallucinate_steps = 1
 hallucinate_lr = 0.03
 hallucinate_l2 = 0.04
@@ -146,7 +158,7 @@ walk_forward_max_folds = 0
 walk_forward_out_csv = "runs/experiments/paper_final_500_TEMPLATE/metrics/benchmark_walk_forward_folds.csv"
 neg_mode = "shuffle+noise"
 eval_neg_mode = "auto"
-eval_neg_modes = ["time_flip", "block_bootstrap", "cross_asset_mix", "phase_randomize"]
+eval_neg_modes = ["time_flip"]
 self_contrastive_eval_view_mode = "shuffle+noise"
 self_contrastive_eval_noise_std = 0.05
 ece_bins = 10
@@ -163,3 +175,32 @@ econ_max_abs_logret = 0.5
 out_csv = "runs/experiments/paper_final_500_TEMPLATE/metrics/benchmark.csv"
 plot_path = "runs/experiments/paper_final_500_TEMPLATE/plots/benchmark_speed_sep.png"
 bar_plot_path = "runs/experiments/paper_final_500_TEMPLATE/plots/benchmark_bar.png"
+
+[benchmark.mode_overrides.ff_e2e]
+goodness_target = 1.5
+goodness_temp = 0.2
+neg_mix_end = 0.5
+hall_steps = 1
+hall_lr = 0.03
+hall_node_fraction = 0.2
+eval_neg_modes = ["time_flip"]
+
+[benchmark.mode_overrides.ff_layerwise]
+goodness_target = 2.0
+goodness_temp = 0.2
+neg_mix_end = 0.5
+hall_steps = 1
+hall_lr = 0.03
+hall_node_fraction = 0.2
+eval_neg_modes = ["block_bootstrap"]
+
+[benchmark.mode_overrides.backprop]
+goodness_target = 1.5
+goodness_temp = 0.2
+neg_mix_end = 0.5
+hall_steps = 1
+hall_lr = 0.03
+hall_node_fraction = 0.2
+backprop_amp = true
+backprop_amp_dtype = "float16"
+backprop_fused_optimizer = true
