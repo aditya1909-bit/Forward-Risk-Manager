@@ -29,6 +29,16 @@ def test_default_experiments_cover_requested_families():
     assert "split_strategy" in families
 
 
+def test_risk_head_experiments_cover_weight_sweep_and_off():
+    mod = _load_script("recovery_ablation.py")
+    exps = mod._default_experiments()
+    ids = {e["id"] for e in exps if e["family"] == "risk_head"}
+    assert "risk_head_off" in ids
+    assert "risk_head_weight_low" in ids
+    assert "risk_head_weight_lower" in ids
+    assert "risk_head_weight_min" in ids
+
+
 def test_deep_update_merges_nested_dicts():
     mod = _load_script("recovery_ablation.py")
     base = {"train": {"neg_mode": "mix", "nested": {"a": 1, "b": 2}}}

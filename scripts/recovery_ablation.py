@@ -129,6 +129,18 @@ def _default_experiments() -> list[dict]:
             "overrides": {"train": {"risk_head_enabled": True, "risk_loss_weight": 0.02}},
         },
         {
+            "id": "risk_head_weight_lower",
+            "family": "risk_head",
+            "description": "Keep risk-head with lower auxiliary loss weight (0.01).",
+            "overrides": {"train": {"risk_head_enabled": True, "risk_loss_weight": 0.01}},
+        },
+        {
+            "id": "risk_head_weight_min",
+            "family": "risk_head",
+            "description": "Keep risk-head with minimal auxiliary loss weight (0.005).",
+            "overrides": {"train": {"risk_head_enabled": True, "risk_loss_weight": 0.005}},
+        },
+        {
             "id": "graph_topk10_pearson_xsec",
             "family": "graph_params",
             "description": "Denser Pearson graph with top_k=10 and cross-sectional normalization.",
