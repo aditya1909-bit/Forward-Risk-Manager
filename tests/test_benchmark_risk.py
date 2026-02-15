@@ -60,3 +60,81 @@ def test_compute_multi_horizon_risk_loss_returns_none_for_all_missing_targets():
         risk_loss_type="mse",
     )
     assert loss is None
+
+
+def test_aggregate_fold_results_preserves_objective_metadata():
+    mod = _load_script("benchmark_training.py")
+    fold_rows = [
+        {
+            "mode": "ff_e2e",
+            "row_type": "fold",
+            "eval_objective": "ff",
+            "objective_track": "critic",
+            "primary_eval_metric_name": "eval_sep",
+            "primary_eval_metric_robust_name": "eval_sep",
+            "neg_mode_effective": "shuffle+noise",
+            "eval_neg_mode_effective": "shuffle+noise",
+            "risk_head_enabled_effective": True,
+            "eval_sep": 0.2,
+        },
+        {
+            "mode": "ff_e2e",
+            "row_type": "fold",
+            "eval_objective": "ff",
+            "objective_track": "critic",
+            "primary_eval_metric_name": "eval_sep",
+            "primary_eval_metric_robust_name": "eval_sep",
+            "neg_mode_effective": "shuffle+noise",
+            "eval_neg_mode_effective": "shuffle+noise",
+            "risk_head_enabled_effective": True,
+            "eval_sep": 0.4,
+        },
+    ]
+
+    agg = mod._aggregate_fold_results(fold_rows)
+    assert agg["eval_objective"] == "ff"
+    assert agg["objective_track"] == "critic"
+    assert agg["primary_eval_metric_name"] == "eval_sep"
+    assert agg["primary_eval_metric_robust_name"] == "eval_sep"
+    assert agg["neg_mode_effective"] == "shuffle+noise"
+    assert agg["eval_neg_mode_effective"] == "shuffle+noise"
+    assert agg["risk_head_enabled_effective"] is True
+
+
+def test_ff_sweep_aggregate_fold_rows_preserves_objective_metadata():
+    mod = _load_script("ff_sweep.py")
+    fold_rows = [
+        {
+            "mode": "ff_e2e",
+            "row_type": "fold",
+            "eval_objective": "ff",
+            "objective_track": "critic",
+            "primary_eval_metric_name": "eval_sep",
+            "primary_eval_metric_robust_name": "eval_sep",
+            "neg_mode_effective": "shuffle+noise",
+            "eval_neg_mode_effective": "shuffle+noise",
+            "risk_head_enabled_effective": True,
+            "eval_sep": 0.2,
+        },
+        {
+            "mode": "ff_e2e",
+            "row_type": "fold",
+            "eval_objective": "ff",
+            "objective_track": "critic",
+            "primary_eval_metric_name": "eval_sep",
+            "primary_eval_metric_robust_name": "eval_sep",
+            "neg_mode_effective": "shuffle+noise",
+            "eval_neg_mode_effective": "shuffle+noise",
+            "risk_head_enabled_effective": True,
+            "eval_sep": 0.4,
+        },
+    ]
+
+    agg = mod._aggregate_fold_rows(fold_rows)
+    assert agg["eval_objective"] == "ff"
+    assert agg["objective_track"] == "critic"
+    assert agg["primary_eval_metric_name"] == "eval_sep"
+    assert agg["primary_eval_metric_robust_name"] == "eval_sep"
+    assert agg["neg_mode_effective"] == "shuffle+noise"
+    assert agg["eval_neg_mode_effective"] == "shuffle+noise"
+    assert agg["risk_head_enabled_effective"] is True

@@ -104,7 +104,10 @@ def main() -> int:
         eval_mode = str(row.get("eval_neg_mode_effective", "")).strip().lower()
         objective = str(row.get("eval_objective", "")).strip().lower()
         acc = _to_float(row.get("eval_acc"))
-        if eval_mode in easy_modes:
+        # Easy-negative accuracy gate is for FF/critic objectives; backprop/BCE can
+        # legitimately saturate this metric and should not fail anti-triviality checks.
+        is_critic_objective = _is_critic_objective(objective) or objective == ""
+        if eval_mode in easy_modes and is_critic_objective:
             easy_acc.append(acc)
         tf_sep = _to_float(row.get("eval_time_flip_sep"))
         if tf_sep == tf_sep and _is_critic_objective(objective):

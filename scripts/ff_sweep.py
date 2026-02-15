@@ -695,7 +695,15 @@ def _aggregate_fold_rows(rows: list[dict]) -> dict:
             out[key] = mean_val
             out[f"{key}_std"] = std_val
     first = rows[0]
-    for key in ("eval_objective", "neg_mode_effective", "eval_neg_mode_effective"):
+    for key in (
+        "eval_objective",
+        "objective_track",
+        "primary_eval_metric_name",
+        "primary_eval_metric_robust_name",
+        "neg_mode_effective",
+        "eval_neg_mode_effective",
+        "risk_head_enabled_effective",
+    ):
         if key in first:
             out[key] = first[key]
     out["walk_forward_num_folds"] = len(rows)

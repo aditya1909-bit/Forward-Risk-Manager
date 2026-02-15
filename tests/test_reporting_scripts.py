@@ -392,3 +392,40 @@ def test_sanity_checks_sc_gap_min_fails_when_gap_is_too_low(
         ],
     )
     assert mod.main() == 1
+
+
+def test_sanity_checks_easy_negative_acc_ignores_backprop_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _load_script("sanity_checks.py")
+    bench_csv = tmp_path / "benchmark.csv"
+    with bench_csv.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "eval_neg_mode_effective",
+                "eval_objective",
+                "eval_acc",
+                "eval_time_flip_sep",
+            ]
+        )
+        # FF row should be used for easy-negative gate.
+        w.writerow(["shuffle+noise", "ff", "0.99", "0.10"])
+        # Backprop row can saturate eval_acc and should not fail easy-negative gate.
+        w.writerow(["shuffle+noise", "bce", "1.0", "0.00"])
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sanity_checks.py",
+            "--benchmark-csv",
+            str(bench_csv),
+            "--easy-neg-acc-max",
+            "0.995",
+            "--timeflip-sep-min",
+            "0.05",
+        ],
+    )
+    assert mod.main() == 0

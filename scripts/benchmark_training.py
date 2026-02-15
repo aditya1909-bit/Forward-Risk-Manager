@@ -406,8 +406,12 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
     first = fold_rows[0]
     for key in (
         "eval_objective",
+        "objective_track",
+        "primary_eval_metric_name",
+        "primary_eval_metric_robust_name",
         "neg_mode_effective",
         "eval_neg_mode_effective",
+        "risk_head_enabled_effective",
     ):
         if key in first:
             out[key] = first[key]
