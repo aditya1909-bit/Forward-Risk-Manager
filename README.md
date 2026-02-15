@@ -32,45 +32,51 @@ Publish curated artifacts from a run:
 python scripts/publish_run.py --run-id <run_id>
 ```
 
-## Current Results Snapshot (as of 2026-02-11)
-Primary run analyzed: `runs/experiments/long_constituents/`.
+## Current Results Snapshot (as of 2026-02-13)
+Latest notebook run IDs:
+- Latest benchmark rerun: `runs/experiments/e2e_runbook_20260213_235152/`
+- Latest full end-to-end run (sweep/scenario/calibration/backtest): `runs/experiments/e2e_runbook_20260213_205538/`
 
-Published index status:
-- `reports/index.csv` currently has mixed provenance.
-- Most scenario/hallucination/sweep benchmark metrics are from `long_constituents`.
-- `train/*` published snapshots are still from `legacy-20260211-colab`.
-- `goodness_backtest.csv` currently exists in `legacy-20260211-colab` only.
+Published index status (`reports/index.csv`):
+- Published benchmark/scenario/sweep/hallucination/train snapshots currently point to `long_constituents` (timestamp `2026-02-13T00:40:52Z`).
+- `sweep/latest_tune.csv` still points to `legacy-20260211-colab`.
+- Notebook runbook artifacts (`e2e_runbook_*`) are local run artifacts until promoted/published.
 
-Benchmark (`runs/experiments/long_constituents/metrics/benchmark.csv`):
+Benchmark rerun (`runs/experiments/e2e_runbook_20260213_235152/metrics/benchmark.csv`, walk-forward with 3 folds):
 
-| mode | objective | eval_acc | eval_sep / eval_sc_gap | avg_epoch_s | graphs_per_s |
-|---|---|---:|---:|---:|---:|
-| `ff_layerwise` | `ff` | 0.866 | 1.719 (`eval_sep`) | 1.185 | 2383.5 |
-| `ff_e2e` | `self_contrastive` | 0.999 | 0.730 (`eval_sc_gap`) | 1.169 | 2415.0 |
-| `backprop` | `bce` | 0.983 | 0.548 (`eval_sep`) | 0.832 | 3395.3 |
+| mode | objective | eval_sep | eval_auroc | eval_auprc | avg_epoch_s | graphs_per_s | econ_ann_return_uplift | econ_sharpe_uplift |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `ff_layerwise` | `ff` | `3.06e-08` | `0.50003` | `0.50408` | `1.284` | `1125.0` | `-15.88%` | `-0.329` |
+| `ff_e2e` | `ff` | `-1.22e-08` | `0.49998` | `0.50442` | `0.962` | `1502.0` | `-16.14%` | `-0.176` |
+| `backprop` | `bce` | `0.0` | `0.49999` | `0.50330` | `0.921` | `1569.0` | `-6.80%` | `+0.662` |
 
-`eval_acc` is a secondary metric. Prefer objective-aware separation (`eval_sep`/`eval_sc_gap`) plus AUROC/AUPRC/calibration metrics for model selection.
+Notes:
+- On this rerun, objective separation on standard eval is near-zero for all modes (`eval_sep ~= 0`).
+- Time-flip sanity still passes strongly (`best eval_time_flip_sep = 0.9115`, threshold `0.05`).
 
-Sweep best (`runs/experiments/long_constituents/metrics/ff_sweep.csv`):
-- Best objective-aware row (rank metric `eval_sep`): `2.071` in `ff_layerwise`.
-- Speed for that row: `2818.1` graphs/s, `avg_epoch_s=1.002`.
-- Key params: `goodness_temp=0.0524`, `goodness_target=3.4908`, `hall_steps=14`, `hall_lr=0.033614`, `hall_node_fraction=0.25`.
+Sweep best from latest full run (`runs/experiments/e2e_runbook_20260213_205538/metrics/ff_sweep.csv`):
+- Best finance-first rank metric: `econ_sharpe_uplift = 0.5596` (`ff_layerwise`).
+- Speed for that row: `1115.3` graphs/s (`avg_epoch_s = 1.480`).
+- Key params: `goodness_temp=0.2`, `goodness_target=1.5`, `hall_steps=1`, `hall_lr=0.02`, `hall_node_fraction=0.2`, `neg_mix_end=0.5`.
 
-Scenario + stress (`runs/experiments/long_constituents/diagnostics/scenario_constraint_diagnostics.csv`, `runs/experiments/long_constituents/metrics/stress_test_report.csv`):
-- Scenario constraint hit rate: `58.7%` over 150 scenarios.
-- Mean target absolute error: `2.43%` (target drop is `-10%`).
-- Mean non-target drift: `0.094%` absolute.
+Scenario + stress from latest full run (`runs/experiments/e2e_runbook_20260213_205538/diagnostics/scenario_constraint_diagnostics.csv`, `runs/experiments/e2e_runbook_20260213_205538/metrics/stress_test_report.csv`):
+- Scenario constraint hit rate: `40.0%` over 50 scenarios.
+- Mean target absolute error: `1.70%` (target drop is `-10%`).
+- Mean non-target drift: `0.50%` absolute.
 - Stress deltas (hallucinated minus real), `all` scope mean absolute:
-  - `|delta total_return| = 0.12%`
-  - `|delta volatility| = 0.04%`
-  - `|delta cvar_95| = 0.08%`
-- Target scope is intentionally harder and shows larger shifts (mean absolute `delta total_return ~= 15.75%`).
+  - `|delta total_return| = 1.14%`
+  - `|delta volatility| = 0.18%`
+  - `|delta cvar_95| = 0.33%`
+- Target scope remains intentionally harder (`|delta total_return| = 11.74%` mean absolute).
 
-Hallucination calibration (`runs/experiments/long_constituents/diagnostics/hallucination_calibration_by_ticker.csv`):
-- Median corr(real, halluc): `0.9937`.
-- Median JS divergence: `0.0047`.
-- Median tail ratio p99 (hall/real): `0.976`.
-- Largest JS outliers currently include: `AEIS`, `INDB`, `CMP`, `MOH`, `SARO`.
+Hallucination calibration from latest full run (`runs/experiments/e2e_runbook_20260213_205538/diagnostics/hallucination_calibration_by_ticker.csv`):
+- Median corr(real, halluc): `0.9379`.
+- Median JS divergence: `0.0216`.
+- Median tail ratio p99 (hall/real): `1.0561`.
+- Largest JS outliers currently include: `MANT`, `CRBG`, `LPS`, `WXS`, `GDI`.
+
+Goodness backtest (`runs/experiments/e2e_runbook_20260213_205538/diagnostics/goodness_strategy_metrics.csv`):
+- `goodness_risk_on_off` vs buy-and-hold: lower annual return (`10.82%` vs `15.07%`) but better Sharpe (`0.563` vs `0.525`) and shallower max drawdown (`-37.0%` vs `-44.2%`).
 
 ## Converter Usage
 Place your raw exports under `data/raw/` (any filenames). Then run:

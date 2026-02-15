@@ -20,5 +20,6 @@ tests/test_eval_metrics.py
 tests/test_ff.py
 tests/test_graph_builder.py
 tests/test_hallucinate.py
+tests/test_models.py
 tests/test_reporting_scripts.py
 tests/test_splits.py
