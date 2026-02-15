@@ -54,6 +54,22 @@ Notes:
 - On this rerun, objective separation on standard eval is near-zero for all modes (`eval_sep ~= 0`).
 - Time-flip sanity still passes strongly (`best eval_time_flip_sep = 0.9115`, threshold `0.05`).
 
+Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, generated 2026-02-14):
+
+| ablation_id | mode | eval_sep | delta_eval_sep_vs_baseline | econ_sharpe_uplift | delta_econ_sharpe_uplift_vs_baseline | econ_ann_return_uplift | delta_econ_ann_return_uplift_vs_baseline |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `baseline_updated` | `ff_e2e` | `0.857273` | `0.000000` | `0.486007` | `0.000000` | `-0.016364` | `0.000000` |
+| `risk_head_weight_low` | `ff_e2e` | `0.857514` | `+0.000242` | `0.660381` | `+0.174374` | `0.028862` | `+0.045227` |
+| `graph_threshold_pearson` | `ff_e2e` | `0.915798` | `+0.058525` | `0.164615` | `-0.321392` | `-0.097643` | `-0.081278` |
+| `goodtemp_050_margin010` | `ff_e2e` | `0.857561` | `+0.000289` | `-1.062746` | `-1.548753` | `-0.359101` | `-0.342736` |
+| `split_walk_forward_tighter_step` | `ff_e2e` (`walk_forward`, 5-fold aggregate) | `0.870083` | `+0.012811` | `-0.007149` | `-0.493156` | `-0.166357` | `-0.149993` |
+
+Recovery ablation interpretation:
+- Best single-factor recovery was `risk_head_weight_low` (`train.risk_loss_weight = 0.02`), which improved both economics and separation for `ff_e2e`.
+- `neg_shuffle_noise` was effectively neutral versus baseline in all three modes, so it is a low-risk simplification.
+- Graph-density and goodness-temperature changes often increased `eval_sep` while hurting economic metrics, so separation alone was a misleading target in this matrix.
+- `ff_layerwise` stayed high-separation but economically negative across tested settings; `backprop` could increase separation (especially with `graph_topk10_partial`) but generally did not improve economics.
+
 Sweep best from latest full run (`runs/experiments/e2e_runbook_20260213_205538/metrics/ff_sweep.csv`):
 - Best finance-first rank metric: `econ_sharpe_uplift = 0.5596` (`ff_layerwise`).
 - Speed for that row: `1115.3` graphs/s (`avg_epoch_s = 1.480`).
@@ -375,6 +391,7 @@ econ_signal_quantile = 0.5
 econ_turnover_cost_bps = 0.0
 out_csv = "runs/experiments/default/metrics/benchmark.csv"
 ```
+When `train.risk_head_enabled = true`, benchmark FF/backprop runs now include the same auxiliary risk loss path used in training and report `risk_loss_train`/`risk_head_enabled_effective`.
 
 For expanding walk-forward validation instead of a single holdout:
 ```
@@ -408,6 +425,38 @@ runs/experiments/default/plots/benchmark_speed_sep.png
 And a bar chart summary:
 ```
 runs/experiments/default/plots/benchmark.png
+```
+
+## Recovery Ablation Runner
+Run a controlled one-factor-at-a-time ablation matrix covering:
+- negative sampling/mix schedule
+- risk-head weighting/disablement
+- graph construction density/method
+- goodness temperature + FF margin
+- hallucination schedule strength
+- split strategy (chronological vs walk-forward)
+
+```bash
+python scripts/recovery_ablation.py --config configs/default.toml
+```
+
+Outputs are written under `runs/experiments/recovery_ablation/`:
+- `metrics/recovery_ablation_plan.csv` (full planned matrix)
+- `metrics/recovery_ablation.csv` (consolidated benchmark rows + deltas vs baseline)
+- `metrics/recovery_ablation_summary.csv` (best-by-family summary)
+
+Useful options:
+```bash
+python scripts/recovery_ablation.py \
+  --config configs/default.toml \
+  --families negative_sampling,risk_head \
+  --benchmark-epochs 3 \
+  --modes ff_e2e,backprop
+```
+
+Dry-run (no graph builds or training):
+```bash
+python scripts/recovery_ablation.py --config configs/default.toml --dry-run
 ```
 
 ## Auto-Sweep (FF Hyperparams)

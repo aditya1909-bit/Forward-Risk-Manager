@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
+import hashlib
+import math
 import random
 import time
 from pathlib import Path
@@ -61,6 +64,221 @@ _NEG_AUG_MODES = {
     "cross_asset_mix",
     "phase_randomize",
 }
+_RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+
+
+def _parse_positive_int_list(value, fallback: int) -> list[int]:
+    vals: list[int] = []
+    raw_items = []
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    elif value is not None:
+        raw_items = str(value).split(",")
+
+    seen = set()
+    for item in raw_items:
+        s = str(item).strip()
+        if not s:
+            continue
+        try:
+            v = int(float(s))
+        except ValueError:
+            continue
+        if v <= 0 or v in seen:
+            continue
+        seen.add(v)
+        vals.append(v)
+
+    if vals:
+        return vals
+    return [max(1, int(fallback))]
+
+
+def _compute_risk_targets(
+    prices_path: str,
+    ticker: str,
+    dates: list[str],
+    horizon: int,
+    standardize: bool,
+    max_abs_logret: float,
+    cache_dir: str | None = "runs/cache",
+) -> tuple[list[float | None], float, float]:
+    prices_file = Path(prices_path)
+    try:
+        st = prices_file.stat()
+        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        file_sig = "missing"
+    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha1(
+        "|".join(
+            [
+                str(prices_file.resolve()),
+                str(ticker).upper(),
+                str(horizon),
+                str(int(bool(standardize))),
+                f"{float(max_abs_logret):.8f}",
+                file_sig,
+                dates_hash,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+    cached = _RISK_TARGET_MEM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cache_path: Path | None = None
+    if cache_dir:
+        cache_path = Path(cache_dir) / f"risk_targets_{cache_key}.pt"
+        if cache_path.exists():
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                targets = payload["targets"]
+                mean = float(payload["mean"])
+                std = float(payload["std"])
+                result = (targets, mean, std)
+                _RISK_TARGET_MEM_CACHE[cache_key] = result
+                return result
+            except Exception:
+                pass
+
+    prices_by_date: dict[str, list[float]] = {}
+    ticker_norm = str(ticker).upper()
+    with Path(prices_path).open() as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames:
+            raise ValueError("prices.csv missing header")
+        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
+        for row in r:
+            if str(row.get("ticker", "")).upper() != ticker_norm:
+                continue
+            date = row.get("date")
+            if not date:
+                continue
+            val = row.get(price_col, "")
+            if not val:
+                continue
+            try:
+                price = float(val)
+            except ValueError:
+                continue
+            if not math.isfinite(price) or price <= 0:
+                continue
+            prices_by_date.setdefault(date, []).append(price)
+    prices: list[tuple[str, float]] = []
+    for date, vals in prices_by_date.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        mid = len(vals_sorted) // 2
+        if len(vals_sorted) % 2 == 1:
+            px = vals_sorted[mid]
+        else:
+            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+        prices.append((date, float(px)))
+    if not prices:
+        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
+
+    prices.sort(key=lambda x: x[0])
+    date_list = [d for d, _ in prices]
+    price_list = [p for _, p in prices]
+    returns = []
+    clip = float(max_abs_logret)
+    for i in range(len(price_list) - 1):
+        if price_list[i] <= 0 or price_list[i + 1] <= 0:
+            returns.append(0.0)
+            continue
+        ret = math.log(price_list[i + 1] / price_list[i])
+        if clip > 0 and abs(ret) > clip:
+            ret = math.copysign(clip, ret)
+        returns.append(ret)
+    idx_map = {d: i for i, d in enumerate(date_list)}
+
+    targets: list[float | None] = []
+    for d in dates:
+        idx = idx_map.get(d)
+        if idx is None:
+            targets.append(None)
+            continue
+        if idx + horizon > len(returns):
+            targets.append(None)
+            continue
+        window = returns[idx : idx + horizon]
+        if not window:
+            targets.append(None)
+            continue
+        mean = sum(window) / len(window)
+        var = sum((x - mean) ** 2 for x in window) / len(window)
+        vol = math.sqrt(var)
+        targets.append(vol)
+
+    finite = [t for t in targets if t is not None]
+    if not finite:
+        result = (targets, 0.0, 1.0)
+        _RISK_TARGET_MEM_CACHE[cache_key] = result
+        return result
+    mean = sum(finite) / len(finite)
+    var = sum((x - mean) ** 2 for x in finite) / len(finite)
+    std = math.sqrt(var) if var > 0 else 1.0
+
+    if standardize:
+        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
+    result = (targets, mean, std)
+    _RISK_TARGET_MEM_CACHE[cache_key] = result
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
+        except Exception:
+            pass
+    return result
+
+
+def _compute_multi_horizon_risk_loss(
+    risk_head: torch.nn.Module,
+    embeddings: torch.Tensor,
+    graph_idx,
+    risk_targets_by_horizon: list[list[float | None]],
+    device: torch.device,
+    risk_loss_type: str,
+) -> torch.Tensor | None:
+    if not risk_targets_by_horizon:
+        return None
+
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+
+    target_rows = []
+    for gi in idx_list:
+        row = []
+        for horizon_targets in risk_targets_by_horizon:
+            if 0 <= gi < len(horizon_targets):
+                t = horizon_targets[gi]
+            else:
+                t = None
+            row.append(float(t) if t is not None else float("nan"))
+        target_rows.append(row)
+
+    target = torch.tensor(target_rows, dtype=torch.float32, device=device)
+    mask = torch.isfinite(target)
+    if not mask.any():
+        return None
+
+    pred = risk_head(embeddings)
+    if pred.ndim == 1:
+        pred = pred.unsqueeze(-1)
+    if pred.shape != target.shape:
+        raise RuntimeError(
+            f"risk head output shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}"
+        )
+    if risk_loss_type == "mse":
+        return torch.nn.functional.mse_loss(pred[mask], target[mask])
+    return torch.nn.functional.smooth_l1_loss(pred[mask], target[mask])
 
 
 def _load_config(path: str) -> dict:
@@ -746,13 +964,28 @@ def _benchmark_ff(
         conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(config.get("encoder_gat_heads", 2)),
     ).to(device)
+    risk_targets_by_horizon = config.get("risk_targets_by_horizon")
+    risk_horizons_effective = config.get("risk_horizons_effective", [])
+    risk_head_active = bool(config.get("risk_head_enabled", False)) and bool(risk_targets_by_horizon)
+    if layerwise and risk_head_active:
+        print("risk_head disabled for ff_layerwise benchmarking.")
+        risk_head_active = False
+    risk_head = None
+    if risk_head_active:
+        risk_head = torch.nn.Linear(
+            config["hidden_dim"],
+            len(risk_horizons_effective),
+        ).to(device)
+    optim_params = list(model.parameters())
+    if risk_head is not None:
+        optim_params.extend(list(risk_head.parameters()))
     optim = _build_optimizer(
-        model.parameters(),
+        optim_params,
         lr=config["lr"],
         device=device,
         use_fused=bool(config.get("fused_optimizer", True)),
     )
-    clip_params = list(model.parameters())
+    clip_params = list(optim_params)
 
     hall_cfg = HallucinationConfig(
         steps=config["hall_steps"],
@@ -828,6 +1061,8 @@ def _benchmark_ff(
         )
 
     epoch_times = []
+    risk_loss_sum = 0.0
+    risk_batches = 0
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -1041,6 +1276,20 @@ def _benchmark_ff(
                             margin=dist_margin,
                             max_graphs=dist_max_graphs,
                         )
+                risk_loss_val = None
+                if risk_head is not None and risk_targets_by_horizon is not None:
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        z_risk = global_mean_pool(h_pos, batch.batch)
+                        risk_loss_val = _compute_multi_horizon_risk_loss(
+                            risk_head=risk_head,
+                            embeddings=z_risk,
+                            graph_idx=batch.graph_idx,
+                            risk_targets_by_horizon=risk_targets_by_horizon,
+                            device=device,
+                            risk_loss_type=str(config.get("risk_loss_type", "huber")).strip().lower(),
+                        )
+                        if risk_loss_val is not None:
+                            loss = loss + float(config.get("risk_loss_weight", 0.0)) * risk_loss_val
                 _optimizer_step(
                     optim=optim,
                     loss=loss,
@@ -1049,6 +1298,9 @@ def _benchmark_ff(
                     scaler=step_scaler,
                 )
                 total_loss += loss.item()
+                if risk_loss_val is not None:
+                    risk_loss_sum += float(risk_loss_val.detach())
+                    risk_batches += 1
 
             graphs_seen += batch.num_graphs
 
@@ -1099,6 +1351,7 @@ def _benchmark_ff(
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
     avg_time = float(np.mean([t for t, _ in usable]))
     avg_gps = float(np.mean([g / t for t, g in usable]))
+    risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
@@ -1106,7 +1359,12 @@ def _benchmark_ff(
         "target_cal_acc": target_cal_acc,
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
+        "risk_head_enabled_effective": bool(risk_head is not None),
+        "risk_loss_train": risk_loss_train,
     }
+    if risk_head is not None:
+        out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
+        out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
     out.update(eval_metrics)
     econ = _compute_econ_metrics_for_eval(
         model,
@@ -1204,7 +1462,14 @@ def _benchmark_backprop(
         gat_heads=int(config.get("encoder_gat_heads", 2)),
     ).to(device)
     head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
+    risk_targets_by_horizon = config.get("risk_targets_by_horizon")
+    risk_horizons_effective = config.get("risk_horizons_effective", [])
+    risk_head = None
+    if bool(config.get("risk_head_enabled", False)) and risk_targets_by_horizon:
+        risk_head = torch.nn.Linear(config["hidden_dim"], len(risk_horizons_effective)).to(device)
     optim_params = list(model.parameters()) + list(head.parameters())
+    if risk_head is not None:
+        optim_params.extend(list(risk_head.parameters()))
     optim = _build_optimizer(
         optim_params,
         lr=config["lr"],
@@ -1254,6 +1519,8 @@ def _benchmark_backprop(
         eval_mode = "shuffle"
 
     epoch_times = []
+    risk_loss_sum = 0.0
+    risk_batches = 0
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -1303,6 +1570,18 @@ def _benchmark_backprop(
                 y = torch.cat([y_pos, y_neg], dim=0)
                 logits = head(z).squeeze(1)
                 loss = bce(logits, y)
+                risk_loss_val = None
+                if risk_head is not None and risk_targets_by_horizon is not None:
+                    risk_loss_val = _compute_multi_horizon_risk_loss(
+                        risk_head=risk_head,
+                        embeddings=z_pos,
+                        graph_idx=batch.graph_idx,
+                        risk_targets_by_horizon=risk_targets_by_horizon,
+                        device=device,
+                        risk_loss_type=str(config.get("risk_loss_type", "huber")).strip().lower(),
+                    )
+                    if risk_loss_val is not None:
+                        loss = loss + float(config.get("risk_loss_weight", 0.0)) * risk_loss_val
 
             _optimizer_step(
                 optim=optim,
@@ -1311,6 +1590,9 @@ def _benchmark_backprop(
                 clip_params=optim_params,
                 scaler=bp_scaler,
             )
+            if risk_loss_val is not None:
+                risk_loss_sum += float(risk_loss_val.detach())
+                risk_batches += 1
             graphs_seen += batch.num_graphs
         _sync(device)
         dt = time.perf_counter() - t0
@@ -1405,6 +1687,7 @@ def _benchmark_backprop(
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
     avg_time = float(np.mean([t for t, _ in usable]))
     avg_gps = float(np.mean([g / t for t, g in usable]))
+    risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
@@ -1420,7 +1703,12 @@ def _benchmark_backprop(
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
         "eval_objective": "bce",
+        "risk_head_enabled_effective": bool(risk_head is not None),
+        "risk_loss_train": risk_loss_train,
     }
+    if risk_head is not None:
+        out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
+        out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
     econ = _compute_econ_metrics_for_eval(
         model,
         eval_graphs,
@@ -1457,6 +1745,8 @@ def main() -> int:
     graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
     if graph_dates and len(graph_dates) != len(graphs):
         graph_dates = []
+    for i, g in enumerate(graphs):
+        setattr(g, "graph_idx", i)
 
     device = _choose_device(train_cfg.get("device", "auto"))
     _set_seed(int(train_cfg.get("seed", 7)))
@@ -1595,6 +1885,18 @@ def main() -> int:
         "hall_moment_var": float(train_cfg.get("hallucinate_moment_var", 0.0)),
         "hall_moment_skew": float(train_cfg.get("hallucinate_moment_skew", 0.0)),
         "hall_moment_scope": str(train_cfg.get("hallucinate_moment_scope", "returns")),
+        "risk_head_enabled": bool(train_cfg.get("risk_head_enabled", False)),
+        "risk_ticker": str(train_cfg.get("risk_ticker", "AUTO")),
+        "risk_horizon": int(train_cfg.get("risk_horizon", 21)),
+        "risk_horizons": _parse_positive_int_list(
+            train_cfg.get("risk_horizons", train_cfg.get("risk_horizon", 21)),
+            fallback=int(train_cfg.get("risk_horizon", 21)),
+        ),
+        "risk_loss_weight": float(train_cfg.get("risk_loss_weight", 0.1)),
+        "risk_loss_type": str(train_cfg.get("risk_loss_type", "huber")),
+        "risk_standardize": bool(train_cfg.get("risk_standardize", True)),
+        "risk_cache_dir": str(train_cfg.get("risk_cache_dir", "runs/cache")),
+        "risk_max_abs_logret": float(train_cfg.get("risk_max_abs_logret", 0.5)),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
         "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
@@ -1645,6 +1947,52 @@ def main() -> int:
         except Exception as exc:
             config["econ_enabled"] = False
             print(f"warning: disabled econ metrics: {exc}")
+
+    config["risk_targets_by_horizon"] = None
+    config["risk_horizons_effective"] = []
+    config["risk_ticker_effective"] = str(config.get("risk_ticker", "AUTO"))
+    if bool(config.get("risk_head_enabled", False)):
+        if not graph_dates:
+            config["risk_head_enabled"] = False
+            print("warning: disabled risk_head in benchmark: graphs payload missing dates.")
+        else:
+            prices_path = str(build_cfg.get("prices", "data/processed/prices.csv"))
+            try:
+                risk_horizons = _parse_positive_int_list(
+                    config.get("risk_horizons", config.get("risk_horizon", 21)),
+                    fallback=int(config.get("risk_horizon", 21)),
+                )
+                ticker_eff, ticker_src, ticker_rows = resolve_price_ticker(
+                    prices_path=prices_path,
+                    requested_ticker=str(config.get("risk_ticker", "AUTO")),
+                    min_rows=max(64, max(risk_horizons)),
+                )
+                risk_targets_by_horizon = []
+                for horizon in risk_horizons:
+                    targets_h, _, _ = _compute_risk_targets(
+                        prices_path=prices_path,
+                        ticker=str(ticker_eff),
+                        dates=list(graph_dates),
+                        horizon=int(horizon),
+                        standardize=bool(config.get("risk_standardize", True)),
+                        max_abs_logret=float(config.get("risk_max_abs_logret", 0.5)),
+                        cache_dir=str(config.get("risk_cache_dir", "runs/cache")),
+                    )
+                    risk_targets_by_horizon.append(targets_h)
+                if not risk_targets_by_horizon:
+                    raise ValueError("no valid risk targets resolved")
+                config["risk_targets_by_horizon"] = risk_targets_by_horizon
+                config["risk_horizons_effective"] = risk_horizons
+                config["risk_ticker_effective"] = str(ticker_eff)
+                print(
+                    "risk ticker: "
+                    f"requested={config.get('risk_ticker')} "
+                    f"effective={ticker_eff} source={ticker_src} rows={ticker_rows} "
+                    f"horizons={risk_horizons}"
+                )
+            except Exception as exc:
+                config["risk_head_enabled"] = False
+                print(f"warning: disabled risk_head in benchmark: {exc}")
 
     mode_overrides = bench_cfg.get("mode_overrides", {})
     if not isinstance(mode_overrides, dict):
