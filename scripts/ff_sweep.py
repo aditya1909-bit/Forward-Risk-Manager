@@ -11,6 +11,7 @@ import sys
 import tomllib
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
@@ -20,7 +21,13 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.models import GCNEncoder
+from frisk.models import (
+    CompositeEnergyCritic,
+    EnergyCritic,
+    EnergyCriticEnsemble,
+    GCNEncoder,
+    SequenceEnergyCritic,
+)
 from frisk.ff import (
     ff_loss,
     goodness,
@@ -36,6 +43,7 @@ from frisk.eval_metrics import ff_binary_metrics
 from frisk.econ_eval import (
     evaluate_goodness_strategy,
     infer_graph_goodness,
+    infer_graph_goodness_with_uncertainty,
     load_forward_returns_from_prices,
     resolve_price_ticker,
 )
@@ -52,6 +60,7 @@ _NEG_AUG_MODES = {
     "block_bootstrap",
     "cross_asset_mix",
     "phase_randomize",
+    "edge_attack",
 }
 
 
@@ -148,6 +157,69 @@ def _optimizer_step(optim, loss: torch.Tensor, grad_clip: float, clip_params, sc
 
 def _sync(device: torch.device) -> None:
     sync_device(device)
+
+
+def _build_critic(cfg: dict, hidden_dim: int, device: torch.device):
+    critic_hidden_dim = max(1, int(cfg.get("critic_hidden_dim", hidden_dim)))
+    critic_num_layers = max(1, int(cfg.get("critic_num_layers", 2)))
+    critic_dropout = max(0.0, float(cfg.get("critic_dropout", cfg.get("dropout", 0.1))))
+    critic_positive = str(cfg.get("critic_positive_activation", "softplus")).strip().lower()
+    if critic_positive not in {"softplus", "square"}:
+        critic_positive = "softplus"
+
+    ensemble_size = max(1, int(cfg.get("critic_ensemble_size", 1)))
+    seed_base = int(cfg.get("seed", 7))
+    seed_stride = max(1, int(cfg.get("critic_ensemble_seed_stride", 1009)))
+    critics = []
+    for i in range(ensemble_size):
+        if ensemble_size > 1:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed_base + i * seed_stride)
+                member = EnergyCritic(
+                    in_dim=hidden_dim,
+                    hidden_dim=critic_hidden_dim,
+                    num_layers=critic_num_layers,
+                    dropout=critic_dropout,
+                    positive_activation=critic_positive,
+                )
+        else:
+            member = EnergyCritic(
+                in_dim=hidden_dim,
+                hidden_dim=critic_hidden_dim,
+                num_layers=critic_num_layers,
+                dropout=critic_dropout,
+                positive_activation=critic_positive,
+            )
+        critics.append(member.to(device))
+
+    if len(critics) == 1:
+        base_critic = critics[0]
+    else:
+        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
+
+    seq_enabled = bool(cfg.get("sequence_critic_enabled", False))
+    if not seq_enabled:
+        return base_critic
+
+    seq_hidden = max(1, int(cfg.get("sequence_critic_hidden_dim", hidden_dim)))
+    seq_layers = max(1, int(cfg.get("sequence_critic_num_layers", 1)))
+    seq_dropout = max(0.0, float(cfg.get("sequence_critic_dropout", 0.0)))
+    seq_positive = str(cfg.get("sequence_critic_positive_activation", "softplus")).strip().lower()
+    if seq_positive not in {"softplus", "square"}:
+        seq_positive = "softplus"
+    seq_weight = float(cfg.get("sequence_critic_weight", 0.0))
+    seq_critic = SequenceEnergyCritic(
+        in_dim=hidden_dim,
+        hidden_dim=seq_hidden,
+        num_layers=seq_layers,
+        dropout=seq_dropout,
+        positive_activation=seq_positive,
+    ).to(device)
+    return CompositeEnergyCritic(
+        base_critic=base_critic,
+        sequence_critic=seq_critic,
+        sequence_weight=seq_weight,
+    ).to(device)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -384,12 +456,61 @@ def _make_negatives(
     use_mode,
     noise_std,
     hall_cfg: HallucinationConfig,
+    critic=None,
     forward_fn=None,
     window_len: int | None = None,
     summary_dim: int = 0,
 ):
     if use_mode == "self_contrastive":
         use_mode = "shuffle"
+    if use_mode == "edge_attack":
+        out = make_negative(
+            x,
+            batch,
+            mode="shuffle+noise",
+            noise_std=max(0.0, float(noise_std)),
+            window_len=window_len,
+            summary_dim=summary_dim,
+        )
+        if out.numel() == 0:
+            return out
+        hub_frac = float(getattr(hall_cfg, "adversarial_hub_fraction", 0.2))
+        noise_mult = float(getattr(hall_cfg, "adversarial_feature_noise_mult", 3.0))
+        flip_prob = float(getattr(hall_cfg, "adversarial_timeflip_prob", 0.5))
+        hub_frac = max(0.0, min(1.0, hub_frac))
+        noise_mult = max(1.0, noise_mult)
+        flip_prob = max(0.0, min(1.0, flip_prob))
+        if hub_frac <= 0:
+            return out
+        row = edge_index[0]
+        col = edge_index[1]
+        deg = torch.zeros(out.size(0), device=out.device, dtype=out.dtype)
+        deg.scatter_add_(0, row, torch.ones_like(row, dtype=out.dtype))
+        deg.scatter_add_(0, col, torch.ones_like(col, dtype=out.dtype))
+        out_adv = out.clone()
+        for gid in batch.unique():
+            idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            k = max(1, int(idx.numel() * hub_frac))
+            k = min(int(idx.numel()), int(k))
+            if k <= 0:
+                continue
+            local_deg = deg.index_select(0, idx)
+            top_local = torch.topk(local_deg, k=k, largest=True).indices
+            hub_idx = idx.index_select(0, top_local)
+            out_adv.index_add_(
+                0,
+                hub_idx,
+                (max(0.0, float(noise_std)) * noise_mult) * torch.randn_like(out_adv.index_select(0, hub_idx)),
+            )
+            if flip_prob > 0 and torch.rand((), device=out.device).item() < flip_prob:
+                if window_len is not None and int(window_len) > 1 and out_adv.size(1) >= int(window_len):
+                    wlen = int(window_len)
+                    out_adv[hub_idx, :wlen] = torch.flip(out_adv[hub_idx, :wlen], dims=[1])
+                elif out_adv.size(1) > 1:
+                    out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
+        return out_adv
     if use_mode == "hallucinate":
         return hallucinate_negative(
             model,
@@ -400,6 +521,7 @@ def _make_negatives(
             hall_cfg,
             edge_weight=edge_weight,
             forward_fn=forward_fn,
+            critic=critic,
         )
     return make_negative(
         x,
@@ -471,6 +593,7 @@ def _self_contrastive_step(
 
 def _eval_ff_metrics(
     model,
+    critic,
     loader,
     goodness_temp,
     goodness_target,
@@ -558,7 +681,7 @@ def _eval_ff_metrics(
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
         if eval_mode == "hallucinate":
             with torch.enable_grad():
@@ -572,6 +695,7 @@ def _eval_ff_metrics(
                     eval_mode,
                     noise_std,
                     hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
@@ -587,13 +711,14 @@ def _eval_ff_metrics(
                     eval_mode,
                     noise_std,
                     hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
 
         with torch.no_grad():
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
             pred_pos = (g_pos > goodness_target)
             pred_neg = (g_neg <= goodness_target)
             acc_num += (pred_pos.sum() + pred_neg.sum()).item()
@@ -694,6 +819,8 @@ def _aggregate_fold_rows(rows: list[dict]) -> dict:
             mean_val, std_val = _mean_std(vals)
             out[key] = mean_val
             out[f"{key}_std"] = std_val
+            out[f"{key}_min"] = float(np.min(vals))
+            out[f"{key}_max"] = float(np.max(vals))
     first = rows[0]
     for key in (
         "eval_objective",
@@ -713,6 +840,7 @@ def _aggregate_fold_rows(rows: list[dict]) -> dict:
 
 def _compute_econ_metrics_for_eval(
     model,
+    critic,
     eval_graphs,
     eval_dates,
     cfg: dict,
@@ -730,14 +858,31 @@ def _compute_econ_metrics_for_eval(
     fwd_ret_1 = cfg.get("econ_fwd_ret_1")
     if fwd_ret_1 is None:
         return meta
-    g = infer_graph_goodness(
+    g, g_unc = infer_graph_goodness_with_uncertainty(
         model,
         eval_graphs,
         goodness_temp=float(cfg.get("goodness_temp", 1.0)),
         batch_size=int(cfg.get("econ_loader_batch_size", cfg.get("batch_size", 64))),
+        critic=critic,
     )
     if g.size == 0:
         return meta
+    risk_signal = None
+    if bool(cfg.get("econ_regime_gate_enabled", False)):
+        rgw = max(10, int(cfg.get("econ_regime_gate_window", 63)))
+        g_ser = np.asarray(g, dtype=float)
+        if g_ser.size > 0:
+            g_roll_mean = np.asarray(
+                pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).mean(),
+                dtype=float,
+            )
+            g_roll_std = np.asarray(
+                pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).std(),
+                dtype=float,
+            )
+            risk_signal = (g_roll_mean - g_ser) / (g_roll_std + 1e-8)
+            if g_unc is not None and g_unc.shape[0] == risk_signal.shape[0]:
+                risk_signal = risk_signal + np.nan_to_num(np.asarray(g_unc, dtype=float), nan=0.0)
     out = evaluate_goodness_strategy(
         eval_dates,
         g,
@@ -749,6 +894,15 @@ def _compute_econ_metrics_for_eval(
         slippage_vol_scale=float(cfg.get("econ_slippage_vol_scale", 0.0)),
         slippage_vol_lookback=int(cfg.get("econ_slippage_vol_lookback", 21)),
         trading_days=int(cfg.get("econ_trading_days", 252)),
+        regime_gate_enabled=bool(cfg.get("econ_regime_gate_enabled", False)),
+        regime_gate_window=int(cfg.get("econ_regime_gate_window", 63)),
+        regime_confidence_temp=float(cfg.get("econ_regime_confidence_temp", 1.0)),
+        regime_neutral_exposure=float(cfg.get("econ_regime_neutral_exposure", 0.0)),
+        regime_min_confidence=float(cfg.get("econ_regime_min_confidence", 0.0)),
+        goodness_uncertainty=g_unc,
+        regime_uncertainty_scale=float(cfg.get("econ_regime_uncertainty_scale", 0.0)),
+        risk_signal=risk_signal,
+        regime_risk_scale=float(cfg.get("econ_regime_risk_scale", 0.0)),
     )
     out.update(meta)
     return out
@@ -814,9 +968,14 @@ def _run_ff_trial(
         train_graphs = list(train_graphs)
         eval_graphs = list(eval_graphs)
         eval_dates = list(eval_dates_override or [])
+    train_shuffle = True
+    if bool(cfg.get("sequence_critic_enabled", False)) and bool(
+        cfg.get("sequence_critic_force_chrono", True)
+    ):
+        train_shuffle = False
     loader_kwargs = {
         "batch_size": cfg["batch_size"],
-        "shuffle": True,
+        "shuffle": train_shuffle,
         "drop_last": False,
         "num_workers": cfg["loader_workers"],
         "pin_memory": bool(cfg.get("pin_memory", False)) if device.type == "cuda" else False,
@@ -837,9 +996,14 @@ def _run_ff_trial(
         dropout=cfg["dropout"],
         conv_type=str(cfg.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(cfg.get("encoder_gat_heads", 2)),
+        residual_edge_enabled=bool(cfg.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(cfg.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(cfg.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(cfg.get("residual_edge_detach_features", True)),
     ).to(device)
+    critic = _build_critic(cfg, hidden_dim=int(cfg["hidden_dim"]), device=device)
     optim = _build_optimizer(
-        model.parameters(),
+        list(model.parameters()) + list(critic.parameters()),
         lr=cfg["lr"],
         device=device,
         use_fused=bool(cfg.get("fused_optimizer", True)),
@@ -873,6 +1037,12 @@ def _run_ff_trial(
         moment_var_weight=float(cfg.get("hall_moment_var", 0.0)),
         moment_skew_weight=float(cfg.get("hall_moment_skew", 0.0)),
         moment_scope=str(cfg.get("hall_moment_scope", "returns")),
+        adversarial_hub_fraction=float(cfg.get("hall_attack_hub_fraction", 0.2)),
+        adversarial_feature_noise_mult=float(cfg.get("hall_attack_noise_mult", 3.0)),
+        adversarial_timeflip_prob=float(cfg.get("hall_attack_timeflip_prob", 0.5)),
+        adversarial_edge_drop_prob=float(cfg.get("hall_attack_edge_drop_prob", 0.2)),
+        adversarial_sign_flip_prob=float(cfg.get("hall_attack_sign_flip_prob", 0.2)),
+        adversarial_hub_weight_scale=float(cfg.get("hall_attack_hub_weight_scale", 0.5)),
     )
     hall_cfg_layer = HallucinationConfig(
         steps=cfg["hall_steps"],
@@ -902,6 +1072,12 @@ def _run_ff_trial(
         moment_var_weight=float(cfg.get("hall_moment_var", 0.0)),
         moment_skew_weight=float(cfg.get("hall_moment_skew", 0.0)),
         moment_scope=str(cfg.get("hall_moment_scope", "returns")),
+        adversarial_hub_fraction=float(cfg.get("hall_attack_hub_fraction", 0.2)),
+        adversarial_feature_noise_mult=float(cfg.get("hall_attack_noise_mult", 3.0)),
+        adversarial_timeflip_prob=float(cfg.get("hall_attack_timeflip_prob", 0.5)),
+        adversarial_edge_drop_prob=float(cfg.get("hall_attack_edge_drop_prob", 0.2)),
+        adversarial_sign_flip_prob=float(cfg.get("hall_attack_sign_flip_prob", 0.2)),
+        adversarial_hub_weight_scale=float(cfg.get("hall_attack_hub_weight_scale", 0.5)),
     )
     sc_temp = float(cfg.get("self_contrastive_temp", 0.2))
     sc_ff_weight = max(0.0, float(cfg.get("self_contrastive_ff_weight", 0.0)))
@@ -934,7 +1110,7 @@ def _run_ff_trial(
     ff_block_endpoints = (
         _block_endpoint_indices(len(model.layers), ff_block_size) if ff_blockwise else []
     )
-    clip_params = tuple(model.parameters())
+    clip_params = tuple(list(model.parameters()) + list(critic.parameters()))
     amp_enabled = bool(cfg.get("amp", True)) and device.type == "cuda"
     amp_dtype = _parse_amp_dtype(cfg.get("amp_dtype", "float16"))
     if amp_enabled and amp_dtype == torch.bfloat16:
@@ -948,6 +1124,7 @@ def _run_ff_trial(
     epoch_times = []
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
+        critic.train()
         t0 = time.perf_counter()
         graphs_seen = 0
         for batch_idx, batch in enumerate(loader, start=1):
@@ -982,6 +1159,7 @@ def _run_ff_trial(
                             layer_mode,
                             cfg["noise_std"],
                             hall_cfg_layer,
+                            critic=critic,
                             window_len=cfg.get("window_len"),
                             summary_dim=cfg.get("summary_dim", 0),
                         )
@@ -996,6 +1174,7 @@ def _run_ff_trial(
                             cfg["layerwise_neg_mode"],
                             cfg["layerwise_noise_std"],
                             hall_cfg,
+                            critic=critic,
                             window_len=cfg.get("window_len"),
                             summary_dim=cfg.get("summary_dim", 0),
                         )
@@ -1006,10 +1185,16 @@ def _run_ff_trial(
                         last_idx = ff_block_endpoints[-1]
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             g_pos_probe = goodness(
-                                layers_pos[last_idx], batch.batch, temperature=cfg["goodness_temp"]
+                                layers_pos[last_idx],
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
                             ).mean().item()
                             g_neg_probe = goodness(
-                                layers_neg[last_idx], batch.batch, temperature=cfg["goodness_temp"]
+                                layers_neg[last_idx],
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
                             ).mean().item()
                         if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
                             x_neg = make_negative(
@@ -1028,8 +1213,18 @@ def _run_ff_trial(
                     loss = 0.0
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         for li in ff_block_endpoints:
-                            g_pos = goodness(layers_pos[li], batch.batch, temperature=cfg["goodness_temp"])
-                            g_neg = goodness(layers_neg[li], batch.batch, temperature=cfg["goodness_temp"])
+                            g_pos = goodness(
+                                layers_pos[li],
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
+                            )
+                            g_neg = goodness(
+                                layers_neg[li],
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
+                            )
                             loss = loss + ff_loss(
                                 g_pos,
                                 g_neg,
@@ -1055,7 +1250,12 @@ def _run_ff_trial(
                             layer_mode = "shuffle"
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
-                            g_pos = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
+                            g_pos = goodness(
+                                h_pos,
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
+                            )
 
                         if layer_mode == "hallucinate":
                             forward_fn = lambda x_var, li=li: model.forward_layer(
@@ -1071,6 +1271,7 @@ def _run_ff_trial(
                                 layer_mode,
                                 cfg["noise_std"],
                                 hall_cfg_layer,
+                                critic=critic,
                                 forward_fn=forward_fn,
                                 window_len=cfg.get("window_len"),
                                 summary_dim=cfg.get("summary_dim", 0),
@@ -1086,6 +1287,7 @@ def _run_ff_trial(
                                 cfg["layerwise_neg_mode"],
                                 cfg["layerwise_noise_std"],
                                 hall_cfg,
+                                critic=critic,
                                 window_len=cfg.get("window_len"),
                                 summary_dim=cfg.get("summary_dim", 0),
                             )
@@ -1094,7 +1296,10 @@ def _run_ff_trial(
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
                                 h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
                                 g_neg_probe = goodness(
-                                    h_neg_probe, batch.batch, temperature=cfg["goodness_temp"]
+                                    h_neg_probe,
+                                    batch.batch,
+                                    temperature=cfg["goodness_temp"],
+                                    critic=critic,
                                 ).mean().item()
                             g_pos_probe = g_pos.mean().item()
                             if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
@@ -1104,7 +1309,12 @@ def _run_ff_trial(
 
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                            g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
+                            g_neg = goodness(
+                                h_neg,
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
+                            )
                             loss = ff_loss(
                                 g_pos,
                                 g_neg,
@@ -1160,8 +1370,18 @@ def _run_ff_trial(
                                 summary_dim=cfg.get("summary_dim", 0),
                             )
                             h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
-                            g_pos_aux = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
-                            g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=cfg["goodness_temp"])
+                            g_pos_aux = goodness(
+                                h_pos,
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
+                            )
+                            g_neg_aux = goodness(
+                                h_neg_aux,
+                                batch.batch,
+                                temperature=cfg["goodness_temp"],
+                                critic=critic,
+                            )
                             loss = loss + sc_ff_weight * ff_loss(
                                 g_pos_aux,
                                 g_neg_aux,
@@ -1171,7 +1391,12 @@ def _run_ff_trial(
                             )
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                    g_pos = goodness(h_pos, batch.batch, temperature=cfg["goodness_temp"])
+                    g_pos = goodness(
+                        h_pos,
+                        batch.batch,
+                        temperature=cfg["goodness_temp"],
+                        critic=critic,
+                    )
                     x_neg = _make_negatives(
                         model,
                         x,
@@ -1182,6 +1407,7 @@ def _run_ff_trial(
                         use_mode,
                         cfg["noise_std"],
                         hall_cfg,
+                        critic=critic,
                         window_len=cfg.get("window_len"),
                         summary_dim=cfg.get("summary_dim", 0),
                     )
@@ -1189,14 +1415,22 @@ def _run_ff_trial(
                     if use_mode == "hallucinate":
                         h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
                         g_neg_probe = goodness(
-                            h_neg_probe, batch.batch, temperature=cfg["goodness_temp"]
+                            h_neg_probe,
+                            batch.batch,
+                            temperature=cfg["goodness_temp"],
+                            critic=critic,
                         ).mean().item()
                         g_pos_probe = g_pos.mean().item()
                         if g_neg_probe > g_pos_probe + cfg["neg_gate_margin"]:
                             x_neg = make_negative(x, batch.batch, mode="shuffle", noise_std=cfg["noise_std"])
 
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                    g_neg = goodness(h_neg, batch.batch, temperature=cfg["goodness_temp"])
+                    g_neg = goodness(
+                        h_neg,
+                        batch.batch,
+                        temperature=cfg["goodness_temp"],
+                        critic=critic,
+                    )
                     loss = ff_loss(
                         g_pos,
                         g_neg,
@@ -1230,6 +1464,7 @@ def _run_ff_trial(
 
     eval_metrics = _eval_ff_metrics(
         model,
+        critic,
         eval_loader,
         cfg["goodness_temp"],
         cfg["goodness_target"],
@@ -1256,6 +1491,7 @@ def _run_ff_trial(
     out.update(eval_metrics)
     econ = _compute_econ_metrics_for_eval(
         model,
+        critic,
         eval_graphs,
         eval_dates,
         cfg,
@@ -1277,6 +1513,7 @@ def _run_ff_trial(
                 continue
             mode_metrics = _eval_ff_metrics(
                 model,
+                critic,
                 eval_loader,
                 cfg["goodness_temp"],
                 cfg["goodness_target"],
@@ -1366,6 +1603,27 @@ def main() -> int:
         "hidden_dim": int(train_cfg.get("hidden_dim", 64)),
         "num_layers": int(train_cfg.get("num_layers", 2)),
         "dropout": float(train_cfg.get("dropout", 0.1)),
+        "critic_hidden_dim": int(train_cfg.get("critic_hidden_dim", train_cfg.get("hidden_dim", 64))),
+        "critic_num_layers": int(train_cfg.get("critic_num_layers", 2)),
+        "critic_dropout": float(train_cfg.get("critic_dropout", train_cfg.get("dropout", 0.1))),
+        "critic_positive_activation": str(train_cfg.get("critic_positive_activation", "softplus")),
+        "critic_ensemble_size": int(train_cfg.get("critic_ensemble_size", 1)),
+        "critic_ensemble_seed_stride": int(train_cfg.get("critic_ensemble_seed_stride", 1009)),
+        "sequence_critic_enabled": bool(train_cfg.get("sequence_critic_enabled", False)),
+        "sequence_critic_weight": float(train_cfg.get("sequence_critic_weight", 0.0)),
+        "sequence_critic_hidden_dim": int(
+            train_cfg.get("sequence_critic_hidden_dim", train_cfg.get("hidden_dim", 64))
+        ),
+        "sequence_critic_num_layers": int(train_cfg.get("sequence_critic_num_layers", 1)),
+        "sequence_critic_dropout": float(train_cfg.get("sequence_critic_dropout", 0.0)),
+        "sequence_critic_positive_activation": str(
+            train_cfg.get("sequence_critic_positive_activation", "softplus")
+        ),
+        "sequence_critic_force_chrono": bool(train_cfg.get("sequence_critic_force_chrono", True)),
+        "residual_edge_weight_enabled": bool(train_cfg.get("residual_edge_weight_enabled", False)),
+        "residual_edge_hidden_dim": int(train_cfg.get("residual_edge_hidden_dim", 32)),
+        "residual_edge_max_delta": float(train_cfg.get("residual_edge_max_delta", 0.25)),
+        "residual_edge_detach_features": bool(train_cfg.get("residual_edge_detach_features", True)),
         "encoder_conv_type": str(train_cfg.get("encoder_conv_type", "gcn")),
         "encoder_gat_heads": int(train_cfg.get("encoder_gat_heads", 2)),
         "lr": float(train_cfg.get("lr", 1e-3)),
@@ -1465,6 +1723,12 @@ def main() -> int:
         "hall_moment_var": float(train_cfg.get("hallucinate_moment_var", 0.0)),
         "hall_moment_skew": float(train_cfg.get("hallucinate_moment_skew", 0.0)),
         "hall_moment_scope": str(train_cfg.get("hallucinate_moment_scope", "returns")),
+        "hall_attack_hub_fraction": float(train_cfg.get("hall_attack_hub_fraction", 0.2)),
+        "hall_attack_noise_mult": float(train_cfg.get("hall_attack_noise_mult", 3.0)),
+        "hall_attack_timeflip_prob": float(train_cfg.get("hall_attack_timeflip_prob", 0.5)),
+        "hall_attack_edge_drop_prob": float(train_cfg.get("hall_attack_edge_drop_prob", 0.2)),
+        "hall_attack_sign_flip_prob": float(train_cfg.get("hall_attack_sign_flip_prob", 0.2)),
+        "hall_attack_hub_weight_scale": float(train_cfg.get("hall_attack_hub_weight_scale", 0.5)),
         "neg_gate_margin": float(train_cfg.get("neg_gate_margin", 1.0)),
         "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "auto")),
         "eval_neg_modes": sweep_cfg.get("eval_neg_modes", []),
@@ -1488,6 +1752,13 @@ def main() -> int:
         "econ_slippage_bps": float(sweep_cfg.get("econ_slippage_bps", 0.0)),
         "econ_slippage_vol_scale": float(sweep_cfg.get("econ_slippage_vol_scale", 0.0)),
         "econ_slippage_vol_lookback": int(sweep_cfg.get("econ_slippage_vol_lookback", 21)),
+        "econ_regime_gate_enabled": bool(sweep_cfg.get("econ_regime_gate_enabled", False)),
+        "econ_regime_gate_window": int(sweep_cfg.get("econ_regime_gate_window", 63)),
+        "econ_regime_confidence_temp": float(sweep_cfg.get("econ_regime_confidence_temp", 1.0)),
+        "econ_regime_neutral_exposure": float(sweep_cfg.get("econ_regime_neutral_exposure", 0.0)),
+        "econ_regime_min_confidence": float(sweep_cfg.get("econ_regime_min_confidence", 0.0)),
+        "econ_regime_uncertainty_scale": float(sweep_cfg.get("econ_regime_uncertainty_scale", 0.0)),
+        "econ_regime_risk_scale": float(sweep_cfg.get("econ_regime_risk_scale", 0.0)),
         "econ_loader_batch_size": int(sweep_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(sweep_cfg.get("econ_trading_days", 252)),
     }
@@ -1558,6 +1829,10 @@ def main() -> int:
         "worker_loader_workers",
         "mode_overrides",
         "rank_mode",
+        "stability_penalty",
+        "stability_penalty_lambda",
+        "econ_sharpe_uplift_min_floor",
+        "rank_gate_penalty",
         "econ_enabled",
         "econ_ticker",
         "econ_prices",
@@ -1568,6 +1843,13 @@ def main() -> int:
         "econ_slippage_bps",
         "econ_slippage_vol_scale",
         "econ_slippage_vol_lookback",
+        "econ_regime_gate_enabled",
+        "econ_regime_gate_window",
+        "econ_regime_confidence_temp",
+        "econ_regime_neutral_exposure",
+        "econ_regime_min_confidence",
+        "econ_regime_uncertainty_scale",
+        "econ_regime_risk_scale",
         "econ_loader_batch_size",
         "econ_trading_days",
     }
@@ -1694,6 +1976,12 @@ def main() -> int:
                     "hall_steps",
                     "hall_lr",
                     "hall_node_fraction",
+                    "hall_attack_hub_fraction",
+                    "hall_attack_noise_mult",
+                    "hall_attack_timeflip_prob",
+                    "hall_attack_edge_drop_prob",
+                    "hall_attack_sign_flip_prob",
+                    "hall_attack_hub_weight_scale",
                     "layerwise_neg_mode",
                     "layerwise_noise_std",
                     "layerwise_hall_corr",
@@ -1711,6 +1999,23 @@ def main() -> int:
                     "fused_optimizer",
                     "ff_blockwise",
                     "ff_block_size",
+                    "critic_hidden_dim",
+                    "critic_num_layers",
+                    "critic_dropout",
+                    "critic_positive_activation",
+                    "critic_ensemble_size",
+                    "critic_ensemble_seed_stride",
+                    "sequence_critic_enabled",
+                    "sequence_critic_weight",
+                    "sequence_critic_hidden_dim",
+                    "sequence_critic_num_layers",
+                    "sequence_critic_dropout",
+                    "sequence_critic_positive_activation",
+                    "sequence_critic_force_chrono",
+                    "residual_edge_weight_enabled",
+                    "residual_edge_hidden_dim",
+                    "residual_edge_max_delta",
+                    "residual_edge_detach_features",
                 ):
                     if k in cfg_mode:
                         res[k] = cfg_mode[k]
@@ -1737,6 +2042,12 @@ def main() -> int:
                         "hall_steps",
                         "hall_lr",
                         "hall_node_fraction",
+                        "hall_attack_hub_fraction",
+                        "hall_attack_noise_mult",
+                        "hall_attack_timeflip_prob",
+                        "hall_attack_edge_drop_prob",
+                        "hall_attack_sign_flip_prob",
+                        "hall_attack_hub_weight_scale",
                         "layerwise_neg_mode",
                         "layerwise_noise_std",
                         "layerwise_hall_corr",
@@ -1754,6 +2065,23 @@ def main() -> int:
                         "fused_optimizer",
                         "ff_blockwise",
                         "ff_block_size",
+                        "critic_hidden_dim",
+                        "critic_num_layers",
+                        "critic_dropout",
+                        "critic_positive_activation",
+                        "critic_ensemble_size",
+                        "critic_ensemble_seed_stride",
+                        "sequence_critic_enabled",
+                        "sequence_critic_weight",
+                        "sequence_critic_hidden_dim",
+                        "sequence_critic_num_layers",
+                        "sequence_critic_dropout",
+                        "sequence_critic_positive_activation",
+                        "sequence_critic_force_chrono",
+                        "residual_edge_weight_enabled",
+                        "residual_edge_hidden_dim",
+                        "residual_edge_max_delta",
+                        "residual_edge_detach_features",
                     ):
                         if k in cfg_mode:
                             res[k] = cfg_mode[k]
@@ -1778,6 +2106,12 @@ def main() -> int:
                         "hall_steps",
                         "hall_lr",
                         "hall_node_fraction",
+                        "hall_attack_hub_fraction",
+                        "hall_attack_noise_mult",
+                        "hall_attack_timeflip_prob",
+                        "hall_attack_edge_drop_prob",
+                        "hall_attack_sign_flip_prob",
+                        "hall_attack_hub_weight_scale",
                         "layerwise_neg_mode",
                         "layerwise_noise_std",
                         "layerwise_hall_corr",
@@ -1795,6 +2129,23 @@ def main() -> int:
                         "fused_optimizer",
                         "ff_blockwise",
                         "ff_block_size",
+                        "critic_hidden_dim",
+                        "critic_num_layers",
+                        "critic_dropout",
+                        "critic_positive_activation",
+                        "critic_ensemble_size",
+                        "critic_ensemble_seed_stride",
+                        "sequence_critic_enabled",
+                        "sequence_critic_weight",
+                        "sequence_critic_hidden_dim",
+                        "sequence_critic_num_layers",
+                        "sequence_critic_dropout",
+                        "sequence_critic_positive_activation",
+                        "sequence_critic_force_chrono",
+                        "residual_edge_weight_enabled",
+                        "residual_edge_hidden_dim",
+                        "residual_edge_max_delta",
+                        "residual_edge_detach_features",
                     ):
                         if k in cfg_mode:
                             res[k] = cfg_mode[k]
@@ -1805,11 +2156,42 @@ def main() -> int:
     if results:
         default_rank_mode = "finance_first" if bool(base.get("econ_enabled", False)) else "objective"
         rank_mode = str(sweep_cfg.get("rank_mode", default_rank_mode))
+        rank_mode_norm = rank_mode.strip().lower()
+        finance_rank = rank_mode_norm in {"finance_first", "economic", "econ"}
+        stability_penalty = bool(sweep_cfg.get("stability_penalty", finance_rank))
+        stability_lambda = max(0.0, float(sweep_cfg.get("stability_penalty_lambda", 0.5)))
+        rank_gate_floor = _to_float(sweep_cfg.get("econ_sharpe_uplift_min_floor"), float("nan"))
+        rank_gate_penalty = abs(float(sweep_cfg.get("rank_gate_penalty", 1e6)))
         for r in results:
             rank_metric, rank_value = _objective_rank_metric(r, rank_mode=rank_mode)
+            rank_base_metric = rank_metric
+            rank_base_value = rank_value
+            gate_failed = False
+
+            if finance_rank and stability_penalty:
+                sharpe_mean = _to_float(r.get("econ_sharpe_uplift"), float("nan"))
+                sharpe_std = _to_float(r.get("econ_sharpe_uplift_std"), float("nan"))
+                if np.isfinite(sharpe_mean) and np.isfinite(sharpe_std):
+                    rank_metric = "econ_sharpe_uplift_stability_adj"
+                    rank_value = sharpe_mean - stability_lambda * max(0.0, sharpe_std)
+                    r["econ_sharpe_uplift_stability_adj"] = rank_value
+                    r["econ_sharpe_uplift_stability_lambda"] = stability_lambda
+
+            if finance_rank and np.isfinite(rank_gate_floor):
+                floor_metric = _to_float(r.get("econ_sharpe_uplift_min"), float("nan"))
+                if np.isfinite(floor_metric) and floor_metric < rank_gate_floor:
+                    gate_failed = True
+                    rank_value = rank_value - rank_gate_penalty
+                    r["rank_gate_metric"] = "econ_sharpe_uplift_min"
+                    r["rank_gate_floor"] = float(rank_gate_floor)
+                    r["rank_gate_value"] = float(floor_metric)
+
+            r["rank_base_metric"] = rank_base_metric
+            r["rank_base_value"] = rank_base_value
             r["rank_metric"] = rank_metric
             r["rank_value"] = rank_value
             r["rank_mode"] = rank_mode
+            r["rank_gate_failed"] = int(gate_failed)
 
         econ_metric_name = str(sweep_cfg.get("composite_econ_metric", "econ_sharpe_uplift"))
         sep_metric_name = str(sweep_cfg.get("composite_sep_metric", "eval_sep"))

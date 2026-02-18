@@ -13,6 +13,7 @@ import sys
 import tomllib
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
@@ -22,7 +23,13 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.models import GCNEncoder
+from frisk.models import (
+    CompositeEnergyCritic,
+    EnergyCritic,
+    EnergyCriticEnsemble,
+    GCNEncoder,
+    SequenceEnergyCritic,
+)
 from frisk.ff import (
     ff_loss,
     goodness,
@@ -49,6 +56,7 @@ from frisk.splits import (
 from frisk.econ_eval import (
     evaluate_goodness_strategy,
     infer_graph_goodness,
+    infer_graph_goodness_with_uncertainty,
     load_forward_returns_from_prices,
     resolve_price_ticker,
 )
@@ -63,8 +71,10 @@ _NEG_AUG_MODES = {
     "block_bootstrap",
     "cross_asset_mix",
     "phase_randomize",
+    "edge_attack",
 }
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+_PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 
 
 def _parse_positive_int_list(value, fallback: int) -> list[int]:
@@ -235,6 +245,196 @@ def _compute_risk_targets(
     return result
 
 
+def _compute_forward_return_targets(
+    prices_path: str,
+    ticker: str,
+    dates: list[str],
+    horizon: int,
+    standardize: bool,
+    max_abs_logret: float,
+    cache_dir: str | None = "runs/cache",
+) -> tuple[list[float | None], float, float]:
+    prices_file = Path(prices_path)
+    try:
+        st = prices_file.stat()
+        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        file_sig = "missing"
+    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha1(
+        "|".join(
+            [
+                "portfolio_targets",
+                str(prices_file.resolve()),
+                str(ticker).upper(),
+                str(horizon),
+                str(int(bool(standardize))),
+                f"{float(max_abs_logret):.8f}",
+                file_sig,
+                dates_hash,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+    cached = _PORT_TARGET_MEM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cache_path: Path | None = None
+    if cache_dir:
+        cache_path = Path(cache_dir) / f"portfolio_targets_{cache_key}.pt"
+        if cache_path.exists():
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                targets = payload["targets"]
+                mean = float(payload["mean"])
+                std = float(payload["std"])
+                result = (targets, mean, std)
+                _PORT_TARGET_MEM_CACHE[cache_key] = result
+                return result
+            except Exception:
+                pass
+
+    prices_by_date: dict[str, list[float]] = {}
+    ticker_norm = str(ticker).upper()
+    with Path(prices_path).open() as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames:
+            raise ValueError("prices.csv missing header")
+        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
+        for row in r:
+            if str(row.get("ticker", "")).upper() != ticker_norm:
+                continue
+            date = row.get("date")
+            if not date:
+                continue
+            val = row.get(price_col, "")
+            if not val:
+                continue
+            try:
+                price = float(val)
+            except ValueError:
+                continue
+            if not math.isfinite(price) or price <= 0:
+                continue
+            prices_by_date.setdefault(date, []).append(price)
+    prices: list[tuple[str, float]] = []
+    for date, vals in prices_by_date.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        mid = len(vals_sorted) // 2
+        if len(vals_sorted) % 2 == 1:
+            px = vals_sorted[mid]
+        else:
+            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+        prices.append((date, float(px)))
+    if not prices:
+        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
+
+    prices.sort(key=lambda x: x[0])
+    date_list = [d for d, _ in prices]
+    price_list = [p for _, p in prices]
+    log_returns = []
+    clip = float(max_abs_logret)
+    for i in range(len(price_list) - 1):
+        if price_list[i] <= 0 or price_list[i + 1] <= 0:
+            log_returns.append(0.0)
+            continue
+        ret = math.log(price_list[i + 1] / price_list[i])
+        if clip > 0 and abs(ret) > clip:
+            ret = math.copysign(clip, ret)
+        log_returns.append(ret)
+    idx_map = {d: i for i, d in enumerate(date_list)}
+
+    targets: list[float | None] = []
+    horizon = max(1, int(horizon))
+    for d in dates:
+        idx = idx_map.get(d)
+        if idx is None:
+            targets.append(None)
+            continue
+        if idx + horizon > len(log_returns):
+            targets.append(None)
+            continue
+        window = log_returns[idx : idx + horizon]
+        if not window:
+            targets.append(None)
+            continue
+        cum_log = float(sum(window))
+        targets.append(float(math.exp(cum_log) - 1.0))
+
+    finite = [t for t in targets if t is not None]
+    if not finite:
+        result = (targets, 0.0, 1.0)
+        _PORT_TARGET_MEM_CACHE[cache_key] = result
+        return result
+    mean = sum(finite) / len(finite)
+    var = sum((x - mean) ** 2 for x in finite) / len(finite)
+    std = math.sqrt(var) if var > 0 else 1.0
+
+    if standardize:
+        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
+    result = (targets, mean, std)
+    _PORT_TARGET_MEM_CACHE[cache_key] = result
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
+        except Exception:
+            pass
+    return result
+
+
+def _compute_portfolio_head_loss(
+    portfolio_head: torch.nn.Module,
+    embeddings: torch.Tensor,
+    graph_idx,
+    portfolio_targets: list[float | None],
+    device: torch.device,
+    loss_type: str,
+) -> torch.Tensor | None:
+    if not portfolio_targets:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+    target_vals = []
+    for gi in idx_list:
+        if 0 <= gi < len(portfolio_targets):
+            tv = portfolio_targets[gi]
+        else:
+            tv = None
+        target_vals.append(float(tv) if tv is not None else float("nan"))
+    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
+    mask = torch.isfinite(target)
+    if not mask.any():
+        return None
+
+    pred_raw = portfolio_head(embeddings)
+    if pred_raw.ndim == 2 and pred_raw.size(1) == 1:
+        pred_raw = pred_raw.squeeze(1)
+    if pred_raw.ndim != 1:
+        raise RuntimeError(f"portfolio head output shape mismatch: {tuple(pred_raw.shape)}")
+    pred = torch.tanh(pred_raw)
+
+    loss_mode = str(loss_type).strip().lower()
+    if loss_mode == "mse":
+        return torch.nn.functional.mse_loss(pred[mask], target[mask])
+
+    pnl = pred[mask] * target[mask]
+    if pnl.numel() == 0:
+        return None
+    if pnl.numel() == 1:
+        return -pnl.mean()
+    mean = pnl.mean()
+    std = pnl.std(unbiased=False) + 1e-6
+    return -(mean / std)
+
+
 def _compute_multi_horizon_risk_loss(
     risk_head: torch.nn.Module,
     embeddings: torch.Tensor,
@@ -403,6 +603,8 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
             mean_val, std_val = _mean_std(vals)
             out[key] = mean_val
             out[f"{key}_std"] = std_val
+            out[f"{key}_min"] = float(np.min(vals))
+            out[f"{key}_max"] = float(np.max(vals))
     first = fold_rows[0]
     for key in (
         "eval_objective",
@@ -412,6 +614,7 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
         "neg_mode_effective",
         "eval_neg_mode_effective",
         "risk_head_enabled_effective",
+        "portfolio_head_enabled_effective",
     ):
         if key in first:
             out[key] = first[key]
@@ -422,6 +625,7 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
 
 def _compute_econ_metrics_for_eval(
     model,
+    critic,
     eval_graphs,
     eval_dates,
     config: dict,
@@ -439,14 +643,31 @@ def _compute_econ_metrics_for_eval(
     fwd_ret_1 = config.get("econ_fwd_ret_1")
     if fwd_ret_1 is None:
         return meta
-    g = infer_graph_goodness(
+    g, g_unc = infer_graph_goodness_with_uncertainty(
         model,
         eval_graphs,
         goodness_temp=float(config.get("goodness_temp", 1.0)),
         batch_size=int(config.get("econ_loader_batch_size", config.get("batch_size", 64))),
+        critic=critic,
     )
     if g.size == 0:
         return meta
+    risk_signal = None
+    if bool(config.get("econ_regime_gate_enabled", False)):
+        rgw = max(10, int(config.get("econ_regime_gate_window", 63)))
+        g_ser = np.asarray(g, dtype=float)
+        if g_ser.size > 0:
+            g_roll_mean = np.asarray(
+                pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).mean(),
+                dtype=float,
+            )
+            g_roll_std = np.asarray(
+                pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).std(),
+                dtype=float,
+            )
+            risk_signal = (g_roll_mean - g_ser) / (g_roll_std + 1e-8)
+            if g_unc is not None and g_unc.shape[0] == risk_signal.shape[0]:
+                risk_signal = risk_signal + np.nan_to_num(np.asarray(g_unc, dtype=float), nan=0.0)
     out = evaluate_goodness_strategy(
         eval_dates,
         g,
@@ -458,6 +679,15 @@ def _compute_econ_metrics_for_eval(
         slippage_vol_scale=float(config.get("econ_slippage_vol_scale", 0.0)),
         slippage_vol_lookback=int(config.get("econ_slippage_vol_lookback", 21)),
         trading_days=int(config.get("econ_trading_days", 252)),
+        regime_gate_enabled=bool(config.get("econ_regime_gate_enabled", False)),
+        regime_gate_window=int(config.get("econ_regime_gate_window", 63)),
+        regime_confidence_temp=float(config.get("econ_regime_confidence_temp", 1.0)),
+        regime_neutral_exposure=float(config.get("econ_regime_neutral_exposure", 0.0)),
+        regime_min_confidence=float(config.get("econ_regime_min_confidence", 0.0)),
+        goodness_uncertainty=g_unc,
+        regime_uncertainty_scale=float(config.get("econ_regime_uncertainty_scale", 0.0)),
+        risk_signal=risk_signal,
+        regime_risk_scale=float(config.get("econ_regime_risk_scale", 0.0)),
     )
     out.update(meta)
     return out
@@ -535,11 +765,60 @@ def _make_negatives(
     use_mode,
     noise_std,
     hall_cfg: HallucinationConfig,
+    critic=None,
     window_len: int | None = None,
     summary_dim: int = 0,
 ):
     if use_mode == "self_contrastive":
         use_mode = "shuffle"
+    if use_mode == "edge_attack":
+        out = make_negative(
+            x,
+            batch,
+            mode="shuffle+noise",
+            noise_std=max(0.0, float(noise_std)),
+            window_len=window_len,
+            summary_dim=summary_dim,
+        )
+        if out.numel() == 0:
+            return out
+        hub_frac = float(getattr(hall_cfg, "adversarial_hub_fraction", 0.2))
+        noise_mult = float(getattr(hall_cfg, "adversarial_feature_noise_mult", 3.0))
+        flip_prob = float(getattr(hall_cfg, "adversarial_timeflip_prob", 0.5))
+        hub_frac = max(0.0, min(1.0, hub_frac))
+        noise_mult = max(1.0, noise_mult)
+        flip_prob = max(0.0, min(1.0, flip_prob))
+        if hub_frac <= 0:
+            return out
+        row = edge_index[0]
+        col = edge_index[1]
+        deg = torch.zeros(out.size(0), device=out.device, dtype=out.dtype)
+        deg.scatter_add_(0, row, torch.ones_like(row, dtype=out.dtype))
+        deg.scatter_add_(0, col, torch.ones_like(col, dtype=out.dtype))
+        out_adv = out.clone()
+        for gid in batch.unique():
+            idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            k = max(1, int(idx.numel() * hub_frac))
+            k = min(int(idx.numel()), int(k))
+            if k <= 0:
+                continue
+            local_deg = deg.index_select(0, idx)
+            top_local = torch.topk(local_deg, k=k, largest=True).indices
+            hub_idx = idx.index_select(0, top_local)
+            out_adv.index_add_(
+                0,
+                hub_idx,
+                (max(0.0, float(noise_std)) * noise_mult) * torch.randn_like(out_adv.index_select(0, hub_idx)),
+            )
+            if flip_prob > 0 and torch.rand((), device=out.device).item() < flip_prob:
+                if window_len is not None and int(window_len) > 1 and out_adv.size(1) >= int(window_len):
+                    wlen = int(window_len)
+                    out_adv[hub_idx, :wlen] = torch.flip(out_adv[hub_idx, :wlen], dims=[1])
+                elif out_adv.size(1) > 1:
+                    out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
+        return out_adv
     if use_mode == "hallucinate":
         return hallucinate_negative(
             model,
@@ -549,6 +828,7 @@ def _make_negatives(
             batch,
             hall_cfg,
             edge_weight=edge_weight,
+            critic=critic,
         )
     return make_negative(
         x,
@@ -622,8 +902,72 @@ def _sync(device: torch.device) -> None:
     sync_device(device)
 
 
+def _build_critic(config: dict, hidden_dim: int, device: torch.device):
+    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
+    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
+    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
+    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
+    if critic_positive not in {"softplus", "square"}:
+        critic_positive = "softplus"
+
+    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
+    seed_base = int(config.get("seed", 7))
+    seed_stride = max(1, int(config.get("critic_ensemble_seed_stride", 1009)))
+    critics = []
+    for i in range(ensemble_size):
+        if ensemble_size > 1:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed_base + i * seed_stride)
+                member = EnergyCritic(
+                    in_dim=hidden_dim,
+                    hidden_dim=critic_hidden_dim,
+                    num_layers=critic_num_layers,
+                    dropout=critic_dropout,
+                    positive_activation=critic_positive,
+                )
+        else:
+            member = EnergyCritic(
+                in_dim=hidden_dim,
+                hidden_dim=critic_hidden_dim,
+                num_layers=critic_num_layers,
+                dropout=critic_dropout,
+                positive_activation=critic_positive,
+            )
+        critics.append(member.to(device))
+
+    if len(critics) == 1:
+        base_critic = critics[0]
+    else:
+        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
+
+    seq_enabled = bool(config.get("sequence_critic_enabled", False))
+    if not seq_enabled:
+        return base_critic
+
+    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
+    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
+    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
+    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
+    if seq_positive not in {"softplus", "square"}:
+        seq_positive = "softplus"
+    seq_weight = float(config.get("sequence_critic_weight", 0.0))
+    seq_critic = SequenceEnergyCritic(
+        in_dim=hidden_dim,
+        hidden_dim=seq_hidden,
+        num_layers=seq_layers,
+        dropout=seq_dropout,
+        positive_activation=seq_positive,
+    ).to(device)
+    return CompositeEnergyCritic(
+        base_critic=base_critic,
+        sequence_critic=seq_critic,
+        sequence_weight=seq_weight,
+    ).to(device)
+
+
 def _eval_ff_metrics(
     model,
+    critic,
     loader,
     goodness_temp,
     goodness_target,
@@ -711,7 +1055,7 @@ def _eval_ff_metrics(
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
         if eval_mode == "hallucinate":
             with torch.enable_grad():
@@ -725,6 +1069,7 @@ def _eval_ff_metrics(
                     eval_mode,
                     noise_std,
                     hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
@@ -740,13 +1085,14 @@ def _eval_ff_metrics(
                     eval_mode,
                     noise_std,
                     hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
 
         with torch.no_grad():
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
             pred_pos = (g_pos > goodness_target)
             pred_neg = (g_neg <= goodness_target)
             acc_num += (pred_pos.sum() + pred_neg.sum()).item()
@@ -832,6 +1178,7 @@ def _attach_primary_metrics(out: dict) -> None:
 
 def _calibrate_goodness_target(
     model,
+    critic,
     loader,
     goodness_temp,
     default_target,
@@ -856,7 +1203,7 @@ def _calibrate_goodness_target(
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
             h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp)
+            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
         if neg_mode == "hallucinate":
             with torch.enable_grad():
@@ -870,6 +1217,7 @@ def _calibrate_goodness_target(
                     neg_mode,
                     noise_std,
                     hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
@@ -885,13 +1233,14 @@ def _calibrate_goodness_target(
                     neg_mode,
                     noise_std,
                     hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
 
         with torch.no_grad():
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp)
+            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
 
         pos_vals.append(g_pos.detach().cpu())
         neg_vals.append(g_neg.detach().cpu())
@@ -944,9 +1293,14 @@ def _benchmark_ff(
         eval_graphs = list(eval_graphs)
         if not train_graphs or not eval_graphs:
             raise ValueError("Explicit fold split must include non-empty train and eval graphs.")
+    train_shuffle = True
+    if bool(config.get("sequence_critic_enabled", False)) and bool(
+        config.get("sequence_critic_force_chrono", True)
+    ):
+        train_shuffle = False
     loader_kwargs = {
         "batch_size": config["batch_size"],
-        "shuffle": True,
+        "shuffle": train_shuffle,
         "drop_last": False,
         "num_workers": config["loader_workers"],
         "pin_memory": bool(config.get("pin_memory", False)) if device.type == "cuda" else False,
@@ -967,7 +1321,12 @@ def _benchmark_ff(
         dropout=config["dropout"],
         conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(config.get("encoder_gat_heads", 2)),
+        residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
     ).to(device)
+    critic = _build_critic(config, hidden_dim=int(config["hidden_dim"]), device=device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
     risk_horizons_effective = config.get("risk_horizons_effective", [])
     risk_head_active = bool(config.get("risk_head_enabled", False)) and bool(risk_targets_by_horizon)
@@ -980,9 +1339,20 @@ def _benchmark_ff(
             config["hidden_dim"],
             len(risk_horizons_effective),
         ).to(device)
+    portfolio_targets = config.get("portfolio_targets")
+    portfolio_head_active = bool(config.get("portfolio_head_enabled", False)) and bool(portfolio_targets)
+    if layerwise and portfolio_head_active:
+        print("portfolio_head disabled for ff_layerwise benchmarking.")
+        portfolio_head_active = False
+    portfolio_head = None
+    if portfolio_head_active:
+        portfolio_head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
     optim_params = list(model.parameters())
+    optim_params.extend(list(critic.parameters()))
     if risk_head is not None:
         optim_params.extend(list(risk_head.parameters()))
+    if portfolio_head is not None:
+        optim_params.extend(list(portfolio_head.parameters()))
     optim = _build_optimizer(
         optim_params,
         lr=config["lr"],
@@ -1019,6 +1389,12 @@ def _benchmark_ff(
         moment_var_weight=float(config.get("hall_moment_var", 0.0)),
         moment_skew_weight=float(config.get("hall_moment_skew", 0.0)),
         moment_scope=str(config.get("hall_moment_scope", "returns")),
+        adversarial_hub_fraction=float(config.get("hall_attack_hub_fraction", 0.2)),
+        adversarial_feature_noise_mult=float(config.get("hall_attack_noise_mult", 3.0)),
+        adversarial_timeflip_prob=float(config.get("hall_attack_timeflip_prob", 0.5)),
+        adversarial_edge_drop_prob=float(config.get("hall_attack_edge_drop_prob", 0.2)),
+        adversarial_sign_flip_prob=float(config.get("hall_attack_sign_flip_prob", 0.2)),
+        adversarial_hub_weight_scale=float(config.get("hall_attack_hub_weight_scale", 0.5)),
     )
     sc_temp = float(config.get("self_contrastive_temp", 0.2))
     sc_max_graphs = int(config.get("self_contrastive_max_graphs", 0))
@@ -1067,6 +1443,8 @@ def _benchmark_ff(
     epoch_times = []
     risk_loss_sum = 0.0
     risk_batches = 0
+    portfolio_loss_sum = 0.0
+    portfolio_batches = 0
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -1075,6 +1453,7 @@ def _benchmark_ff(
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ):
         model.train()
+        critic.train()
         t0 = time.perf_counter()
         graphs_seen = 0
         total_loss = 0.0
@@ -1109,6 +1488,7 @@ def _benchmark_ff(
                         "hallucinate" if layer_mode == "hallucinate" else config["layerwise_neg_mode"],
                         config["layerwise_noise_std"],
                         hall_cfg,
+                        critic=critic,
                         window_len=config.get("window_len"),
                         summary_dim=config.get("summary_dim", 0),
                     )
@@ -1119,10 +1499,16 @@ def _benchmark_ff(
                         last_idx = ff_block_endpoints[-1]
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             g_pos_probe = goodness(
-                                layers_pos[last_idx], batch.batch, temperature=config["goodness_temp"]
+                                layers_pos[last_idx],
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
                             ).mean().item()
                             g_neg_probe = goodness(
-                                layers_neg[last_idx], batch.batch, temperature=config["goodness_temp"]
+                                layers_neg[last_idx],
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
                             ).mean().item()
                         if g_neg_probe > g_pos_probe + config["neg_gate_margin"]:
                             x_neg = make_negative(
@@ -1140,8 +1526,18 @@ def _benchmark_ff(
                     loss = 0.0
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         for li in ff_block_endpoints:
-                            g_pos = goodness(layers_pos[li], batch.batch, temperature=config["goodness_temp"])
-                            g_neg = goodness(layers_neg[li], batch.batch, temperature=config["goodness_temp"])
+                            g_pos = goodness(
+                                layers_pos[li],
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
+                            )
+                            g_neg = goodness(
+                                layers_neg[li],
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
+                            )
                             loss = loss + ff_loss(
                                 g_pos,
                                 g_neg,
@@ -1166,7 +1562,12 @@ def _benchmark_ff(
                             layer_mode = "shuffle"
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
-                            g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
+                            g_pos = goodness(
+                                h_pos,
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
+                            )
                         x_neg = _make_negatives(
                             model,
                             x_in,
@@ -1177,12 +1578,18 @@ def _benchmark_ff(
                             "hallucinate" if (layer_mode == "hallucinate" and li == 0) else "shuffle",
                             config["noise_std"],
                             hall_cfg,
+                            critic=critic,
                             window_len=config.get("window_len"),
                             summary_dim=config.get("summary_dim", 0),
                         )
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                            g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
+                            g_neg = goodness(
+                                h_neg,
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
+                            )
                             loss = ff_loss(
                                 g_pos,
                                 g_neg,
@@ -1237,8 +1644,18 @@ def _benchmark_ff(
                                 summary_dim=config.get("summary_dim", 0),
                             )
                             h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
-                            g_pos_aux = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
-                            g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=config["goodness_temp"])
+                            g_pos_aux = goodness(
+                                h_pos,
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
+                            )
+                            g_neg_aux = goodness(
+                                h_neg_aux,
+                                batch.batch,
+                                temperature=config["goodness_temp"],
+                                critic=critic,
+                            )
                             loss = loss + sc_ff_weight * ff_loss(
                                 g_pos_aux,
                                 g_neg_aux,
@@ -1248,7 +1665,12 @@ def _benchmark_ff(
                             )
                 else:
                     h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                    g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
+                    g_pos = goodness(
+                        h_pos,
+                        batch.batch,
+                        temperature=config["goodness_temp"],
+                        critic=critic,
+                    )
                     x_neg = _make_negatives(
                         model,
                         x,
@@ -1259,11 +1681,17 @@ def _benchmark_ff(
                         use_mode,
                         config["noise_std"],
                         hall_cfg,
+                        critic=critic,
                         window_len=config.get("window_len"),
                         summary_dim=config.get("summary_dim", 0),
                     )
                     h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                    g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
+                    g_neg = goodness(
+                        h_neg,
+                        batch.batch,
+                        temperature=config["goodness_temp"],
+                        critic=critic,
+                    )
                     loss = ff_loss(
                         g_pos,
                         g_neg,
@@ -1294,6 +1722,20 @@ def _benchmark_ff(
                         )
                         if risk_loss_val is not None:
                             loss = loss + float(config.get("risk_loss_weight", 0.0)) * risk_loss_val
+                portfolio_loss_val = None
+                if portfolio_head is not None and portfolio_targets is not None:
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        z_port = global_mean_pool(h_pos, batch.batch)
+                        portfolio_loss_val = _compute_portfolio_head_loss(
+                            portfolio_head=portfolio_head,
+                            embeddings=z_port,
+                            graph_idx=batch.graph_idx,
+                            portfolio_targets=portfolio_targets,
+                            device=device,
+                            loss_type=str(config.get("portfolio_loss_type", "sharpe")).strip().lower(),
+                        )
+                        if portfolio_loss_val is not None:
+                            loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
                 _optimizer_step(
                     optim=optim,
                     loss=loss,
@@ -1305,6 +1747,9 @@ def _benchmark_ff(
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
+                if portfolio_loss_val is not None:
+                    portfolio_loss_sum += float(portfolio_loss_val.detach())
+                    portfolio_batches += 1
 
             graphs_seen += batch.num_graphs
 
@@ -1320,6 +1765,7 @@ def _benchmark_ff(
         )
         target_eval, target_cal_acc = _calibrate_goodness_target(
             model,
+            critic,
             calib_loader,
             config["goodness_temp"],
             config["goodness_target"],
@@ -1338,6 +1784,7 @@ def _benchmark_ff(
 
     eval_metrics = _eval_ff_metrics(
         model,
+        critic,
         eval_loader,
         config["goodness_temp"],
         target_eval,
@@ -1356,6 +1803,7 @@ def _benchmark_ff(
     avg_time = float(np.mean([t for t, _ in usable]))
     avg_gps = float(np.mean([g / t for t, g in usable]))
     risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
+    portfolio_loss_train = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
@@ -1365,13 +1813,18 @@ def _benchmark_ff(
         "eval_neg_mode_effective": eval_mode,
         "risk_head_enabled_effective": bool(risk_head is not None),
         "risk_loss_train": risk_loss_train,
+        "portfolio_head_enabled_effective": bool(portfolio_head is not None),
+        "portfolio_loss_train": portfolio_loss_train,
     }
     if risk_head is not None:
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
         out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
+    if portfolio_head is not None:
+        out["portfolio_ticker_effective"] = str(config.get("portfolio_ticker_effective", ""))
     out.update(eval_metrics)
     econ = _compute_econ_metrics_for_eval(
         model,
+        critic,
         eval_graphs,
         eval_dates or [],
         config,
@@ -1393,6 +1846,7 @@ def _benchmark_ff(
                 continue
             mode_metrics = _eval_ff_metrics(
                 model,
+                critic,
                 eval_loader,
                 config["goodness_temp"],
                 target_eval,
@@ -1464,6 +1918,10 @@ def _benchmark_backprop(
         dropout=config["dropout"],
         conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(config.get("encoder_gat_heads", 2)),
+        residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
     ).to(device)
     head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
@@ -1471,9 +1929,15 @@ def _benchmark_backprop(
     risk_head = None
     if bool(config.get("risk_head_enabled", False)) and risk_targets_by_horizon:
         risk_head = torch.nn.Linear(config["hidden_dim"], len(risk_horizons_effective)).to(device)
+    portfolio_targets = config.get("portfolio_targets")
+    portfolio_head = None
+    if bool(config.get("portfolio_head_enabled", False)) and portfolio_targets:
+        portfolio_head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
     optim_params = list(model.parameters()) + list(head.parameters())
     if risk_head is not None:
         optim_params.extend(list(risk_head.parameters()))
+    if portfolio_head is not None:
+        optim_params.extend(list(portfolio_head.parameters()))
     optim = _build_optimizer(
         optim_params,
         lr=config["lr"],
@@ -1513,6 +1977,12 @@ def _benchmark_backprop(
         moment_var_weight=float(config.get("hall_moment_var", 0.0)),
         moment_skew_weight=float(config.get("hall_moment_skew", 0.0)),
         moment_scope=str(config.get("hall_moment_scope", "returns")),
+        adversarial_hub_fraction=float(config.get("hall_attack_hub_fraction", 0.2)),
+        adversarial_feature_noise_mult=float(config.get("hall_attack_noise_mult", 3.0)),
+        adversarial_timeflip_prob=float(config.get("hall_attack_timeflip_prob", 0.5)),
+        adversarial_edge_drop_prob=float(config.get("hall_attack_edge_drop_prob", 0.2)),
+        adversarial_sign_flip_prob=float(config.get("hall_attack_sign_flip_prob", 0.2)),
+        adversarial_hub_weight_scale=float(config.get("hall_attack_hub_weight_scale", 0.5)),
     )
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if train_neg_mode == "self_contrastive":
@@ -1525,6 +1995,8 @@ def _benchmark_backprop(
     epoch_times = []
     risk_loss_sum = 0.0
     risk_batches = 0
+    portfolio_loss_sum = 0.0
+    portfolio_batches = 0
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -1586,6 +2058,18 @@ def _benchmark_backprop(
                     )
                     if risk_loss_val is not None:
                         loss = loss + float(config.get("risk_loss_weight", 0.0)) * risk_loss_val
+                portfolio_loss_val = None
+                if portfolio_head is not None and portfolio_targets is not None:
+                    portfolio_loss_val = _compute_portfolio_head_loss(
+                        portfolio_head=portfolio_head,
+                        embeddings=z_pos,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                        loss_type=str(config.get("portfolio_loss_type", "sharpe")).strip().lower(),
+                    )
+                    if portfolio_loss_val is not None:
+                        loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
 
             _optimizer_step(
                 optim=optim,
@@ -1597,6 +2081,9 @@ def _benchmark_backprop(
             if risk_loss_val is not None:
                 risk_loss_sum += float(risk_loss_val.detach())
                 risk_batches += 1
+            if portfolio_loss_val is not None:
+                portfolio_loss_sum += float(portfolio_loss_val.detach())
+                portfolio_batches += 1
             graphs_seen += batch.num_graphs
         _sync(device)
         dt = time.perf_counter() - t0
@@ -1692,6 +2179,7 @@ def _benchmark_backprop(
     avg_time = float(np.mean([t for t, _ in usable]))
     avg_gps = float(np.mean([g / t for t, g in usable]))
     risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
+    portfolio_loss_train = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
@@ -1709,12 +2197,17 @@ def _benchmark_backprop(
         "eval_objective": "bce",
         "risk_head_enabled_effective": bool(risk_head is not None),
         "risk_loss_train": risk_loss_train,
+        "portfolio_head_enabled_effective": bool(portfolio_head is not None),
+        "portfolio_loss_train": portfolio_loss_train,
     }
     if risk_head is not None:
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
         out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
+    if portfolio_head is not None:
+        out["portfolio_ticker_effective"] = str(config.get("portfolio_ticker_effective", ""))
     econ = _compute_econ_metrics_for_eval(
         model,
+        None,
         eval_graphs,
         eval_dates or [],
         config,
@@ -1775,6 +2268,27 @@ def main() -> int:
         "hidden_dim": int(train_cfg.get("hidden_dim", 64)),
         "num_layers": int(train_cfg.get("num_layers", 2)),
         "dropout": float(train_cfg.get("dropout", 0.1)),
+        "critic_hidden_dim": int(train_cfg.get("critic_hidden_dim", train_cfg.get("hidden_dim", 64))),
+        "critic_num_layers": int(train_cfg.get("critic_num_layers", 2)),
+        "critic_dropout": float(train_cfg.get("critic_dropout", train_cfg.get("dropout", 0.1))),
+        "critic_positive_activation": str(train_cfg.get("critic_positive_activation", "softplus")),
+        "critic_ensemble_size": int(train_cfg.get("critic_ensemble_size", 1)),
+        "critic_ensemble_seed_stride": int(train_cfg.get("critic_ensemble_seed_stride", 1009)),
+        "sequence_critic_enabled": bool(train_cfg.get("sequence_critic_enabled", False)),
+        "sequence_critic_weight": float(train_cfg.get("sequence_critic_weight", 0.0)),
+        "sequence_critic_hidden_dim": int(
+            train_cfg.get("sequence_critic_hidden_dim", train_cfg.get("hidden_dim", 64))
+        ),
+        "sequence_critic_num_layers": int(train_cfg.get("sequence_critic_num_layers", 1)),
+        "sequence_critic_dropout": float(train_cfg.get("sequence_critic_dropout", 0.0)),
+        "sequence_critic_positive_activation": str(
+            train_cfg.get("sequence_critic_positive_activation", "softplus")
+        ),
+        "sequence_critic_force_chrono": bool(train_cfg.get("sequence_critic_force_chrono", True)),
+        "residual_edge_weight_enabled": bool(train_cfg.get("residual_edge_weight_enabled", False)),
+        "residual_edge_hidden_dim": int(train_cfg.get("residual_edge_hidden_dim", 32)),
+        "residual_edge_max_delta": float(train_cfg.get("residual_edge_max_delta", 0.25)),
+        "residual_edge_detach_features": bool(train_cfg.get("residual_edge_detach_features", True)),
         "encoder_conv_type": str(train_cfg.get("encoder_conv_type", "gcn")),
         "encoder_gat_heads": int(train_cfg.get("encoder_gat_heads", 2)),
         "lr": float(train_cfg.get("lr", 1e-3)),
@@ -1889,6 +2403,12 @@ def main() -> int:
         "hall_moment_var": float(train_cfg.get("hallucinate_moment_var", 0.0)),
         "hall_moment_skew": float(train_cfg.get("hallucinate_moment_skew", 0.0)),
         "hall_moment_scope": str(train_cfg.get("hallucinate_moment_scope", "returns")),
+        "hall_attack_hub_fraction": float(train_cfg.get("hall_attack_hub_fraction", 0.2)),
+        "hall_attack_noise_mult": float(train_cfg.get("hall_attack_noise_mult", 3.0)),
+        "hall_attack_timeflip_prob": float(train_cfg.get("hall_attack_timeflip_prob", 0.5)),
+        "hall_attack_edge_drop_prob": float(train_cfg.get("hall_attack_edge_drop_prob", 0.2)),
+        "hall_attack_sign_flip_prob": float(train_cfg.get("hall_attack_sign_flip_prob", 0.2)),
+        "hall_attack_hub_weight_scale": float(train_cfg.get("hall_attack_hub_weight_scale", 0.5)),
         "risk_head_enabled": bool(train_cfg.get("risk_head_enabled", False)),
         "risk_ticker": str(train_cfg.get("risk_ticker", "AUTO")),
         "risk_horizon": int(train_cfg.get("risk_horizon", 21)),
@@ -1901,6 +2421,14 @@ def main() -> int:
         "risk_standardize": bool(train_cfg.get("risk_standardize", True)),
         "risk_cache_dir": str(train_cfg.get("risk_cache_dir", "runs/cache")),
         "risk_max_abs_logret": float(train_cfg.get("risk_max_abs_logret", 0.5)),
+        "portfolio_head_enabled": bool(train_cfg.get("portfolio_head_enabled", False)),
+        "portfolio_ticker": str(train_cfg.get("portfolio_ticker", "AUTO")),
+        "portfolio_horizon": int(train_cfg.get("portfolio_horizon", 5)),
+        "portfolio_loss_weight": float(train_cfg.get("portfolio_loss_weight", 0.0)),
+        "portfolio_loss_type": str(train_cfg.get("portfolio_loss_type", "sharpe")),
+        "portfolio_standardize": bool(train_cfg.get("portfolio_standardize", True)),
+        "portfolio_cache_dir": str(train_cfg.get("portfolio_cache_dir", "runs/cache")),
+        "portfolio_max_abs_logret": float(train_cfg.get("portfolio_max_abs_logret", 0.5)),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
         "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
@@ -1920,6 +2448,13 @@ def main() -> int:
         "econ_slippage_bps": float(bench_cfg.get("econ_slippage_bps", 0.0)),
         "econ_slippage_vol_scale": float(bench_cfg.get("econ_slippage_vol_scale", 0.0)),
         "econ_slippage_vol_lookback": int(bench_cfg.get("econ_slippage_vol_lookback", 21)),
+        "econ_regime_gate_enabled": bool(bench_cfg.get("econ_regime_gate_enabled", False)),
+        "econ_regime_gate_window": int(bench_cfg.get("econ_regime_gate_window", 63)),
+        "econ_regime_confidence_temp": float(bench_cfg.get("econ_regime_confidence_temp", 1.0)),
+        "econ_regime_neutral_exposure": float(bench_cfg.get("econ_regime_neutral_exposure", 0.0)),
+        "econ_regime_min_confidence": float(bench_cfg.get("econ_regime_min_confidence", 0.0)),
+        "econ_regime_uncertainty_scale": float(bench_cfg.get("econ_regime_uncertainty_scale", 0.0)),
+        "econ_regime_risk_scale": float(bench_cfg.get("econ_regime_risk_scale", 0.0)),
         "econ_loader_batch_size": int(bench_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
     }
@@ -1997,6 +2532,42 @@ def main() -> int:
             except Exception as exc:
                 config["risk_head_enabled"] = False
                 print(f"warning: disabled risk_head in benchmark: {exc}")
+
+    config["portfolio_targets"] = None
+    config["portfolio_ticker_effective"] = str(config.get("portfolio_ticker", "AUTO"))
+    if bool(config.get("portfolio_head_enabled", False)):
+        if not graph_dates:
+            config["portfolio_head_enabled"] = False
+            print("warning: disabled portfolio_head in benchmark: graphs payload missing dates.")
+        else:
+            prices_path = str(build_cfg.get("prices", "data/processed/prices.csv"))
+            try:
+                horizon = max(1, int(config.get("portfolio_horizon", 5)))
+                ticker_eff, ticker_src, ticker_rows = resolve_price_ticker(
+                    prices_path=prices_path,
+                    requested_ticker=str(config.get("portfolio_ticker", "AUTO")),
+                    min_rows=max(64, horizon),
+                )
+                portfolio_targets, _, _ = _compute_forward_return_targets(
+                    prices_path=prices_path,
+                    ticker=str(ticker_eff),
+                    dates=list(graph_dates),
+                    horizon=horizon,
+                    standardize=bool(config.get("portfolio_standardize", True)),
+                    max_abs_logret=float(config.get("portfolio_max_abs_logret", 0.5)),
+                    cache_dir=str(config.get("portfolio_cache_dir", "runs/cache")),
+                )
+                config["portfolio_targets"] = portfolio_targets
+                config["portfolio_ticker_effective"] = str(ticker_eff)
+                print(
+                    "portfolio ticker: "
+                    f"requested={config.get('portfolio_ticker')} "
+                    f"effective={ticker_eff} source={ticker_src} rows={ticker_rows} "
+                    f"horizon={horizon}"
+                )
+            except Exception as exc:
+                config["portfolio_head_enabled"] = False
+                print(f"warning: disabled portfolio_head in benchmark: {exc}")
 
     mode_overrides = bench_cfg.get("mode_overrides", {})
     if not isinstance(mode_overrides, dict):

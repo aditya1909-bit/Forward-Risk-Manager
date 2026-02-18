@@ -21,7 +21,13 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
-from frisk.models import EnergyCritic, GCNEncoder
+from frisk.models import (
+    CompositeEnergyCritic,
+    EnergyCritic,
+    EnergyCriticEnsemble,
+    GCNEncoder,
+    SequenceEnergyCritic,
+)
 from frisk.ff import (
     ff_loss,
     goodness,
@@ -35,6 +41,7 @@ from frisk.device import collect_device_diagnostics, empty_device_cache, resolve
 from frisk.econ_eval import resolve_price_ticker
 
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+_PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _NEG_AUG_MODES = {
     "shuffle",
     "noise",
@@ -45,6 +52,7 @@ _NEG_AUG_MODES = {
     "block_bootstrap",
     "cross_asset_mix",
     "phase_randomize",
+    "edge_attack",
 }
 
 
@@ -342,6 +350,196 @@ def _compute_risk_targets(
     return result
 
 
+def _compute_forward_return_targets(
+    prices_path: str,
+    ticker: str,
+    dates: list[str],
+    horizon: int,
+    standardize: bool,
+    max_abs_logret: float,
+    cache_dir: str | None = "runs/cache",
+) -> tuple[list[float | None], float, float]:
+    prices_file = Path(prices_path)
+    try:
+        st = prices_file.stat()
+        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        file_sig = "missing"
+    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha1(
+        "|".join(
+            [
+                "portfolio_targets",
+                str(prices_file.resolve()),
+                str(ticker).upper(),
+                str(horizon),
+                str(int(bool(standardize))),
+                f"{float(max_abs_logret):.8f}",
+                file_sig,
+                dates_hash,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+    cached = _PORT_TARGET_MEM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cache_path: Path | None = None
+    if cache_dir:
+        cache_path = Path(cache_dir) / f"portfolio_targets_{cache_key}.pt"
+        if cache_path.exists():
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                targets = payload["targets"]
+                mean = float(payload["mean"])
+                std = float(payload["std"])
+                result = (targets, mean, std)
+                _PORT_TARGET_MEM_CACHE[cache_key] = result
+                return result
+            except Exception:
+                pass
+
+    prices_by_date: dict[str, list[float]] = {}
+    ticker_norm = str(ticker).upper()
+    with Path(prices_path).open() as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames:
+            raise ValueError("prices.csv missing header")
+        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
+        for row in r:
+            if str(row.get("ticker", "")).upper() != ticker_norm:
+                continue
+            date = row.get("date")
+            if not date:
+                continue
+            val = row.get(price_col, "")
+            if not val:
+                continue
+            try:
+                price = float(val)
+            except ValueError:
+                continue
+            if not math.isfinite(price) or price <= 0:
+                continue
+            prices_by_date.setdefault(date, []).append(price)
+    prices: list[tuple[str, float]] = []
+    for date, vals in prices_by_date.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        mid = len(vals_sorted) // 2
+        if len(vals_sorted) % 2 == 1:
+            px = vals_sorted[mid]
+        else:
+            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+        prices.append((date, float(px)))
+    if not prices:
+        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
+
+    prices.sort(key=lambda x: x[0])
+    date_list = [d for d, _ in prices]
+    price_list = [p for _, p in prices]
+    log_returns = []
+    clip = float(max_abs_logret)
+    for i in range(len(price_list) - 1):
+        if price_list[i] <= 0 or price_list[i + 1] <= 0:
+            log_returns.append(0.0)
+            continue
+        ret = math.log(price_list[i + 1] / price_list[i])
+        if clip > 0 and abs(ret) > clip:
+            ret = math.copysign(clip, ret)
+        log_returns.append(ret)
+    idx_map = {d: i for i, d in enumerate(date_list)}
+
+    targets: list[float | None] = []
+    horizon = max(1, int(horizon))
+    for d in dates:
+        idx = idx_map.get(d)
+        if idx is None:
+            targets.append(None)
+            continue
+        if idx + horizon > len(log_returns):
+            targets.append(None)
+            continue
+        window = log_returns[idx : idx + horizon]
+        if not window:
+            targets.append(None)
+            continue
+        cum_log = float(sum(window))
+        targets.append(float(math.exp(cum_log) - 1.0))
+
+    finite = [t for t in targets if t is not None]
+    if not finite:
+        result = (targets, 0.0, 1.0)
+        _PORT_TARGET_MEM_CACHE[cache_key] = result
+        return result
+    mean = sum(finite) / len(finite)
+    var = sum((x - mean) ** 2 for x in finite) / len(finite)
+    std = math.sqrt(var) if var > 0 else 1.0
+
+    if standardize:
+        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
+    result = (targets, mean, std)
+    _PORT_TARGET_MEM_CACHE[cache_key] = result
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
+        except Exception:
+            pass
+    return result
+
+
+def _compute_portfolio_head_loss(
+    portfolio_head: torch.nn.Module,
+    embeddings: torch.Tensor,
+    graph_idx,
+    portfolio_targets: list[float | None],
+    device: torch.device,
+    loss_type: str,
+) -> torch.Tensor | None:
+    if not portfolio_targets:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+    target_vals = []
+    for gi in idx_list:
+        if 0 <= gi < len(portfolio_targets):
+            tv = portfolio_targets[gi]
+        else:
+            tv = None
+        target_vals.append(float(tv) if tv is not None else float("nan"))
+    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
+    mask = torch.isfinite(target)
+    if not mask.any():
+        return None
+
+    pred_raw = portfolio_head(embeddings)
+    if pred_raw.ndim == 2 and pred_raw.size(1) == 1:
+        pred_raw = pred_raw.squeeze(1)
+    if pred_raw.ndim != 1:
+        raise RuntimeError(f"portfolio head output shape mismatch: {tuple(pred_raw.shape)}")
+    pred = torch.tanh(pred_raw)
+
+    loss_mode = str(loss_type).strip().lower()
+    if loss_mode == "mse":
+        return F.mse_loss(pred[mask], target[mask])
+
+    pnl = pred[mask] * target[mask]
+    if pnl.numel() == 0:
+        return None
+    if pnl.numel() == 1:
+        return -pnl.mean()
+    mean = pnl.mean()
+    std = pnl.std(unbiased=False) + 1e-6
+    return -(mean / std)
+
+
 def _compute_multi_horizon_risk_loss(
     risk_head: torch.nn.Module,
     embeddings: torch.Tensor,
@@ -409,6 +607,176 @@ def _self_contrastive_batch_loss(
     return loss, pos_score, neg_score, z_pos, z_view
 
 
+def _make_negatives(
+    model,
+    x,
+    batch,
+    edge_index,
+    edge_attr,
+    edge_weight,
+    use_mode,
+    noise_std,
+    hall_cfg: HallucinationConfig,
+    critic=None,
+    forward_fn=None,
+    window_len: int | None = None,
+    summary_dim: int = 0,
+):
+    if use_mode == "self_contrastive":
+        use_mode = "shuffle"
+    if use_mode in {"schedule", "mix"}:
+        use_mode = "shuffle"
+    if use_mode == "edge_attack":
+        out = make_negative(
+            x,
+            batch,
+            mode="shuffle+noise",
+            noise_std=max(0.0, float(noise_std)),
+            window_len=window_len,
+            summary_dim=summary_dim,
+        )
+        if out.numel() == 0:
+            return out
+        hub_frac = float(getattr(hall_cfg, "adversarial_hub_fraction", 0.2))
+        noise_mult = float(getattr(hall_cfg, "adversarial_feature_noise_mult", 3.0))
+        flip_prob = float(getattr(hall_cfg, "adversarial_timeflip_prob", 0.5))
+        edge_drop_prob = float(getattr(hall_cfg, "adversarial_edge_drop_prob", 0.2))
+        sign_flip_prob = float(getattr(hall_cfg, "adversarial_sign_flip_prob", 0.2))
+        hub_weight_scale = float(getattr(hall_cfg, "adversarial_hub_weight_scale", 0.5))
+        hub_frac = max(0.0, min(1.0, hub_frac))
+        noise_mult = max(1.0, noise_mult)
+        flip_prob = max(0.0, min(1.0, flip_prob))
+        edge_drop_prob = max(0.0, min(1.0, edge_drop_prob))
+        sign_flip_prob = max(0.0, min(1.0, sign_flip_prob))
+        hub_weight_scale = max(0.0, hub_weight_scale)
+        if hub_frac <= 0:
+            return out
+        row = edge_index[0]
+        col = edge_index[1]
+        deg = torch.zeros(out.size(0), device=out.device, dtype=out.dtype)
+        deg.scatter_add_(0, row, torch.ones_like(row, dtype=out.dtype))
+        deg.scatter_add_(0, col, torch.ones_like(col, dtype=out.dtype))
+        out_adv = out.clone()
+        for gid in batch.unique():
+            idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            k = max(1, int(idx.numel() * hub_frac))
+            k = min(int(idx.numel()), int(k))
+            if k <= 0:
+                continue
+            local_deg = deg.index_select(0, idx)
+            top_local = torch.topk(local_deg, k=k, largest=True).indices
+            hub_idx = idx.index_select(0, top_local)
+            out_adv.index_add_(
+                0,
+                hub_idx,
+                (max(0.0, float(noise_std)) * noise_mult)
+                * torch.randn_like(out_adv.index_select(0, hub_idx)),
+            )
+            # Approximate hub-edge drops by muting a subset of hub-node return windows.
+            if edge_drop_prob > 0 and torch.rand((), device=out.device).item() < edge_drop_prob:
+                if window_len is not None and int(window_len) > 0 and out_adv.size(1) >= int(window_len):
+                    out_adv[hub_idx, : int(window_len)] *= max(0.0, 1.0 - hub_weight_scale)
+                else:
+                    out_adv[hub_idx] *= max(0.0, 1.0 - hub_weight_scale)
+            if sign_flip_prob > 0 and torch.rand((), device=out.device).item() < sign_flip_prob:
+                if window_len is not None and int(window_len) > 0 and out_adv.size(1) >= int(window_len):
+                    out_adv[hub_idx, : int(window_len)] *= -1.0
+                else:
+                    out_adv[hub_idx] *= -1.0
+            if flip_prob > 0 and torch.rand((), device=out.device).item() < flip_prob:
+                if window_len is not None and int(window_len) > 1 and out_adv.size(1) >= int(window_len):
+                    wlen = int(window_len)
+                    out_adv[hub_idx, :wlen] = torch.flip(out_adv[hub_idx, :wlen], dims=[1])
+                elif out_adv.size(1) > 1:
+                    out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
+        return out_adv
+    if use_mode == "hallucinate":
+        return hallucinate_negative(
+            model,
+            x,
+            edge_index,
+            edge_attr,
+            batch,
+            hall_cfg,
+            edge_weight=edge_weight,
+            forward_fn=forward_fn,
+            critic=critic,
+        )
+    return make_negative(
+        x,
+        batch,
+        mode=use_mode,
+        noise_std=noise_std,
+        window_len=window_len,
+        summary_dim=summary_dim,
+    )
+
+
+def _build_critic(config: dict, hidden_dim: int, device: torch.device):
+    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
+    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
+    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
+    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
+    if critic_positive not in {"softplus", "square"}:
+        critic_positive = "softplus"
+
+    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
+    seed_base = int(config.get("seed", 7))
+    seed_stride = max(1, int(config.get("critic_ensemble_seed_stride", 1009)))
+    critics = []
+    for i in range(ensemble_size):
+        if ensemble_size > 1:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed_base + i * seed_stride)
+                member = EnergyCritic(
+                    in_dim=hidden_dim,
+                    hidden_dim=critic_hidden_dim,
+                    num_layers=critic_num_layers,
+                    dropout=critic_dropout,
+                    positive_activation=critic_positive,
+                )
+        else:
+            member = EnergyCritic(
+                in_dim=hidden_dim,
+                hidden_dim=critic_hidden_dim,
+                num_layers=critic_num_layers,
+                dropout=critic_dropout,
+                positive_activation=critic_positive,
+            )
+        critics.append(member.to(device))
+
+    if len(critics) == 1:
+        base_critic = critics[0]
+    else:
+        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
+
+    seq_enabled = bool(config.get("sequence_critic_enabled", False))
+    if not seq_enabled:
+        return base_critic
+
+    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
+    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
+    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
+    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
+    if seq_positive not in {"softplus", "square"}:
+        seq_positive = "softplus"
+    seq_weight = float(config.get("sequence_critic_weight", 0.0))
+    seq_critic = SequenceEnergyCritic(
+        in_dim=hidden_dim,
+        hidden_dim=seq_hidden,
+        num_layers=seq_layers,
+        dropout=seq_dropout,
+        positive_activation=seq_positive,
+    ).to(device)
+    return CompositeEnergyCritic(
+        base_critic=base_critic,
+        sequence_critic=seq_critic,
+        sequence_weight=seq_weight,
+    ).to(device)
+
+
 def _make_self_contrastive_view(
     x: torch.Tensor,
     batch: torch.Tensor,
@@ -474,11 +842,12 @@ def _try_batch_size(
     distance_forward_max_graphs: int,
     ff_margin: float,
     ff_margin_weight: float,
+    loader_shuffle: bool = True,
 ):
     loader = DataLoader(
         graphs,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=bool(loader_shuffle),
         drop_last=False,
         num_workers=loader_workers,
     )
@@ -527,11 +896,17 @@ def _try_batch_size(
                     max_graphs=distance_forward_max_graphs,
                 )
             if self_contrastive_ff_weight > 0:
-                x_neg_aux = make_negative(
+                x_neg_aux = _make_negatives(
+                    model,
                     x,
                     batch.batch,
-                    mode=self_contrastive_ff_neg_mode,
-                    noise_std=self_contrastive_ff_noise_std,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    self_contrastive_ff_neg_mode,
+                    self_contrastive_ff_noise_std,
+                    hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
@@ -561,26 +936,20 @@ def _try_batch_size(
                     margin_weight=ff_margin_weight,
                 )
         else:
-            if neg_mode == "hallucinate":
-                x_neg_hall = hallucinate_negative(
-                    model,
-                    x,
-                    batch.edge_index,
-                    getattr(batch, "edge_attr", None),
-                    batch.batch,
-                    hall_cfg,
-                    edge_weight=edge_weight,
-                    critic=critic,
-                )
-            else:
-                x_neg_hall = make_negative(
-                    x,
-                    batch.batch,
-                    mode=neg_mode,
-                    noise_std=noise_std,
-                    window_len=window_len,
-                    summary_dim=summary_dim,
-                )
+            x_neg_hall = _make_negatives(
+                model,
+                x,
+                batch.batch,
+                batch.edge_index,
+                getattr(batch, "edge_attr", None),
+                edge_weight,
+                neg_mode,
+                noise_std,
+                hall_cfg,
+                critic=critic,
+                window_len=window_len,
+                summary_dim=summary_dim,
+            )
             x_neg_time = make_negative(
                 x,
                 batch.batch,
@@ -660,11 +1029,17 @@ def _try_batch_size(
                     max_graphs=distance_forward_max_graphs,
                 )
             if self_contrastive_ff_weight > 0:
-                x_neg_aux = make_negative(
+                x_neg_aux = _make_negatives(
+                    model,
                     x,
                     batch.batch,
-                    mode=self_contrastive_ff_neg_mode,
-                    noise_std=self_contrastive_ff_noise_std,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    edge_weight,
+                    self_contrastive_ff_neg_mode,
+                    self_contrastive_ff_noise_std,
+                    hall_cfg,
+                    critic=critic,
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
@@ -680,26 +1055,20 @@ def _try_batch_size(
                 )
         else:
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
-            if neg_mode == "hallucinate":
-                x_neg = hallucinate_negative(
-                    model,
-                    x,
-                    batch.edge_index,
-                    getattr(batch, "edge_attr", None),
-                    batch.batch,
-                    hall_cfg,
-                    edge_weight=edge_weight,
-                    critic=critic,
-                )
-            else:
-                x_neg = make_negative(
-                    x,
-                    batch.batch,
-                    mode=neg_mode,
-                    noise_std=noise_std,
-                    window_len=window_len,
-                    summary_dim=summary_dim,
-                )
+            x_neg = _make_negatives(
+                model,
+                x,
+                batch.batch,
+                batch.edge_index,
+                getattr(batch, "edge_attr", None),
+                edge_weight,
+                neg_mode,
+                noise_std,
+                hall_cfg,
+                critic=critic,
+                window_len=window_len,
+                summary_dim=summary_dim,
+            )
             h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
             loss = ff_loss(
@@ -760,6 +1129,7 @@ def main() -> int:
             "block_bootstrap",
             "cross_asset_mix",
             "phase_randomize",
+            "edge_attack",
             "hallucinate",
             "schedule",
             "mix",
@@ -863,6 +1233,35 @@ def main() -> int:
     critic_dropout = float(_get_setting(args, section, "critic_dropout", dropout))
     critic_positive_activation = str(
         _get_setting(args, section, "critic_positive_activation", "softplus")
+    )
+    critic_ensemble_size = int(_get_setting(args, section, "critic_ensemble_size", 1))
+    critic_ensemble_seed_stride = int(
+        _get_setting(args, section, "critic_ensemble_seed_stride", 1009)
+    )
+    sequence_critic_enabled = _to_bool(
+        _get_setting(args, section, "sequence_critic_enabled", False)
+    )
+    sequence_critic_weight = float(_get_setting(args, section, "sequence_critic_weight", 0.0))
+    sequence_critic_hidden_dim = int(
+        _get_setting(args, section, "sequence_critic_hidden_dim", hidden_dim)
+    )
+    sequence_critic_num_layers = int(
+        _get_setting(args, section, "sequence_critic_num_layers", 1)
+    )
+    sequence_critic_dropout = float(_get_setting(args, section, "sequence_critic_dropout", 0.0))
+    sequence_critic_positive_activation = str(
+        _get_setting(args, section, "sequence_critic_positive_activation", "softplus")
+    )
+    sequence_critic_force_chrono = _to_bool(
+        _get_setting(args, section, "sequence_critic_force_chrono", True)
+    )
+    residual_edge_weight_enabled = _to_bool(
+        _get_setting(args, section, "residual_edge_weight_enabled", False)
+    )
+    residual_edge_hidden_dim = int(_get_setting(args, section, "residual_edge_hidden_dim", 32))
+    residual_edge_max_delta = float(_get_setting(args, section, "residual_edge_max_delta", 0.25))
+    residual_edge_detach_features = _to_bool(
+        _get_setting(args, section, "residual_edge_detach_features", True)
     )
     auto_tune = _get_setting(args, section, "auto_tune_batch", False)
     auto_tune_max = _get_setting(args, section, "auto_tune_max_batch", 64)
@@ -981,6 +1380,18 @@ def main() -> int:
     hall_freeze_non_return = _to_bool(
         _get_setting(args, section, "hallucinate_freeze_non_return_features", True)
     )
+    hall_attack_hub_fraction = float(_get_setting(args, section, "hall_attack_hub_fraction", 0.2))
+    hall_attack_noise_mult = float(_get_setting(args, section, "hall_attack_noise_mult", 3.0))
+    hall_attack_timeflip_prob = float(_get_setting(args, section, "hall_attack_timeflip_prob", 0.5))
+    hall_attack_edge_drop_prob = float(
+        _get_setting(args, section, "hall_attack_edge_drop_prob", 0.2)
+    )
+    hall_attack_sign_flip_prob = float(
+        _get_setting(args, section, "hall_attack_sign_flip_prob", 0.2)
+    )
+    hall_attack_hub_weight_scale = float(
+        _get_setting(args, section, "hall_attack_hub_weight_scale", 0.5)
+    )
     if hall_penalty_scope not in {"all", "returns"}:
         hall_penalty_scope = "returns"
     if hall_corr_scope not in {"all", "returns"}:
@@ -1040,6 +1451,14 @@ def main() -> int:
     risk_standardize = bool(_get_setting(args, section, "risk_standardize", True))
     risk_cache_dir = _get_setting(args, section, "risk_cache_dir", "runs/cache")
     risk_max_abs_logret = float(_get_setting(args, section, "risk_max_abs_logret", 0.5))
+    portfolio_head_enabled = bool(_get_setting(args, section, "portfolio_head_enabled", False))
+    portfolio_ticker = _get_setting(args, section, "portfolio_ticker", "AUTO")
+    portfolio_horizon = int(_get_setting(args, section, "portfolio_horizon", 21))
+    portfolio_loss_weight = float(_get_setting(args, section, "portfolio_loss_weight", 0.0))
+    portfolio_loss_type = _get_setting(args, section, "portfolio_loss_type", "sharpe")
+    portfolio_standardize = bool(_get_setting(args, section, "portfolio_standardize", True))
+    portfolio_cache_dir = _get_setting(args, section, "portfolio_cache_dir", "runs/cache")
+    portfolio_max_abs_logret = float(_get_setting(args, section, "portfolio_max_abs_logret", 0.5))
 
     adaptive_hall_enabled = _to_bool(_get_setting(args, section, "adaptive_hallucination", True))
     adaptive_hall_close_high = float(_get_setting(args, section, "adaptive_hall_close_high", 0.75))
@@ -1092,6 +1511,24 @@ def main() -> int:
     critic_positive_activation = str(critic_positive_activation).strip().lower()
     if critic_positive_activation not in {"softplus", "square"}:
         critic_positive_activation = "softplus"
+    critic_ensemble_size = max(1, int(critic_ensemble_size))
+    critic_ensemble_seed_stride = max(1, int(critic_ensemble_seed_stride))
+    sequence_critic_hidden_dim = max(1, int(sequence_critic_hidden_dim))
+    sequence_critic_num_layers = max(1, int(sequence_critic_num_layers))
+    sequence_critic_dropout = max(0.0, float(sequence_critic_dropout))
+    sequence_critic_positive_activation = str(sequence_critic_positive_activation).strip().lower()
+    if sequence_critic_positive_activation not in {"softplus", "square"}:
+        sequence_critic_positive_activation = "softplus"
+    residual_edge_hidden_dim = max(4, int(residual_edge_hidden_dim))
+    residual_edge_max_delta = max(0.0, float(residual_edge_max_delta))
+    portfolio_horizon = max(1, int(portfolio_horizon))
+    portfolio_loss_weight = max(0.0, float(portfolio_loss_weight))
+    portfolio_loss_type = str(portfolio_loss_type).strip().lower()
+    if portfolio_loss_type not in {"sharpe", "mse"}:
+        portfolio_loss_type = "sharpe"
+    layerwise_neg_mode = str(layerwise_neg_mode).strip().lower()
+    if layerwise_neg_mode not in _NEG_AUG_MODES:
+        layerwise_neg_mode = "shuffle"
     if encoder_conv_type not in {"gcn", "sage", "gat"}:
         encoder_conv_type = "gcn"
     encoder_gat_heads = max(1, int(encoder_gat_heads))
@@ -1153,6 +1590,12 @@ def main() -> int:
                 moment_var_weight=hall_moment_var,
                 moment_skew_weight=hall_moment_skew,
                 moment_scope=hall_moment_scope,
+                adversarial_hub_fraction=hall_attack_hub_fraction,
+                adversarial_feature_noise_mult=hall_attack_noise_mult,
+                adversarial_timeflip_prob=hall_attack_timeflip_prob,
+                adversarial_edge_drop_prob=hall_attack_edge_drop_prob,
+                adversarial_sign_flip_prob=hall_attack_sign_flip_prob,
+                adversarial_hub_weight_scale=hall_attack_hub_weight_scale,
             )
 
         if epoch < hall_curr_start:
@@ -1209,6 +1652,12 @@ def main() -> int:
             moment_var_weight=hall_moment_var,
             moment_skew_weight=hall_moment_skew,
             moment_scope=hall_moment_scope,
+            adversarial_hub_fraction=hall_attack_hub_fraction,
+            adversarial_feature_noise_mult=hall_attack_noise_mult,
+            adversarial_timeflip_prob=hall_attack_timeflip_prob,
+            adversarial_edge_drop_prob=hall_attack_edge_drop_prob,
+            adversarial_sign_flip_prob=hall_attack_sign_flip_prob,
+            adversarial_hub_weight_scale=hall_attack_hub_weight_scale,
         )
 
     set_seed(seed)
@@ -1260,6 +1709,22 @@ def main() -> int:
             f"risk_head: ticker={risk_ticker} horizons={risk_horizons} "
             f"weight={risk_loss_weight} type={risk_loss_type} std={risk_standardize} "
             f"max_abs_logret={risk_max_abs_logret}"
+        )
+    if portfolio_head_enabled:
+        print(
+            f"portfolio_head: ticker={portfolio_ticker} horizon={portfolio_horizon} "
+            f"weight={portfolio_loss_weight} type={portfolio_loss_type} std={portfolio_standardize} "
+            f"max_abs_logret={portfolio_max_abs_logret}"
+        )
+    print(
+        "critic_arch: "
+        f"ensemble={critic_ensemble_size}, seq_enabled={sequence_critic_enabled}, "
+        f"seq_weight={sequence_critic_weight}"
+    )
+    if residual_edge_weight_enabled:
+        print(
+            "residual_edge_weight: "
+            f"enabled hidden_dim={residual_edge_hidden_dim} max_delta={residual_edge_max_delta}"
         )
     if neg_mode == "self_contrastive":
         print(f"self_contrastive_temp: {self_contrastive_temp}")
@@ -1353,14 +1818,28 @@ def main() -> int:
         dropout=dropout,
         conv_type=encoder_conv_type,
         gat_heads=encoder_gat_heads,
+        residual_edge_enabled=bool(residual_edge_weight_enabled),
+        residual_edge_hidden_dim=int(residual_edge_hidden_dim),
+        residual_edge_max_delta=float(residual_edge_max_delta),
+        residual_edge_detach_features=bool(residual_edge_detach_features),
     ).to(device)
-    critic = EnergyCritic(
-        in_dim=hidden_dim,
-        hidden_dim=critic_hidden_dim,
-        num_layers=critic_num_layers,
-        dropout=critic_dropout,
-        positive_activation=critic_positive_activation,
-    ).to(device)
+    critic_cfg = {
+        "dropout": float(dropout),
+        "seed": int(seed),
+        "critic_hidden_dim": int(critic_hidden_dim),
+        "critic_num_layers": int(critic_num_layers),
+        "critic_dropout": float(critic_dropout),
+        "critic_positive_activation": str(critic_positive_activation),
+        "critic_ensemble_size": int(critic_ensemble_size),
+        "critic_ensemble_seed_stride": int(critic_ensemble_seed_stride),
+        "sequence_critic_enabled": bool(sequence_critic_enabled),
+        "sequence_critic_weight": float(sequence_critic_weight),
+        "sequence_critic_hidden_dim": int(sequence_critic_hidden_dim),
+        "sequence_critic_num_layers": int(sequence_critic_num_layers),
+        "sequence_critic_dropout": float(sequence_critic_dropout),
+        "sequence_critic_positive_activation": str(sequence_critic_positive_activation),
+    }
+    critic = _build_critic(critic_cfg, hidden_dim=hidden_dim, device=device)
     if encoder_checkpoint_in:
         ckpt = Path(str(encoder_checkpoint_in))
         if not ckpt.exists():
@@ -1371,7 +1850,15 @@ def main() -> int:
         ckpt = Path(str(critic_checkpoint_in))
         if not ckpt.exists():
             raise FileNotFoundError(f"critic_checkpoint_in not found: {ckpt}")
-        critic.load_state_dict(_load_state_dict_compat(str(ckpt)))
+        state = _load_state_dict_compat(str(ckpt))
+        try:
+            critic.load_state_dict(state, strict=True)
+        except Exception:
+            missing, unexpected = critic.load_state_dict(state, strict=False)
+            print(
+                f"warning: partial critic checkpoint load "
+                f"(missing={len(missing)} unexpected={len(unexpected)})."
+            )
         print(f"loaded critic checkpoint: {ckpt}")
     if freeze_encoder:
         for p in model.parameters():
@@ -1387,7 +1874,8 @@ def main() -> int:
     print(
         "critic: "
         f"layers={critic_num_layers}, hidden_dim={critic_hidden_dim}, "
-        f"dropout={critic_dropout}, positive={critic_positive_activation}"
+        f"dropout={critic_dropout}, positive={critic_positive_activation}, "
+        f"ensemble={critic_ensemble_size}, seq_enabled={sequence_critic_enabled}"
     )
     ff_block_endpoints = (
         _block_endpoint_indices(len(model.layers), ff_block_size) if ff_blockwise else []
@@ -1447,6 +1935,48 @@ def main() -> int:
         print(f"risk_head output dim: {len(risk_horizons_effective)}")
         risk_head = torch.nn.Linear(hidden_dim, len(risk_horizons_effective)).to(device)
 
+    portfolio_head = None
+    portfolio_targets: list[float | None] | None = None
+    portfolio_ticker_effective = str(portfolio_ticker)
+    if portfolio_head_enabled:
+        if ff_layerwise:
+            print("portfolio_head disabled when ff_layerwise is enabled.")
+            portfolio_head_enabled = False
+        elif not dates:
+            print("portfolio_head disabled: graphs payload missing dates.")
+            portfolio_head_enabled = False
+        else:
+            prices_path = build_cfg.get("prices", "data/processed/prices.csv")
+            try:
+                portfolio_ticker_effective, ticker_src, ticker_rows = resolve_price_ticker(
+                    prices_path=prices_path,
+                    requested_ticker=str(portfolio_ticker),
+                    min_rows=max(64, int(portfolio_horizon)),
+                )
+                print(
+                    "portfolio ticker: "
+                    f"requested={portfolio_ticker} effective={portfolio_ticker_effective} "
+                    f"source={ticker_src} rows={ticker_rows}"
+                )
+                portfolio_targets, _, _ = _compute_forward_return_targets(
+                    prices_path=prices_path,
+                    ticker=str(portfolio_ticker_effective),
+                    dates=dates,
+                    horizon=int(portfolio_horizon),
+                    standardize=bool(portfolio_standardize),
+                    max_abs_logret=float(portfolio_max_abs_logret),
+                    cache_dir=str(portfolio_cache_dir) if portfolio_cache_dir else None,
+                )
+                if not any(t is not None for t in portfolio_targets):
+                    raise ValueError("no valid portfolio targets for configured horizon")
+            except Exception as exc:
+                print(f"portfolio_head disabled: {exc}")
+                portfolio_head_enabled = False
+                portfolio_targets = None
+
+    if portfolio_head_enabled and portfolio_targets:
+        portfolio_head = torch.nn.Linear(hidden_dim, 1).to(device)
+
     if temp_sweep:
         temps = [float(t.strip()) for t in str(temp_sweep).split(",") if t.strip()]
         if not temps:
@@ -1469,6 +1999,9 @@ def main() -> int:
         return 0
 
     hall_cfg = _hall_cfg_for_epoch(hall_curr_start if hall_curr_enabled else 1)
+    train_shuffle = True
+    if bool(sequence_critic_enabled) and bool(sequence_critic_force_chrono):
+        train_shuffle = False
 
     if auto_tune and device.type in ("cuda", "mps"):
         print(f"Auto-tuning batch size for {device.type.upper()}...")
@@ -1505,6 +2038,7 @@ def main() -> int:
                     distance_forward_max_graphs,
                     ff_margin,
                     ff_margin_weight,
+                    loader_shuffle=train_shuffle,
                 )
                 best_bs = test_bs
                 test_bs = int(test_bs * auto_tune_factor)
@@ -1550,6 +2084,7 @@ def main() -> int:
                         distance_forward_max_graphs,
                         ff_margin,
                         ff_margin_weight,
+                        loader_shuffle=train_shuffle,
                     )
                     best_bs = test_bs
                     break
@@ -1567,7 +2102,7 @@ def main() -> int:
 
     loader_kwargs = {
         "batch_size": batch_size,
-        "shuffle": True,
+        "shuffle": train_shuffle,
         "drop_last": False,
         "num_workers": loader_workers,
         "pin_memory": bool(dataloader_pin_memory) if device.type == "cuda" else False,
@@ -1582,6 +2117,8 @@ def main() -> int:
     optim_params.extend(p for p in critic.parameters() if p.requires_grad)
     if risk_head is not None:
         optim_params.extend(p for p in risk_head.parameters() if p.requires_grad)
+    if portfolio_head is not None:
+        optim_params.extend(p for p in portfolio_head.parameters() if p.requires_grad)
     if not optim_params:
         raise ValueError("No trainable parameters. Check freeze_encoder/freeze_critic settings.")
     optim = _build_optimizer(optim_params, lr=lr, device=device, use_fused=fused_optimizer)
@@ -1592,7 +2129,7 @@ def main() -> int:
         with log_path.open("w") as f:
             f.write(
                 "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
-                "hall_close_ratio,energy_penalty,risk_loss,dist_forward_loss,goodness_target_used,"
+                "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
                 "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
                 "hall_node_fraction_used\n"
             )
@@ -1627,6 +2164,8 @@ def main() -> int:
         energy_penalty_sum = 0.0
         risk_loss_sum = 0.0
         risk_batches = 0
+        portfolio_loss_sum = 0.0
+        portfolio_batches = 0
         dist_forward_sum = 0.0
 
         hall_used = 0
@@ -1721,11 +2260,17 @@ def main() -> int:
                             )
                             batch_loss = batch_loss + distance_forward_weight * dist_loss_val
                         if self_contrastive_ff_weight > 0:
-                            x_neg_aux = make_negative(
+                            x_neg_aux = _make_negatives(
+                                model,
                                 x,
                                 batch.batch,
-                                mode=self_contrastive_ff_neg_mode,
-                                noise_std=self_contrastive_ff_noise_std,
+                                batch.edge_index,
+                                getattr(batch, "edge_attr", None),
+                                edge_weight,
+                                self_contrastive_ff_neg_mode,
+                                self_contrastive_ff_noise_std,
+                                hall_cfg,
+                                critic=critic,
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
@@ -1752,15 +2297,19 @@ def main() -> int:
                 else:
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
-                        x_neg_hall = hallucinate_negative(
+                        x_neg_hall = _make_negatives(
                             model,
                             x,
+                            batch.batch,
                             batch.edge_index,
                             getattr(batch, "edge_attr", None),
-                            batch.batch,
+                            edge_weight,
+                            use_mode,
+                            noise_std,
                             hall_cfg,
-                            edge_weight=edge_weight,
                             critic=critic,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
                         )
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (
@@ -1779,11 +2328,17 @@ def main() -> int:
                                 )
                         hall_used += 1
                     else:
-                        x_neg_hall = make_negative(
+                        x_neg_hall = _make_negatives(
+                            model,
                             x,
                             batch.batch,
-                            mode=use_mode,
-                            noise_std=noise_std,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            edge_weight,
+                            use_mode,
+                            noise_std,
+                            hall_cfg,
+                            critic=critic,
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
@@ -1910,6 +2465,19 @@ def main() -> int:
                     )
                     if risk_loss_val is not None:
                         batch_loss = batch_loss + risk_loss_weight * risk_loss_val
+                portfolio_loss_val = None
+                if portfolio_head is not None and portfolio_targets is not None:
+                    embed = global_mean_pool(layers_pos[-1], batch.batch)
+                    portfolio_loss_val = _compute_portfolio_head_loss(
+                        portfolio_head=portfolio_head,
+                        embeddings=embed,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                        loss_type=portfolio_loss_type,
+                    )
+                    if portfolio_loss_val is not None:
+                        batch_loss = batch_loss + portfolio_loss_weight * portfolio_loss_val
 
                 _optimizer_step(
                     optim=optim,
@@ -1930,6 +2498,9 @@ def main() -> int:
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
+                if portfolio_loss_val is not None:
+                    portfolio_loss_sum += float(portfolio_loss_val.detach())
+                    portfolio_batches += 1
                 if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
                     dist_forward_sum += float(dist_loss_val.detach())
             elif ff_layerwise:
@@ -1940,15 +2511,19 @@ def main() -> int:
                         layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
 
                     if hall_active:
-                        x_neg = hallucinate_negative(
+                        x_neg = _make_negatives(
                             model,
                             x,
+                            batch.batch,
                             batch.edge_index,
                             getattr(batch, "edge_attr", None),
-                            batch.batch,
+                            edge_weight,
+                            "hallucinate",
+                            layerwise_noise_std,
                             hall_cfg_layer,
-                            edge_weight=edge_weight,
                             critic=critic,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
                         )
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
@@ -1965,11 +2540,17 @@ def main() -> int:
                                 )
                         hall_used += 1
                     else:
-                        x_neg = make_negative(
+                        x_neg = _make_negatives(
+                            model,
                             x,
                             batch.batch,
-                            mode=layerwise_neg_mode,
-                            noise_std=layerwise_noise_std,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            edge_weight,
+                            layerwise_neg_mode,
+                            layerwise_noise_std,
+                            hall_cfg_layer,
+                            critic=critic,
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
@@ -2059,16 +2640,20 @@ def main() -> int:
                             forward_fn = lambda x_var, li=li: model.forward_layer(
                                 x_var, batch.edge_index, edge_weight, li
                             )
-                            x_neg = hallucinate_negative(
+                            x_neg = _make_negatives(
                                 model,
                                 x_in,
+                                batch.batch,
                                 batch.edge_index,
                                 getattr(batch, "edge_attr", None),
-                                batch.batch,
+                                edge_weight,
+                                "hallucinate",
+                                layerwise_noise_std,
                                 hall_cfg_layer,
-                                edge_weight=edge_weight,
-                                forward_fn=forward_fn,
                                 critic=critic,
+                                forward_fn=forward_fn,
+                                window_len=returns_len,
+                                summary_dim=summary_dim,
                             )
                             if hall_min_delta and hall_min_delta > 0:
                                 delta = (
@@ -2087,11 +2672,17 @@ def main() -> int:
                                     )
                             hall_used += 1
                         else:
-                            x_neg = make_negative(
+                            x_neg = _make_negatives(
+                                model,
                                 x_in,
                                 batch.batch,
-                                mode=layerwise_neg_mode,
-                                noise_std=layerwise_noise_std,
+                                batch.edge_index,
+                                getattr(batch, "edge_attr", None),
+                                edge_weight,
+                                layerwise_neg_mode,
+                                layerwise_noise_std,
+                                hall_cfg_layer,
+                                critic=critic,
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
@@ -2182,11 +2773,17 @@ def main() -> int:
                             )
                             loss = loss + distance_forward_weight * dist_loss_val
                         if self_contrastive_ff_weight > 0:
-                            x_neg_aux = make_negative(
+                            x_neg_aux = _make_negatives(
+                                model,
                                 x,
                                 batch.batch,
-                                mode=self_contrastive_ff_neg_mode,
-                                noise_std=self_contrastive_ff_noise_std,
+                                batch.edge_index,
+                                getattr(batch, "edge_attr", None),
+                                edge_weight,
+                                self_contrastive_ff_neg_mode,
+                                self_contrastive_ff_noise_std,
+                                hall_cfg,
+                                critic=critic,
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
@@ -2212,15 +2809,19 @@ def main() -> int:
 
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
-                        x_neg = hallucinate_negative(
+                        x_neg = _make_negatives(
                             model,
                             x,
+                            batch.batch,
                             batch.edge_index,
                             getattr(batch, "edge_attr", None),
-                            batch.batch,
+                            edge_weight,
+                            use_mode,
+                            noise_std,
                             hall_cfg,
-                            edge_weight=edge_weight,
                             critic=critic,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
                         )
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
@@ -2237,11 +2838,17 @@ def main() -> int:
                                 )
                         hall_used += 1
                     else:
-                        x_neg = make_negative(
+                        x_neg = _make_negatives(
+                            model,
                             x,
                             batch.batch,
-                            mode=use_mode,
-                            noise_std=noise_std,
+                            batch.edge_index,
+                            getattr(batch, "edge_attr", None),
+                            edge_weight,
+                            use_mode,
+                            noise_std,
+                            hall_cfg,
+                            critic=critic,
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
@@ -2311,6 +2918,19 @@ def main() -> int:
                     )
                     if risk_loss_val is not None:
                         loss = loss + risk_loss_weight * risk_loss_val
+                portfolio_loss_val = None
+                if portfolio_head is not None and portfolio_targets is not None:
+                    embed = global_mean_pool(h_pos, batch.batch)
+                    portfolio_loss_val = _compute_portfolio_head_loss(
+                        portfolio_head=portfolio_head,
+                        embeddings=embed,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                        loss_type=portfolio_loss_type,
+                    )
+                    if portfolio_loss_val is not None:
+                        loss = loss + portfolio_loss_weight * portfolio_loss_val
                 _optimizer_step(
                     optim=optim,
                     loss=loss,
@@ -2330,6 +2950,9 @@ def main() -> int:
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
+                if portfolio_loss_val is not None:
+                    portfolio_loss_sum += float(portfolio_loss_val.detach())
+                    portfolio_batches += 1
                 if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
                     dist_forward_sum += float(dist_loss_val.detach())
             batches += 1
@@ -2340,6 +2963,7 @@ def main() -> int:
         hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
         energy_penalty_epoch = energy_penalty_sum / batches if batches else 0.0
         risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
+        portfolio_loss_epoch = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
         dist_forward_epoch = dist_forward_sum / batches if batches else 0.0
         epoch_loss = total_loss / batches if batches else 0.0
         epoch_pos = total_pos / batches if batches else 0.0
@@ -2466,6 +3090,7 @@ def main() -> int:
                     f"{epoch_pos:.6f},{epoch_neg:.6f},"
                     f"{hall_ratio:.4f},{gate_ratio:.4f},{hall_hardness:.6f},"
                     f"{hall_close_ratio:.4f},{energy_penalty_epoch:.6f},{risk_loss_epoch:.6f},"
+                    f"{portfolio_loss_epoch:.6f},"
                     f"{dist_forward_epoch:.6f},"
                     f"{epoch_goodness_target:.6f},{epoch_neg_mix_end:.6f},{epoch_neg_gate_margin:.6f},"
                     f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f}\n"
@@ -2506,6 +3131,8 @@ def main() -> int:
                 plt.plot(df["epoch"], df["energy_penalty"], label="energy_penalty")
             if "risk_loss" in df.columns:
                 plt.plot(df["epoch"], df["risk_loss"], label="risk_loss")
+            if "portfolio_loss" in df.columns:
+                plt.plot(df["epoch"], df["portfolio_loss"], label="portfolio_loss")
             if "dist_forward_loss" in df.columns:
                 plt.plot(df["epoch"], df["dist_forward_loss"], label="dist_forward")
             if "goodness_target_used" in df.columns:

@@ -179,22 +179,205 @@ def load_fundamentals(path: Path) -> pd.DataFrame:
 
 def load_macro_features(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    if "date" not in df.columns:
-        raise ValueError("macro.csv must include a 'date' column")
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df = df.dropna(subset=["date"])
 
-    value_cols = [c for c in df.columns if c != "date"]
-    if not value_cols:
-        raise ValueError("macro.csv must include at least one feature column besides date")
-    for col in value_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df = df.dropna(subset=["date"])
+        value_cols = [c for c in df.columns if c != "date"]
+        if not value_cols:
+            raise ValueError("macro.csv must include at least one feature column besides date")
+        for col in value_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        macro = df.groupby("date", as_index=True)[value_cols].mean().sort_index()
+        return macro.replace([np.inf, -np.inf], np.nan)
 
-    macro = (
-        df.groupby("date", as_index=True)[value_cols]
-        .mean()
-        .sort_index()
+    # Fallback for long-format macro price files:
+    # ticker,time,close/high/low/open,volume
+    if "time" in df.columns and "ticker" in df.columns:
+        df["date"] = pd.to_datetime(df["time"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+        df = df.dropna(subset=["date", "ticker"])
+        price_col = "adj_close" if "adj_close" in df.columns else ("close" if "close" in df.columns else "")
+        if not price_col:
+            raise ValueError(
+                "Long macro price CSV must include one of: adj_close, close."
+            )
+        df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
+        px = (
+            df.pivot_table(index="date", columns="ticker", values=price_col, aggfunc="mean")
+            .sort_index()
+        )
+        log_ret = np.log(px / px.shift(1))
+
+        feats: dict[str, pd.Series] = {}
+        for ticker in log_ret.columns:
+            s = pd.to_numeric(log_ret[ticker], errors="coerce")
+            feats[f"macro_ret_{ticker}"] = s
+            feats[f"macro_vol21_{ticker}"] = s.rolling(21, min_periods=5).std()
+
+        # Term-structure style macro proxies when common ETF symbols are present.
+        # This keeps integration feasible with local macro_prices universes that
+        # do not contain full treasury/credit index histories.
+        def _ticker_ret(symbol: str) -> pd.Series | None:
+            if symbol in log_ret.columns:
+                return pd.to_numeric(log_ret[symbol], errors="coerce")
+            return None
+
+        spy = _ticker_ret("SPY")
+        tlt = _ticker_ret("TLT")
+        hyg = _ticker_ret("HYG")
+        vxx = _ticker_ret("VXX")
+        gld = _ticker_ret("GLD")
+        uup = _ticker_ret("UUP")
+
+        if tlt is not None:
+            feats["macro_rates_proxy_tlt"] = tlt
+            feats["macro_rates_proxy_tlt_trend_21_63"] = (
+                tlt.rolling(21, min_periods=5).mean()
+                - tlt.rolling(63, min_periods=10).mean()
+            )
+        if hyg is not None:
+            feats["macro_credit_proxy_hyg"] = hyg
+            feats["macro_credit_proxy_hyg_trend_21_63"] = (
+                hyg.rolling(21, min_periods=5).mean()
+                - hyg.rolling(63, min_periods=10).mean()
+            )
+        if vxx is not None:
+            feats["macro_vol_proxy_vxx"] = vxx
+            feats["macro_vol_proxy_vxx_vol21"] = vxx.rolling(21, min_periods=5).std()
+
+        if hyg is not None and tlt is not None:
+            feats["macro_credit_term_hyg_tlt"] = hyg - tlt
+        elif hyg is not None and spy is not None:
+            feats["macro_credit_term_hyg_spy"] = hyg - spy
+
+        if vxx is not None and spy is not None:
+            feats["macro_vol_term_vxx_spy"] = vxx - spy
+
+        if tlt is not None and spy is not None:
+            feats["macro_duration_equity_term_tlt_spy"] = tlt - spy
+
+        if gld is not None and uup is not None:
+            feats["macro_real_asset_fx_term_gld_uup"] = gld - uup
+
+        mkt_ret = log_ret.mean(axis=1)
+        feats["macro_mkt_ret_eqw"] = mkt_ret
+        feats["macro_mkt_vol21"] = mkt_ret.rolling(21, min_periods=5).std()
+        feats["macro_mkt_vol63"] = mkt_ret.rolling(63, min_periods=10).std()
+        feats["macro_cs_dispersion"] = log_ret.std(axis=1)
+
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+            vol = (
+                df.pivot_table(index="date", columns="ticker", values="volume", aggfunc="mean")
+                .sort_index()
+            )
+            vol_mean = vol.mean(axis=1)
+            feats["macro_log_volume"] = np.log1p(vol_mean.clip(lower=0.0))
+            vol_base = vol_mean.rolling(21, min_periods=5).mean()
+            feats["macro_volume_shock_21"] = (
+                np.divide(vol_mean, vol_base + 1e-8) - 1.0
+            )
+
+        macro = pd.DataFrame(feats).sort_index()
+        macro = macro.replace([np.inf, -np.inf], np.nan)
+        if macro.shape[1] == 0:
+            raise ValueError("Failed to build macro features from long-format macro prices CSV.")
+        return macro
+
+    raise ValueError(
+        "macro.csv must include either a 'date' column (wide format) or "
+        "'time' + 'ticker' columns (long format)."
     )
+
+
+def load_static_edges(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if df.empty:
+        return pd.DataFrame(columns=["src", "dst", "weight", "directed"])
+
+    norm = {str(c).strip().lower().replace("-", "_").replace(" ", "_"): c for c in df.columns}
+
+    def _pick(cands: list[str]) -> str | None:
+        for cand in cands:
+            if cand in norm:
+                return norm[cand]
+        return None
+
+    src_col = _pick(["src", "source", "from", "from_ticker", "ticker_from", "u"])
+    dst_col = _pick(["dst", "target", "to", "to_ticker", "ticker_to", "v"])
+    if src_col is None or dst_col is None:
+        raise ValueError(
+            "static_edges.csv must include source/destination columns "
+            "(e.g., src,dst or source,target)."
+        )
+    weight_col = _pick(["weight", "edge_weight", "strength", "w"])
+    directed_col = _pick(["directed", "is_directed"])
+
+    out = pd.DataFrame()
+    out["src"] = df[src_col].astype(str).str.upper().str.strip()
+    out["dst"] = df[dst_col].astype(str).str.upper().str.strip()
+    if weight_col is not None:
+        out["weight"] = pd.to_numeric(df[weight_col], errors="coerce")
+    else:
+        out["weight"] = 1.0
+    if directed_col is not None:
+        raw = df[directed_col]
+        if raw.dtype == bool:
+            out["directed"] = raw.astype(bool)
+        else:
+            txt = raw.astype(str).str.strip().str.lower()
+            out["directed"] = txt.isin({"1", "true", "t", "yes", "y"})
+    else:
+        out["directed"] = False
+
+    out = out.dropna(subset=["src", "dst", "weight"])
+    out = out[(out["src"] != "") & (out["dst"] != "")]
+    out["weight"] = out["weight"].astype(float)
+    out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=["weight"])
+    return out
+
+
+def build_macro_features_from_market_data(
+    returns: pd.DataFrame,
+    volume: pd.DataFrame | None = None,
+    short_window: int = 21,
+    long_window: int = 63,
+) -> pd.DataFrame:
+    if returns is None or returns.empty:
+        return pd.DataFrame()
+    short_w = max(2, int(short_window))
+    long_w = max(short_w + 1, int(long_window))
+
+    rets = returns.sort_index()
+    mkt_ret = rets.mean(axis=1)
+    abs_ret = mkt_ret.abs()
+    cs_disp = rets.std(axis=1)
+    q90 = rets.quantile(0.9, axis=1)
+    q10 = rets.quantile(0.1, axis=1)
+
+    macro = pd.DataFrame(index=rets.index)
+    macro["macro_mkt_ret_eqw"] = mkt_ret
+    macro["macro_mkt_abs_ret"] = abs_ret
+    macro["macro_mkt_vol_short"] = mkt_ret.rolling(short_w, min_periods=max(2, short_w // 3)).std()
+    macro["macro_mkt_vol_long"] = mkt_ret.rolling(long_w, min_periods=max(3, long_w // 3)).std()
+    macro["macro_mkt_vol_ratio"] = (
+        macro["macro_mkt_vol_short"] / (macro["macro_mkt_vol_long"] + 1e-8)
+    )
+    macro["macro_mkt_trend_short"] = mkt_ret.rolling(short_w, min_periods=max(2, short_w // 3)).mean()
+    macro["macro_mkt_trend_long"] = mkt_ret.rolling(long_w, min_periods=max(3, long_w // 3)).mean()
+    macro["macro_cs_dispersion"] = cs_disp
+    macro["macro_cs_tail_spread"] = q90 - q10
+
+    if volume is not None and not volume.empty:
+        vol = volume.sort_index()
+        vol_mean = vol.mean(axis=1)
+        vol_base_short = vol_mean.rolling(short_w, min_periods=max(2, short_w // 3)).mean()
+        vol_base_long = vol_mean.rolling(long_w, min_periods=max(3, long_w // 3)).mean()
+        macro["macro_log_volume"] = np.log1p(vol_mean.clip(lower=0.0))
+        macro["macro_volume_shock_short"] = np.divide(vol_mean, vol_base_short + 1e-8) - 1.0
+        macro["macro_volume_shock_long"] = np.divide(vol_mean, vol_base_long + 1e-8) - 1.0
+
     macro = macro.replace([np.inf, -np.inf], np.nan)
     return macro

@@ -189,6 +189,7 @@ def infer_graph_goodness(
     graphs,
     goodness_temp: float,
     batch_size: int = 128,
+    critic=None,
 ) -> np.ndarray:
     if not graphs:
         return np.asarray([], dtype=float)
@@ -210,9 +211,53 @@ def infer_graph_goodness(
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
             h = model(batch.x, batch.edge_index, edge_weight=edge_weight)
-            g = goodness(h, batch.batch, temperature=float(goodness_temp))
+            g = goodness(h, batch.batch, temperature=float(goodness_temp), critic=critic)
             vals.extend(g.detach().cpu().tolist())
     return np.asarray(vals, dtype=float)
+
+
+def infer_graph_goodness_with_uncertainty(
+    model,
+    graphs,
+    goodness_temp: float,
+    batch_size: int = 128,
+    critic=None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    if not graphs:
+        return np.asarray([], dtype=float), None
+    model.eval()
+    loader = DataLoader(
+        graphs,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        drop_last=False,
+    )
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    vals = []
+    unc = []
+    member_graph_energy = getattr(critic, "member_graph_energy", None) if critic is not None else None
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            edge_weight = getattr(batch, "edge_weight", None)
+            h = model(batch.x, batch.edge_index, edge_weight=edge_weight)
+            g = goodness(h, batch.batch, temperature=float(goodness_temp), critic=critic)
+            vals.extend(g.detach().cpu().tolist())
+            if callable(member_graph_energy):
+                ge = member_graph_energy(h, batch.batch, temperature=float(goodness_temp))
+                if ge.ndim == 2 and ge.size(0) > 1:
+                    std = ge.std(dim=0, unbiased=False)
+                    unc.extend(std.detach().cpu().tolist())
+    g_np = np.asarray(vals, dtype=float)
+    if unc:
+        unc_np = np.asarray(unc, dtype=float)
+        if unc_np.shape[0] == g_np.shape[0]:
+            return g_np, unc_np
+    return g_np, None
 
 
 def _nan_sub(a: float, b: float) -> float:
@@ -232,6 +277,15 @@ def evaluate_goodness_strategy(
     slippage_vol_scale: float = 0.0,
     slippage_vol_lookback: int = 21,
     trading_days: int = 252,
+    regime_gate_enabled: bool = False,
+    regime_gate_window: int = 63,
+    regime_confidence_temp: float = 1.0,
+    regime_neutral_exposure: float = 0.0,
+    regime_min_confidence: float = 0.0,
+    goodness_uncertainty: np.ndarray | None = None,
+    regime_uncertainty_scale: float = 0.0,
+    risk_signal: np.ndarray | None = None,
+    regime_risk_scale: float = 0.0,
 ) -> dict[str, float]:
     out = {
         "econ_num_days": 0.0,
@@ -271,6 +325,12 @@ def evaluate_goodness_strategy(
         "econ_slippage_bps": float(slippage_bps),
         "econ_slippage_vol_scale": float(slippage_vol_scale),
         "econ_slippage_vol_lookback": float(slippage_vol_lookback),
+        "econ_regime_gate_enabled": float(bool(regime_gate_enabled)),
+        "econ_regime_confidence_mean": float("nan"),
+        "econ_regime_exposure_mean": float("nan"),
+        "econ_regime_confidence_temp": float(regime_confidence_temp),
+        "econ_regime_neutral_exposure": float(regime_neutral_exposure),
+        "econ_regime_min_confidence": float(regime_min_confidence),
     }
 
     if fwd_ret_1 is None or len(fwd_ret_1) == 0:
@@ -305,9 +365,47 @@ def evaluate_goodness_strategy(
         min_periods=max(10, sw // 3),
     ).quantile(sq)
     signal = (df["goodness"] >= roll_q).astype(float).fillna(1.0)
+    exposure = signal.to_numpy(dtype=float)
+
+    if bool(regime_gate_enabled):
+        rgw = max(10, int(regime_gate_window))
+        g_roll_mean = df["goodness"].rolling(
+            rgw,
+            min_periods=max(5, rgw // 3),
+        ).mean()
+        g_roll_std = df["goodness"].rolling(
+            rgw,
+            min_periods=max(5, rgw // 3),
+        ).std()
+        g_z = (df["goodness"] - g_roll_mean) / (g_roll_std + 1e-8)
+        temp = max(1e-6, float(regime_confidence_temp))
+        conf = 1.0 / (1.0 + np.exp(-(g_z.to_numpy(dtype=float) / temp)))
+        conf = np.nan_to_num(conf, nan=0.5, posinf=1.0, neginf=0.0)
+
+        if goodness_uncertainty is not None:
+            unc = np.asarray(goodness_uncertainty, dtype=float)
+            if unc.shape[0] == conf.shape[0]:
+                unc = np.nan_to_num(unc, nan=float(np.nanmean(unc) if np.isfinite(unc).any() else 0.0))
+                conf = conf * np.exp(-max(0.0, float(regime_uncertainty_scale)) * np.maximum(0.0, unc))
+
+        if risk_signal is not None:
+            rs = np.asarray(risk_signal, dtype=float)
+            if rs.shape[0] == conf.shape[0]:
+                rs = np.nan_to_num(rs, nan=0.0)
+                conf = conf * (1.0 / (1.0 + np.exp(max(0.0, float(regime_risk_scale)) * rs)))
+
+        conf = np.clip(conf, 0.0, 1.0)
+        min_conf = float(np.clip(regime_min_confidence, 0.0, 1.0))
+        if min_conf > 0:
+            conf = np.where(conf >= min_conf, conf, 0.0)
+        neutral = float(np.clip(regime_neutral_exposure, -1.0, 1.0))
+        exposure = conf * exposure + (1.0 - conf) * neutral
+        out["econ_regime_confidence_mean"] = float(np.nanmean(conf)) if conf.size else float("nan")
+        out["econ_regime_exposure_mean"] = float(np.nanmean(exposure)) if exposure.size else float("nan")
+
     bench_ret_1 = df["fwd_ret_1"].to_numpy(dtype=float)
-    strat_ret_1 = signal.to_numpy(dtype=float) * bench_ret_1
-    turnover = signal.diff().abs().fillna(0.0).to_numpy(dtype=float)
+    strat_ret_1 = exposure * bench_ret_1
+    turnover = pd.Series(exposure).diff().abs().fillna(0.0).to_numpy(dtype=float)
     base_cost_bps = max(0.0, float(turnover_cost_bps))
     slip_bps = max(0.0, float(slippage_bps))
     slip_scale = max(0.0, float(slippage_vol_scale))

@@ -34,10 +34,21 @@ class GraphBuildConfig:
     significance_alpha: float = 0.05
     edge_node_weighting: str = "none"  # "none", "volume", "market_cap", "volume_market_cap"
     edge_node_weight_power: float = 0.5
+    lead_lag_enabled: bool = False
+    lead_lag_max_lag: int = 3
+    lead_lag_top_k: int | None = 2
+    lead_lag_threshold: float | None = None
+    lead_lag_weight: float = 0.5
+    lead_lag_mode: str = "top_k"  # "top_k", "threshold", "significance"
+    sector_static_enabled: bool = False
+    sector_static_weight: float = 0.25
+    sector_static_top_k: int | None = 4
+    static_edge_weight: float = 0.25
     # Leakage controls: build graph inputs at t using only data up to t-lag.
     corr_lag_days: int = 0
     feature_lag_days: int = 0
     membership_lag_days: int = 0
+    macro_lag_days: int = 0
 
 
 def _select_edges(
@@ -261,6 +272,131 @@ def _safe_partial_corr_matrix(window_df: pd.DataFrame, ridge: float = 1e-3) -> n
     return partial
 
 
+def _safe_lagged_corr_matrix(window_df: pd.DataFrame, lag: int) -> np.ndarray:
+    x = window_df.to_numpy(dtype=float)
+    if x.ndim != 2 or x.shape[1] == 0:
+        return np.zeros((0, 0), dtype=float)
+    lag_n = max(1, int(lag))
+    if x.shape[0] <= lag_n:
+        return np.zeros((x.shape[1], x.shape[1]), dtype=float)
+    x_src = x[:-lag_n]
+    x_dst = x[lag_n:]
+    x_src = x_src - np.nanmean(x_src, axis=0, keepdims=True)
+    x_dst = x_dst - np.nanmean(x_dst, axis=0, keepdims=True)
+    src_std = np.nanstd(x_src, axis=0) + 1e-8
+    dst_std = np.nanstd(x_dst, axis=0) + 1e-8
+    src_z = np.divide(x_src, src_std[None, :], out=np.zeros_like(x_src), where=src_std[None, :] > 0)
+    dst_z = np.divide(x_dst, dst_std[None, :], out=np.zeros_like(x_dst), where=dst_std[None, :] > 0)
+    corr = np.nan_to_num((src_z.T @ dst_z) / max(1, src_z.shape[0] - 1))
+    np.fill_diagonal(corr, 0.0)
+    return corr
+
+
+def _merge_edges(
+    src: np.ndarray,
+    dst: np.ndarray,
+    w: np.ndarray,
+    extra_edges: list[tuple[int, int, float]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not extra_edges:
+        return src, dst, w
+    edge_map: dict[tuple[int, int], float] = {}
+    for si, di, wi in zip(src.tolist(), dst.tolist(), w.tolist()):
+        edge_map[(int(si), int(di))] = edge_map.get((int(si), int(di)), 0.0) + float(wi)
+    for si, di, wi in extra_edges:
+        key = (int(si), int(di))
+        edge_map[key] = edge_map.get(key, 0.0) + float(wi)
+    keys = sorted(edge_map.keys())
+    if not keys:
+        return np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=float)
+    src_out = []
+    dst_out = []
+    w_out = []
+    for key in keys:
+        val = float(edge_map[key])
+        if not np.isfinite(val) or abs(val) < 1e-12:
+            continue
+        src_out.append(key[0])
+        dst_out.append(key[1])
+        w_out.append(val)
+    return np.array(src_out, dtype=int), np.array(dst_out, dtype=int), np.array(w_out, dtype=float)
+
+
+def _build_lead_lag_edges(
+    corr_window_df: pd.DataFrame,
+    config: GraphBuildConfig,
+) -> list[tuple[int, int, float]]:
+    if not bool(config.lead_lag_enabled):
+        return []
+    max_lag = max(1, int(config.lead_lag_max_lag))
+    mode = str(config.lead_lag_mode or "top_k").strip().lower()
+    if mode in {"", "auto"}:
+        mode = "top_k" if config.lead_lag_top_k is not None else "threshold"
+    if mode not in {"top_k", "threshold", "significance"}:
+        mode = "top_k"
+    if mode == "top_k" and config.lead_lag_top_k is None and config.lead_lag_threshold is not None:
+        mode = "threshold"
+    if mode == "threshold" and config.lead_lag_threshold is None and config.lead_lag_top_k is not None:
+        mode = "top_k"
+
+    lag_edge_map: dict[tuple[int, int], float] = {}
+    for lag in range(1, max_lag + 1):
+        if corr_window_df.shape[0] <= lag + 1:
+            break
+        lag_corr = _safe_lagged_corr_matrix(corr_window_df, lag=lag)
+        src_l, dst_l, w_l = _select_edges(
+            lag_corr,
+            config.lead_lag_top_k,
+            config.lead_lag_threshold,
+            symmetric=False,
+            mode=mode,
+            significance_alpha=float(config.significance_alpha),
+            n_obs=int(corr_window_df.shape[0] - lag),
+        )
+        for si, di, wi in zip(src_l.tolist(), dst_l.tolist(), w_l.tolist()):
+            key = (int(si), int(di))
+            val = float(wi)
+            if key not in lag_edge_map or abs(val) > abs(lag_edge_map[key]):
+                lag_edge_map[key] = val
+
+    scale = float(max(0.0, config.lead_lag_weight))
+    if scale == 0.0:
+        return []
+    out: list[tuple[int, int, float]] = []
+    for (si, di), wi in lag_edge_map.items():
+        out.append((si, di, scale * float(wi)))
+    return out
+
+
+def _prepare_static_edge_map(
+    static_edges: pd.DataFrame | None,
+) -> Dict[str, List[tuple[str, float, bool]]]:
+    if static_edges is None or static_edges.empty:
+        return {}
+    df = static_edges.copy()
+    if not {"src", "dst"}.issubset(df.columns):
+        return {}
+    if "weight" not in df.columns:
+        df["weight"] = 1.0
+    if "directed" not in df.columns:
+        df["directed"] = False
+    df["src"] = df["src"].astype(str).str.upper().str.strip()
+    df["dst"] = df["dst"].astype(str).str.upper().str.strip()
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(1.0)
+    if df["directed"].dtype == bool:
+        df["directed"] = df["directed"].astype(bool)
+    else:
+        d_txt = df["directed"].astype(str).str.strip().str.lower()
+        df["directed"] = d_txt.isin({"1", "true", "t", "yes", "y"})
+    df = df[(df["src"] != "") & (df["dst"] != "")]
+    edge_map: Dict[str, List[tuple[str, float, bool]]] = {}
+    for row in df.itertuples(index=False):
+        edge_map.setdefault(str(row.src), []).append(
+            (str(row.dst), float(row.weight), bool(row.directed))
+        )
+    return edge_map
+
+
 def _prepare_fundamentals_panel(
     fundamentals: pd.DataFrame | None,
     dates: List[str],
@@ -350,8 +486,11 @@ def _build_node_features(
         macro = macro_features.copy()
         if normalize:
             m_mean = np.nanmean(macro, axis=0, keepdims=True)
-            m_std = np.nanstd(macro, axis=0, keepdims=True) + 1e-8
-            macro = (macro - m_mean) / m_std
+            m_std = np.nanstd(macro, axis=0, keepdims=True)
+            # Macro vectors are often global (same value repeated for each node).
+            # In that case cross-node std is ~0 and z-scoring would zero out the signal.
+            if np.nanmax(m_std) > 1e-8:
+                macro = (macro - m_mean) / (m_std + 1e-8)
         values = np.concatenate([values, macro], axis=1)
 
     if feature_mode == "window_plus_summary_fund" and fund_features is not None:
@@ -382,12 +521,14 @@ def _window_to_graph_data(
     fund_cols: List[str],
     macro_panel: pd.DataFrame | None,
     macro_cols: List[str],
+    static_edge_map: Dict[str, List[tuple[str, float, bool]]],
 ):
     end_date = dates[end_idx]
     corr_end_idx = end_idx - max(0, int(config.corr_lag_days))
     feature_end_idx = end_idx - max(0, int(config.feature_lag_days))
     member_end_idx = end_idx - max(0, int(config.membership_lag_days))
-    if min(corr_end_idx, feature_end_idx, member_end_idx) < 0:
+    macro_end_idx = feature_end_idx - max(0, int(config.macro_lag_days))
+    if min(corr_end_idx, feature_end_idx, member_end_idx, macro_end_idx) < 0:
         return None, "lag_history"
 
     corr_start_idx = corr_end_idx - config.window + 1
@@ -438,32 +579,43 @@ def _window_to_graph_data(
         corr = _safe_partial_corr_matrix(corr_window_df, ridge=float(config.partial_corr_ridge))
     else:
         corr = _safe_corr_matrix(corr_window_df)
+    edge_mode = str(config.edge_select_mode or "top_k").strip().lower()
+    if edge_mode in {"", "auto"}:
+        edge_mode = "top_k" if config.top_k is not None else "threshold"
+    if edge_mode == "top_k" and config.top_k is None and config.corr_threshold is not None:
+        edge_mode = "threshold"
+    if edge_mode == "threshold" and config.corr_threshold is None and config.top_k is not None:
+        edge_mode = "top_k"
     src, dst, w = _select_edges(
         corr,
         config.top_k,
         config.corr_threshold,
         config.symmetric,
-        mode=config.edge_select_mode,
+        mode=edge_mode,
         significance_alpha=float(config.significance_alpha),
         n_obs=int(corr_window_df.shape[0]),
     )
-    if len(src) == 0:
-        return None, "no_edges"
+
+    extra_edges: list[tuple[int, int, float]] = []
+    lead_lag_edges = _build_lead_lag_edges(corr_window_df, config)
+    if lead_lag_edges:
+        extra_edges.extend(lead_lag_edges)
 
     fund_features = None
     fund_slice = None
-    if config.feature_mode == "window_plus_summary_fund" and fund_panel is not None:
+    if fund_panel is not None:
         feature_end_date = dates[feature_end_idx]
         try:
             fund_slice = fund_panel.loc[feature_end_date]
         except KeyError:
             fund_slice = None
-        if fund_slice is not None and fund_cols:
+        if fund_slice is not None:
             if isinstance(fund_slice, pd.Series):
                 fund_slice = fund_slice.to_frame().T
             if fund_slice.index.has_duplicates:
                 fund_slice = fund_slice.groupby(level=0).last()
             fund_slice = fund_slice.reindex(cols, axis=0)
+        if config.feature_mode == "window_plus_summary_fund" and fund_slice is not None and fund_cols:
             try:
                 fund_features = fund_slice[fund_cols].to_numpy()
             except KeyError:
@@ -472,11 +624,64 @@ def _window_to_graph_data(
                 # Fallback: skip fundamentals for this window if misaligned
                 fund_features = None
 
+    if bool(config.sector_static_enabled) and fund_slice is not None and "sector_code" in getattr(
+        fund_slice, "columns", []
+    ):
+        sector_weight = float(max(0.0, config.sector_static_weight))
+        sector_top_k = config.sector_static_top_k
+        if sector_weight > 0:
+            sector_codes = pd.to_numeric(
+                fund_slice.reindex(cols, axis=0)["sector_code"],
+                errors="coerce",
+            )
+            groups: Dict[int, List[int]] = {}
+            for idx_i, sec in enumerate(sector_codes.tolist()):
+                if not np.isfinite(sec):
+                    continue
+                groups.setdefault(int(sec), []).append(idx_i)
+            for idxs in groups.values():
+                if len(idxs) < 2:
+                    continue
+                per_node = len(idxs) - 1
+                if sector_top_k is not None:
+                    per_node = min(per_node, max(1, int(sector_top_k)))
+                for i in idxs:
+                    peers = [j for j in idxs if j != i]
+                    if not peers:
+                        continue
+                    if per_node < len(peers):
+                        peer_strength = np.abs(corr[i, peers])
+                        order = np.argsort(-peer_strength)[:per_node]
+                        peers = [peers[k] for k in order.tolist()]
+                    for j in peers:
+                        extra_edges.append((int(i), int(j), sector_weight))
+
+    if static_edge_map:
+        ticker_to_idx = {t: i for i, t in enumerate(cols)}
+        static_scale = float(max(0.0, config.static_edge_weight))
+        if static_scale > 0:
+            for src_ticker, src_i in ticker_to_idx.items():
+                for dst_ticker, edge_weight_raw, directed in static_edge_map.get(src_ticker, []):
+                    dst_i = ticker_to_idx.get(dst_ticker)
+                    if dst_i is None or dst_i == src_i:
+                        continue
+                    ew = static_scale * float(edge_weight_raw)
+                    if not np.isfinite(ew) or ew == 0.0:
+                        continue
+                    extra_edges.append((int(src_i), int(dst_i), ew))
+                    if not directed:
+                        extra_edges.append((int(dst_i), int(src_i), ew))
+
+    if extra_edges:
+        src, dst, w = _merge_edges(src, dst, w, extra_edges)
+        if len(src) == 0:
+            return None, "no_edges"
+
     macro_features = None
     if macro_panel is not None and macro_cols:
-        feature_end_date = dates[feature_end_idx]
-        if feature_end_date in macro_panel.index:
-            macro_vec = macro_panel.loc[feature_end_date, macro_cols].to_numpy(dtype=float)
+        macro_end_date = dates[macro_end_idx]
+        if macro_end_date in macro_panel.index:
+            macro_vec = macro_panel.loc[macro_end_date, macro_cols].to_numpy(dtype=float)
             macro_features = np.tile(macro_vec[None, :], (len(cols), 1))
 
     node_weight_mode = str(config.edge_node_weighting).strip().lower()
@@ -527,6 +732,7 @@ def build_rolling_corr_graphs(
     config: GraphBuildConfig,
     fundamentals: pd.DataFrame | None = None,
     macro: pd.DataFrame | None = None,
+    static_edges: pd.DataFrame | None = None,
     num_workers: int = 1,
     parallel_backend: str | None = "threadpool",
     joblib_prefer: str = "threads",
@@ -536,6 +742,7 @@ def build_rolling_corr_graphs(
     dates = list(returns.index)
     fund_panel, fund_cols = _prepare_fundamentals_panel(fundamentals, dates)
     macro_panel, macro_cols = _prepare_macro_panel(macro, dates)
+    static_edge_map = _prepare_static_edge_map(static_edges)
     graphs: List[Data] = []
     graph_dates: List[str] = []
     node_tickers: List[List[str]] = []
@@ -563,6 +770,7 @@ def build_rolling_corr_graphs(
             fund_cols,
             macro_panel,
             macro_cols,
+            static_edge_map,
         )
 
     backend = (parallel_backend or "threadpool").lower()

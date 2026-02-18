@@ -38,6 +38,12 @@ class HallucinationConfig:
     moment_var_weight: float = 0.0
     moment_skew_weight: float = 0.0
     moment_scope: str = "returns"  # "returns" or "all"
+    adversarial_hub_fraction: float = 0.2
+    adversarial_feature_noise_mult: float = 3.0
+    adversarial_timeflip_prob: float = 0.5
+    adversarial_edge_drop_prob: float = 0.2
+    adversarial_sign_flip_prob: float = 0.2
+    adversarial_hub_weight_scale: float = 0.5
 
 
 def _edge_corr_loss(

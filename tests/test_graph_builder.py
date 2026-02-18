@@ -348,7 +348,46 @@ def test_build_rolling_corr_graphs_supports_macro_and_edge_node_weighting():
     )
     # window(3) + summary(5) + macro(2)
     assert g_w[0].x.shape[1] == 10
+    assert torch.abs(g_w[0].x[:, -2:]).sum() > 0
     assert not torch.allclose(g_none[0].edge_attr, g_w[0].edge_attr)
+
+
+def test_build_rolling_corr_graphs_macro_lag_days_uses_past_macro_row():
+    dates = pd.date_range("2020-01-01", periods=6, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.02, 0.01, -0.01, 0.00, 0.01],
+            "BBB": [0.00, 0.01, 0.02, 0.01, -0.01, -0.02],
+            "CCC": [0.02, 0.01, 0.00, -0.01, 0.00, 0.01],
+        },
+        index=dates,
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    macro = pd.DataFrame({"m1": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]}, index=dates)
+    cfg = GraphBuildConfig(
+        window=3,
+        step=1,
+        top_k=1,
+        min_nodes=2,
+        feature_mode="last",
+        normalize=False,
+        macro_lag_days=1,
+    )
+    graphs, graph_dates, _, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        macro=macro,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    assert stats["built"] >= 1
+    assert graph_dates[0] == dates[2]
+    expected_macro = float(macro.loc[dates[1], "m1"])
+    assert np.allclose(graphs[0].x[:, -1].numpy(), expected_macro, atol=1e-8)
 
 
 def test_build_rolling_corr_graphs_partial_corr_mode_builds_graphs():
@@ -386,3 +425,153 @@ def test_build_rolling_corr_graphs_partial_corr_mode_builds_graphs():
     )
     assert stats["built"] >= 1
     assert torch.isfinite(graphs[0].edge_attr).all()
+
+
+def test_build_rolling_corr_graphs_can_build_with_lead_lag_edges_only():
+    dates = pd.date_range("2020-01-01", periods=8, freq="D").strftime("%Y-%m-%d")
+    aaa = np.array([0.01, -0.01, 0.02, -0.02, 0.03, -0.03, 0.04, -0.04], dtype=float)
+    bbb = np.concatenate([[0.0], aaa[:-1]])
+    returns = pd.DataFrame(
+        {
+            "AAA": aaa,
+            "BBB": bbb,
+            "CCC": np.array([0.005, -0.004, 0.003, -0.002, 0.002, -0.001, 0.001, -0.001], dtype=float),
+        },
+        index=dates,
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    cfg = GraphBuildConfig(
+        window=6,
+        step=1,
+        top_k=None,
+        corr_threshold=2.0,
+        min_nodes=2,
+        feature_mode="window",
+        normalize=False,
+        symmetric=False,
+        lead_lag_enabled=True,
+        lead_lag_max_lag=1,
+        lead_lag_top_k=1,
+        lead_lag_weight=1.0,
+        lead_lag_mode="top_k",
+    )
+    graphs, _, tickers, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        macro=None,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    assert stats["built"] >= 1
+    found_a_to_b = False
+    for g, ts in zip(graphs, tickers):
+        idx = {t: i for i, t in enumerate(ts)}
+        if "AAA" not in idx or "BBB" not in idx:
+            continue
+        pairs = set(zip(g.edge_index[0].tolist(), g.edge_index[1].tolist()))
+        if (idx["AAA"], idx["BBB"]) in pairs:
+            found_a_to_b = True
+            break
+    assert found_a_to_b
+
+
+def test_build_rolling_corr_graphs_supports_static_edge_overlay_without_corr_edges():
+    dates = pd.date_range("2020-01-01", periods=6, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.00, 0.01, 0.00, 0.01, 0.00],
+            "BBB": [0.00, 0.01, 0.00, 0.01, 0.00, 0.01],
+            "CCC": [0.02, -0.01, 0.02, -0.01, 0.02, -0.01],
+        },
+        index=dates,
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    static_edges = pd.DataFrame(
+        {
+            "src": ["AAA"],
+            "dst": ["CCC"],
+            "weight": [2.0],
+            "directed": [False],
+        }
+    )
+    cfg = GraphBuildConfig(
+        window=4,
+        step=1,
+        top_k=None,
+        corr_threshold=2.0,
+        min_nodes=2,
+        feature_mode="window",
+        normalize=True,
+        symmetric=False,
+        static_edge_weight=0.5,
+    )
+    graphs, _, tickers, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        macro=None,
+        static_edges=static_edges,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    assert stats["built"] >= 1
+    idx = {t: i for i, t in enumerate(tickers[0])}
+    pairs = set(zip(graphs[0].edge_index[0].tolist(), graphs[0].edge_index[1].tolist()))
+    assert (idx["AAA"], idx["CCC"]) in pairs
+    assert (idx["CCC"], idx["AAA"]) in pairs
+
+
+def test_sector_static_edges_work_even_when_feature_mode_is_not_fund():
+    dates = pd.date_range("2020-01-01", periods=6, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.00, 0.01, 0.00, 0.01, 0.00],
+            "BBB": [0.01, 0.00, 0.01, 0.00, 0.01, 0.00],
+            "CCC": [0.02, -0.01, 0.02, -0.01, 0.02, -0.01],
+        },
+        index=dates,
+    )
+    fundamentals = pd.DataFrame(
+        {
+            "date": [dates[-1], dates[-1], dates[-1]],
+            "ticker": ["AAA", "BBB", "CCC"],
+            "sector_code": [10, 10, 20],
+        }
+    )
+    membership = {d: ["AAA", "BBB", "CCC"] for d in dates}
+    cfg = GraphBuildConfig(
+        window=4,
+        step=1,
+        top_k=None,
+        corr_threshold=2.0,
+        min_nodes=2,
+        feature_mode="window",
+        normalize=True,
+        symmetric=False,
+        sector_static_enabled=True,
+        sector_static_weight=0.2,
+        sector_static_top_k=2,
+    )
+    graphs, _, tickers, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=fundamentals,
+        macro=None,
+        static_edges=None,
+        num_workers=1,
+        parallel_backend="serial",
+        progress=False,
+    )
+    assert stats["built"] >= 1
+    idx = {t: i for i, t in enumerate(tickers[-1])}
+    pairs = set(zip(graphs[-1].edge_index[0].tolist(), graphs[-1].edge_index[1].tolist()))
+    assert (idx["AAA"], idx["BBB"]) in pairs

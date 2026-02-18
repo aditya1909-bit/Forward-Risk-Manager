@@ -19,6 +19,8 @@ from frisk.data import (
     build_membership_map_all,
     load_fundamentals,
     load_macro_features,
+    load_static_edges,
+    build_macro_features_from_market_data,
 )
 from frisk.graph_builder import GraphBuildConfig, build_rolling_corr_graphs
 
@@ -41,6 +43,22 @@ def _get_setting(args: argparse.Namespace, section: dict, key: str, default):
     return default
 
 
+def _optional_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return int(value)
+
+
+def _optional_float(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return float(value)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build rolling correlation graphs from tidy CSVs.")
     parser.add_argument("--config", help="Path to TOML config")
@@ -53,6 +71,29 @@ def main() -> int:
     )
     parser.add_argument(
         "--macro", help="Optional macro feature CSV (date + feature columns)", default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--macro-auto",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Auto-generate macro features from the available price/volume panel when --macro is empty.",
+    )
+    parser.add_argument(
+        "--macro-auto-short-window",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Short rolling window used in auto-generated macro features.",
+    )
+    parser.add_argument(
+        "--macro-auto-long-window",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Long rolling window used in auto-generated macro features.",
+    )
+    parser.add_argument(
+        "--static-edges",
+        help="Optional static edge CSV (e.g., src,dst,weight,directed).",
+        default=argparse.SUPPRESS,
     )
     parser.add_argument("--out", help="Output .pt file", default=argparse.SUPPRESS)
     parser.add_argument("--window", type=int, help="Rolling window size in days", default=argparse.SUPPRESS)
@@ -74,6 +115,12 @@ def main() -> int:
         type=int,
         default=argparse.SUPPRESS,
         help="Lag (days) applied to membership date lookup to prevent lookahead.",
+    )
+    parser.add_argument(
+        "--macro-lag-days",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Additional lag (days) applied to macro feature lookup to prevent lookahead.",
     )
     parser.add_argument("--top-k", type=int, help="Top-k correlations per node", default=argparse.SUPPRESS)
     parser.add_argument(
@@ -152,6 +199,66 @@ def main() -> int:
     parser.add_argument(
         "--no-normalize", action="store_true", help="Disable per-node z-score normalization"
     )
+    parser.add_argument(
+        "--lead-lag-enabled",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Add directed lead-lag edges estimated from lagged cross-correlations.",
+    )
+    parser.add_argument(
+        "--lead-lag-max-lag",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum lag (in days) for lead-lag edge search.",
+    )
+    parser.add_argument(
+        "--lead-lag-top-k",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Top-k lead-lag edges per node when lead_lag_mode=top_k.",
+    )
+    parser.add_argument(
+        "--lead-lag-threshold",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Absolute lagged-correlation threshold when lead_lag_mode=threshold.",
+    )
+    parser.add_argument(
+        "--lead-lag-weight",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Global weight multiplier for lead-lag edges.",
+    )
+    parser.add_argument(
+        "--lead-lag-mode",
+        choices=["top_k", "threshold", "significance"],
+        default=argparse.SUPPRESS,
+        help="Lead-lag edge selection method.",
+    )
+    parser.add_argument(
+        "--sector-static-enabled",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Add permanent same-sector edges from fundamentals when available.",
+    )
+    parser.add_argument(
+        "--sector-static-weight",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Weight for same-sector static edges.",
+    )
+    parser.add_argument(
+        "--sector-static-top-k",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Max same-sector peers per node for static sector edges.",
+    )
+    parser.add_argument(
+        "--static-edge-weight",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Global multiplier for user-provided static edges.",
+    )
     parser.add_argument("--no-symmetric", action="store_true", help="Disable symmetric edge mirroring")
     parser.add_argument(
         "--include-tickers",
@@ -206,6 +313,10 @@ def main() -> int:
     constituents_path = _get_setting(args, section, "constituents", None)
     fundamentals_path = _get_setting(args, section, "fundamentals", None)
     macro_path = _get_setting(args, section, "macro", None)
+    macro_auto = bool(_get_setting(args, section, "macro_auto", False))
+    macro_auto_short_window = int(_get_setting(args, section, "macro_auto_short_window", 21))
+    macro_auto_long_window = int(_get_setting(args, section, "macro_auto_long_window", 63))
+    static_edges_path = _get_setting(args, section, "static_edges", None)
     out_path = _get_setting(args, section, "out", "data/processed/graphs.pt")
 
     if not prices_path:
@@ -216,6 +327,7 @@ def main() -> int:
     corr_lag_days = _get_setting(args, section, "corr_lag_days", 0)
     feature_lag_days = _get_setting(args, section, "feature_lag_days", 0)
     membership_lag_days = _get_setting(args, section, "membership_lag_days", 0)
+    macro_lag_days = _get_setting(args, section, "macro_lag_days", 0)
     top_k = _get_setting(args, section, "top_k", 10)
     corr_threshold = _get_setting(args, section, "corr_threshold", None)
     min_nodes = _get_setting(args, section, "min_nodes", 50)
@@ -231,6 +343,16 @@ def main() -> int:
     cross_sectional_norm = _get_setting(args, section, "cross_sectional_norm", False)
     edge_node_weighting = _get_setting(args, section, "edge_node_weighting", "none")
     edge_node_weight_power = _get_setting(args, section, "edge_node_weight_power", 0.5)
+    lead_lag_enabled = bool(_get_setting(args, section, "lead_lag_enabled", False))
+    lead_lag_max_lag = int(_get_setting(args, section, "lead_lag_max_lag", 3))
+    lead_lag_top_k = _get_setting(args, section, "lead_lag_top_k", 2)
+    lead_lag_threshold = _get_setting(args, section, "lead_lag_threshold", None)
+    lead_lag_weight = float(_get_setting(args, section, "lead_lag_weight", 0.5))
+    lead_lag_mode = str(_get_setting(args, section, "lead_lag_mode", "top_k"))
+    sector_static_enabled = bool(_get_setting(args, section, "sector_static_enabled", False))
+    sector_static_weight = float(_get_setting(args, section, "sector_static_weight", 0.25))
+    sector_static_top_k = _get_setting(args, section, "sector_static_top_k", 4)
+    static_edge_weight = float(_get_setting(args, section, "static_edge_weight", 0.25))
     normalize = _get_setting(args, section, "normalize", True)
     symmetric = _get_setting(args, section, "symmetric", True)
     membership_mode = _get_setting(args, section, "membership_mode", "constituents")
@@ -312,12 +434,43 @@ def main() -> int:
             fundamentals = fundamentals[fundamentals["date"] <= end_date]
 
     macro = None
+    macro_source = "none"
     if macro_path:
-        macro = load_macro_features(Path(macro_path))
+        try:
+            macro = load_macro_features(Path(macro_path))
+            macro_source = "file"
+        except Exception as exc:
+            if not macro_auto:
+                raise
+            print(f"warning: failed to load macro CSV ({exc}); using auto-generated macro features.")
+            macro = build_macro_features_from_market_data(
+                returns=returns,
+                volume=volume,
+                short_window=macro_auto_short_window,
+                long_window=macro_auto_long_window,
+            )
+            macro_source = "auto_fallback"
+    elif macro_auto:
+        macro = build_macro_features_from_market_data(
+            returns=returns,
+            volume=volume,
+            short_window=macro_auto_short_window,
+            long_window=macro_auto_long_window,
+        )
+        macro_source = "auto"
+
+    if macro is not None and not macro.empty:
         if start_date:
             macro = macro[macro.index >= start_date]
         if end_date:
             macro = macro[macro.index <= end_date]
+        if macro_source != "none":
+            print(f"Macro features: source={macro_source} cols={macro.shape[1]} rows={macro.shape[0]}")
+
+    static_edges = None
+    if static_edges_path:
+        static_edges = load_static_edges(Path(static_edges_path))
+        print(f"Static edges loaded: rows={len(static_edges)} path={static_edges_path}")
 
     cfg = GraphBuildConfig(
         window=window,
@@ -325,6 +478,7 @@ def main() -> int:
         corr_lag_days=max(0, int(corr_lag_days)),
         feature_lag_days=max(0, int(feature_lag_days)),
         membership_lag_days=max(0, int(membership_lag_days)),
+        macro_lag_days=max(0, int(macro_lag_days)),
         top_k=top_k,
         corr_threshold=corr_threshold,
         min_nodes=min_nodes,
@@ -342,6 +496,16 @@ def main() -> int:
         significance_alpha=float(significance_alpha),
         edge_node_weighting=str(edge_node_weighting),
         edge_node_weight_power=float(edge_node_weight_power),
+        lead_lag_enabled=bool(lead_lag_enabled),
+        lead_lag_max_lag=max(1, int(lead_lag_max_lag)),
+        lead_lag_top_k=_optional_int(lead_lag_top_k),
+        lead_lag_threshold=_optional_float(lead_lag_threshold),
+        lead_lag_weight=float(lead_lag_weight),
+        lead_lag_mode=str(lead_lag_mode),
+        sector_static_enabled=bool(sector_static_enabled),
+        sector_static_weight=float(sector_static_weight),
+        sector_static_top_k=_optional_int(sector_static_top_k),
+        static_edge_weight=float(static_edge_weight),
     )
 
     graphs, dates, tickers, stats = build_rolling_corr_graphs(
@@ -351,6 +515,7 @@ def main() -> int:
         cfg,
         fundamentals=fundamentals,
         macro=macro,
+        static_edges=static_edges,
         num_workers=workers,
         parallel_backend=parallel_backend,
         joblib_prefer=joblib_prefer,
