@@ -32,9 +32,9 @@ Publish curated artifacts from a run:
 python scripts/publish_run.py --run-id <run_id>
 ```
 
-## Current Results Snapshot (as of 2026-02-15)
+## Current Results Snapshot (as of 2026-02-18)
 Latest notebook run IDs:
-- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260215_180439/`
+- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260218_024603/`
 - Latest full end-to-end run (sweep/scenario/calibration/backtest): `runs/experiments/e2e_runbook_20260215_143702/`
 - Recovery ablation outputs: `runs/experiments/recovery_ablation/`
 
@@ -43,24 +43,24 @@ Published index status (`reports/index.csv`):
 - `sweep/latest_tune.csv` still points to `legacy-20260211-colab`.
 - Notebook runbook artifacts (`e2e_runbook_*` and `paper_final_500_*`) are local run artifacts until promoted/published.
 
-Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260215_180439/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
+Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260218_024603/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
 
 | mode | quality metric | quality value | eval_auroc | eval_auprc | avg_epoch_s | graphs_per_s | econ_ann_return_uplift | econ_sharpe_uplift |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| `ff_layerwise` | `eval_sep` | `9.32724` | `0.97611` | `0.98411` | `0.609` | `2372.2` | `-12.36%` | `+0.013` |
-| `ff_e2e` | `eval_sep` | `24.23168` | `0.99997` | `0.99997` | `0.418` | `3447.8` | `-12.89%` | `+0.016` |
-| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.359` | `4027.6` | `-21.73%` | `-0.405` |
+| `ff_layerwise` | `eval_sep` | `6.28991` | `0.74806` | `0.79869` | `1.767` | `817.6` | `-29.78%` | `-0.396` |
+| `ff_e2e` | `eval_sep` | `14.64823` | `1.00000` | `1.00000` | `0.808` | `1786.6` | `-30.05%` | `-0.274` |
+| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.532` | `2713.4` | `-26.89%` | `+0.193` |
 
 Latest completed benchmark status:
-- Best quality: `ff_e2e` (`eval_sep=24.23168`, `eval_auroc=0.99997`).
-- Fastest mode: `backprop` (`4027.6` graphs/s).
-- Best economics in this run: `ff_e2e` (`econ_sharpe_uplift=+0.016`, `econ_ann_return_uplift=-12.89%`).
+- Best quality: `ff_e2e` (`eval_sep=14.64823`, `eval_auroc=1.00000`).
+- Fastest mode: `backprop` (`2713.4` graphs/s).
+- Best economics in this run (Sharpe-based): `backprop` (`econ_sharpe_uplift=+0.193`, `econ_ann_return_uplift=-26.89%`).
 
 How to read this latest paper result:
-- Quality and economics are not aligned in this run: `backprop` saturates classification metrics but has the weakest economics (`econ_sharpe_uplift=-0.405`).
-- `ff_e2e` wins on both quality and relative economics, but Sharpe uplift is only marginally positive because economics are unstable across walk-forward folds.
-- Fold-level `ff_e2e` economics (`runs/experiments/paper_final_500_20260215_180439/metrics/benchmark_walk_forward_folds.csv`): Sharpe uplift `+0.201`, `+0.843`, `-0.997`; annual return uplift `-1.00%`, `-1.35%`, `-36.32%`.
-- Conclusion for this run: if target metric is Sharpe, choose `ff_e2e` among the 3 modes, but treat it as regime-sensitive rather than consistently better.
+- Quality and economics are still not aligned: `ff_e2e` has the strongest separation objective (`eval_sep`) but does not win economics.
+- `backprop` is best on speed and Sharpe uplift, but all three modes still have negative annual return uplift versus buy-and-hold in this window.
+- Fold-level economics remain unstable (`runs/experiments/paper_final_500_20260218_024603/metrics/benchmark_walk_forward_folds.csv`), with Sharpe uplift changing sign across folds for every mode.
+- `objective_track` matters when reading rows: `ff_*` rows are critic/separation-tracked; `backprop` is classifier/`eval_auroc`-tracked.
 
 Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, focused `risk_head` rerun generated 2026-02-14 21:32):
 
@@ -380,6 +380,18 @@ Run a small benchmark to compare speed and outcomes between:
 ```bash
 python scripts/benchmark_training.py --config configs/default.toml
 ```
+
+### Colab Notebook Resume (`notebooks/paper_final_benchmark_colab.ipynb`)
+The paper notebook is set up to resume safely from benchmarking:
+- Cell 3: set `RUN_ID_OVERRIDE` (for example `paper_final_500_20260218_024603`) to attach to an existing run instead of creating a new one.
+- Cell 4: graph build auto-skips when `runs/experiments/<run_id>/data/graphs.pt` already exists (`FORCE_REBUILD_GRAPHS` can override).
+- Cell 5: benchmark runs mode-by-mode (`ff_layerwise`, `ff_e2e`, `backprop`) and writes per-mode files:
+  - `metrics/benchmark_ff_layerwise.csv`, `metrics/benchmark_ff_e2e.csv`, `metrics/benchmark_backprop.csv`
+  - matching fold files `metrics/benchmark_walk_forward_folds_<mode>.csv`
+- Re-running cell 5 skips completed modes and only executes missing ones, then merges back to:
+  - `metrics/benchmark.csv`
+  - `metrics/benchmark_walk_forward_folds.csv`
+- If interruption happens mid-mode, that mode is rerun end-to-end (current benchmark script does not checkpoint inside a mode).
 
 Customize via `configs/default.toml`:
 ```
