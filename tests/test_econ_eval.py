@@ -168,3 +168,44 @@ def test_resolve_price_ticker_requested_list_handles_whitespace(tmp_path):
     assert ticker == "BBB"
     assert src == "requested_priority"
     assert rows == 2
+
+
+def test_evaluate_goodness_strategy_regime_thresholding_outputs_stats():
+    dates = pd.date_range("2021-01-01", periods=160, freq="D")
+    base = np.linspace(-1.0, 1.0, num=160)
+    noise = 0.1 * np.sin(np.linspace(0, 20, num=160))
+    goodness = base + noise
+    # Piecewise volatility regimes.
+    low = 0.002 * np.sin(np.linspace(0, 6, num=60))
+    mid = 0.008 * np.sin(np.linspace(0, 6, num=50))
+    high = 0.02 * np.sin(np.linspace(0, 6, num=50))
+    fwd = pd.Series(np.concatenate([low, mid, high]), index=dates)
+
+    out_on = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=40,
+        signal_quantile=0.5,
+        regime_thresholding_enabled=True,
+        regime_threshold_window=40,
+        regime_threshold_quantile=0.5,
+        regime_vol_window=15,
+        regime_low_quantile=0.33,
+        regime_high_quantile=0.67,
+    )
+    out_off = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=40,
+        signal_quantile=0.5,
+        regime_thresholding_enabled=False,
+    )
+
+    assert out_on["econ_regime_thresholding_enabled"] == 1.0
+    assert out_off["econ_regime_thresholding_enabled"] == 0.0
+    assert out_on["econ_regime_low_count"] > 0
+    assert out_on["econ_regime_mid_count"] > 0
+    assert out_on["econ_regime_high_count"] > 0
+    assert np.isfinite(out_on["econ_strategy_ann_return"])

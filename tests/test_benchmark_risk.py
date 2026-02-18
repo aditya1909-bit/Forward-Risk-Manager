@@ -138,3 +138,39 @@ def test_ff_sweep_aggregate_fold_rows_preserves_objective_metadata():
     assert agg["neg_mode_effective"] == "shuffle+noise"
     assert agg["eval_neg_mode_effective"] == "shuffle+noise"
     assert agg["risk_head_enabled_effective"] is True
+
+
+def test_baseline_context_includes_seed_split_device_and_sizes():
+    mod = _load_script("benchmark_training.py")
+    cfg = {"seed": 11, "split_mode": "chronological", "batch_size": 32, "eval_frac": 0.2}
+    ctx = mod._baseline_context(cfg, torch.device("cpu"), num_graphs=123)
+    assert ctx["baseline_seed"] == 11
+    assert ctx["baseline_split_mode"] == "chronological"
+    assert ctx["baseline_device"] == "cpu"
+    assert ctx["baseline_graphs_total"] == 123
+    assert ctx["baseline_batch_size"] == 32
+
+
+def test_make_negatives_timing_tracks_neg_generation():
+    mod = _load_script("benchmark_training.py")
+    x = torch.randn(6, 4)
+    batch = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long)
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 0, 4]], dtype=torch.long)
+    hall_cfg = mod.HallucinationConfig()
+    timing = {}
+    x_neg = mod._make_negatives(
+        model=None,
+        x=x,
+        batch=batch,
+        edge_index=edge_index,
+        edge_attr=None,
+        edge_weight=None,
+        use_mode="shuffle",
+        noise_std=0.05,
+        hall_cfg=hall_cfg,
+        window_len=2,
+        summary_dim=2,
+        timing=timing,
+    )
+    assert x_neg.shape == x.shape
+    assert timing.get("neg_gen", 0.0) > 0.0

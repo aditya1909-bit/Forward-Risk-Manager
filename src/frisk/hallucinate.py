@@ -10,7 +10,7 @@ from .ff import goodness
 
 @dataclass
 class HallucinationConfig:
-    steps: int = 10
+    steps: int = 6
     lr: float = 0.1
     l2_weight: float = 0.1
     mean_weight: float = 0.05
@@ -44,6 +44,8 @@ class HallucinationConfig:
     adversarial_edge_drop_prob: float = 0.2
     adversarial_sign_flip_prob: float = 0.2
     adversarial_hub_weight_scale: float = 0.5
+    warmup_epochs: int = 0
+    every_n_batches: int = 1
 
 
 def _edge_corr_loss(
@@ -178,7 +180,8 @@ def hallucinate_negative(
             s = c.std(unbiased=False) + 1e-6
             return (c.pow(3).mean()) / (s.pow(3) + 1e-6)
 
-        for step_i in range(config.steps):
+        steps = max(1, int(config.steps))
+        for step_i in range(steps):
             if forward_fn is not None:
                 h = forward_fn(x_var)
             else:

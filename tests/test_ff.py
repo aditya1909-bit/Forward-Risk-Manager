@@ -7,6 +7,7 @@ from frisk.ff import (
     make_negative,
     pairwise_distance_forward_loss,
     permute_graph_embeddings,
+    rank_spread_loss,
     self_contrastive_loss,
     self_contrastive_retrieval_accuracy,
 )
@@ -127,6 +128,78 @@ def test_make_negative_phase_randomize_keeps_tail_and_moments():
     assert torch.allclose(out[:, :4].std(dim=1), x[:, :4].std(dim=1), atol=1e-4)
 
 
+def test_make_negative_sector_swap_respects_graph_and_sector_groups():
+    x = torch.tensor(
+        [
+            [1.0, 10.0, 0.0],
+            [2.0, 10.0, 0.0],
+            [3.0, 20.0, 0.0],
+            [4.0, 20.0, 0.0],
+            [101.0, 10.0, 0.0],
+            [102.0, 10.0, 0.0],
+            [103.0, 20.0, 0.0],
+            [104.0, 20.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    batch = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+    out = make_negative(
+        x,
+        batch,
+        mode="sector_swap",
+        sector_idx=1,
+    )
+    for gid in [0, 1]:
+        for sec in [10.0, 20.0]:
+            idx = ((batch == gid) & (x[:, 1] == sec)).nonzero(as_tuple=False).view(-1)
+            src_vals = set(x[idx, 0].tolist())
+            out_vals = set(out[idx, 0].tolist())
+            assert out_vals.issubset(src_vals)
+
+
+def test_make_negative_factor_hard_is_seed_deterministic_and_no_cross_graph():
+    x = torch.tensor(
+        [
+            [1.0, 2.0, 0.1, 0.2],
+            [2.0, 3.0, 0.2, 0.1],
+            [3.0, 4.0, 0.3, 0.4],
+            [101.0, 102.0, 0.1, 0.2],
+            [102.0, 103.0, 0.2, 0.1],
+            [103.0, 104.0, 0.3, 0.4],
+        ],
+        dtype=torch.float32,
+    )
+    batch = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long)
+
+    torch.manual_seed(7)
+    out_a = make_negative(
+        x,
+        batch,
+        mode="factor_hard",
+        window_len=2,
+        factor_start_idx=2,
+        factor_dim=2,
+        hard_topk=2,
+    )
+    torch.manual_seed(7)
+    out_b = make_negative(
+        x,
+        batch,
+        mode="factor_hard",
+        window_len=2,
+        factor_start_idx=2,
+        factor_dim=2,
+        hard_topk=2,
+    )
+    assert torch.equal(out_a, out_b)
+
+    for gid in [0, 1]:
+        idx = (batch == gid).nonzero(as_tuple=False).view(-1)
+        src_rows = {tuple(row.tolist()) for row in x[idx, :2]}
+        out_rows = {tuple(row.tolist()) for row in out_a[idx, :2]}
+        assert out_rows.issubset(src_rows)
+
+
 def test_permute_graph_embeddings_deranges_rows_for_n_gt_1():
     torch.manual_seed(0)
     z = torch.arange(12, dtype=torch.float32).reshape(4, 3)
@@ -184,3 +257,11 @@ def test_ff_loss_margin_penalizes_small_positive_negative_gap():
     base = ff_loss(g_pos, g_neg, target=1.0, margin=0.0, margin_weight=1.0)
     with_margin = ff_loss(g_pos, g_neg, target=1.0, margin=0.3, margin_weight=1.0)
     assert float(with_margin) > float(base)
+
+
+def test_rank_spread_loss_smaller_when_top_bottom_gap_is_larger():
+    scores_small_gap = torch.tensor([0.5, 0.52, 0.49, 0.51, 0.5], dtype=torch.float32)
+    scores_big_gap = torch.tensor([0.9, 0.85, 0.5, 0.2, 0.1], dtype=torch.float32)
+    loss_small = rank_spread_loss(scores_small_gap, top_frac=0.4, margin=0.1)
+    loss_big = rank_spread_loss(scores_big_gap, top_frac=0.4, margin=0.1)
+    assert float(loss_small) > float(loss_big)

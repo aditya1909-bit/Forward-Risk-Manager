@@ -10,6 +10,7 @@ import tomllib
 import csv
 import math
 import hashlib
+import time
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,7 @@ from frisk.ff import (
     make_negative,
     pairwise_distance_forward_loss,
     permute_graph_embeddings,
+    rank_spread_loss,
     self_contrastive_loss,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
@@ -53,6 +55,8 @@ _NEG_AUG_MODES = {
     "cross_asset_mix",
     "phase_randomize",
     "edge_attack",
+    "sector_swap",
+    "factor_hard",
 }
 
 
@@ -209,6 +213,195 @@ def _parse_positive_int_list(value, fallback: int) -> list[int]:
     if vals:
         return vals
     return [max(1, int(fallback))]
+
+
+def _parse_str_list(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        items = [str(v).strip() for v in value]
+    elif value is None:
+        items = []
+    else:
+        items = [s.strip() for s in str(value).split(",")]
+    return [s for s in items if s]
+
+
+def _parse_float_list(value) -> list[float]:
+    out: list[float] = []
+    for s in _parse_str_list(value):
+        try:
+            out.append(float(s))
+        except ValueError:
+            continue
+    return out
+
+
+def _normalize_mode_weights(modes: list[str], weights: list[float]) -> dict[str, float]:
+    if not modes:
+        return {}
+    if not weights:
+        return {m: 1.0 / len(modes) for m in modes}
+    vals = []
+    for i, _ in enumerate(modes):
+        if i < len(weights):
+            vals.append(max(0.0, float(weights[i])))
+        else:
+            vals.append(0.0)
+    s = sum(vals)
+    if s <= 0:
+        return {m: 1.0 / len(modes) for m in modes}
+    return {m: vals[i] / s for i, m in enumerate(modes)}
+
+
+def _curriculum_phase(epoch: int, total_epochs: int, ratios: list[float]) -> int:
+    if not ratios:
+        r = [0.33, 0.34, 0.33]
+    else:
+        r = [max(0.0, float(v)) for v in ratios[:3]]
+        if len(r) < 3:
+            r.extend([0.0] * (3 - len(r)))
+    s = sum(r)
+    if s <= 0:
+        cuts = [0.33, 0.67]
+    else:
+        n = [v / s for v in r]
+        cuts = [n[0], n[0] + n[1]]
+    p = float(epoch) / max(1.0, float(total_epochs))
+    if p <= cuts[0]:
+        return 0
+    if p <= cuts[1]:
+        return 1
+    return 2
+
+
+def _pick_curriculum_neg_mode(
+    base_mode: str,
+    epoch: int,
+    epochs: int,
+    mix_modes: list[str],
+    mix_weights: dict[str, float],
+    phase_ratios: list[float],
+) -> str:
+    mode = str(base_mode).strip().lower()
+    if mode in {"hallucinate", "self_contrastive"}:
+        return mode
+    if not mix_modes:
+        return mode
+    phase = _curriculum_phase(epoch, epochs, phase_ratios)
+    easy = {"noise", "time_flip", "shuffle+noise", "shuffle"}
+    mid = easy | {"sector_swap"}
+    if phase == 0:
+        allowed = [m for m in mix_modes if m in easy]
+    elif phase == 1:
+        allowed = [m for m in mix_modes if m in mid]
+    else:
+        allowed = list(mix_modes)
+    if not allowed:
+        return mode
+    probs = [max(0.0, float(mix_weights.get(m, 0.0))) for m in allowed]
+    ps = sum(probs)
+    if ps <= 0:
+        return random.choice(allowed)
+    r = random.random() * ps
+    c = 0.0
+    for m, p in zip(allowed, probs):
+        c += p
+        if r <= c:
+            return m
+    return allowed[-1]
+
+
+def _infer_neg_feature_slices(window_len: int, summary_dim: int) -> tuple[int | None, int | None, int]:
+    if window_len <= 0:
+        return None, None, 0
+    if summary_dim >= 10:
+        # window_plus_summary_fund: [returns | summary(5) | fund(5)].
+        sector_idx = int(window_len) + 5
+        factor_start = sector_idx + 1
+        return sector_idx, factor_start, 4
+    if summary_dim >= 2:
+        return None, int(window_len), min(4, int(summary_dim))
+    return None, None, 0
+
+
+def _should_use_hallucination(
+    epoch: int,
+    step_idx: int,
+    warmup_epochs: int,
+    every_n_batches: int,
+) -> bool:
+    if epoch <= int(max(0, warmup_epochs)):
+        return False
+    n = max(1, int(every_n_batches))
+    return (int(step_idx) % n) == 0
+
+
+def _concat_forward_pos_neg(
+    model,
+    x_pos: torch.Tensor,
+    x_neg: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor | None,
+    batch_nodes: torch.Tensor,
+    return_all: bool = False,
+):
+    if x_pos.shape != x_neg.shape:
+        raise ValueError(
+            f"concat forward expects matching shapes, got {tuple(x_pos.shape)} vs {tuple(x_neg.shape)}"
+        )
+    n_nodes = int(x_pos.size(0))
+    if n_nodes == 0:
+        if return_all:
+            return [], []
+        return x_pos, x_neg
+    num_graphs = int(batch_nodes.max().item()) + 1 if batch_nodes.numel() else 0
+    x_cat = torch.cat([x_pos, x_neg], dim=0)
+    edge_index_cat = torch.cat([edge_index, edge_index + n_nodes], dim=1)
+    edge_weight_cat = None
+    if edge_weight is not None:
+        edge_weight_cat = torch.cat([edge_weight, edge_weight], dim=0)
+    batch_cat = torch.cat([batch_nodes, batch_nodes + num_graphs], dim=0)
+    if return_all:
+        layers = model(x_cat, edge_index_cat, edge_weight=edge_weight_cat, return_all=True)
+        pos_layers = [h[:n_nodes] for h in layers]
+        neg_layers = [h[n_nodes:] for h in layers]
+        return pos_layers, neg_layers
+    h = model(x_cat, edge_index_cat, edge_weight=edge_weight_cat)
+    return h[:n_nodes], h[n_nodes:]
+
+
+def _goodness_rank_alignment_loss(
+    g_scores: torch.Tensor,
+    graph_idx,
+    portfolio_targets: list[float | None] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if portfolio_targets is None:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+    target_vals = []
+    for gi in idx_list:
+        if 0 <= int(gi) < len(portfolio_targets):
+            tv = portfolio_targets[int(gi)]
+        else:
+            tv = None
+        target_vals.append(float(tv) if tv is not None else float("nan"))
+    t = torch.tensor(target_vals, dtype=g_scores.dtype, device=device)
+    mask = torch.isfinite(t)
+    if int(mask.sum().item()) < 4:
+        return None
+    g = g_scores[mask]
+    t = t[mask]
+    k = max(1, min(int(g.numel() // 2), int(round(0.2 * g.numel()))))
+    hi = torch.topk(t, k=k, largest=True).indices
+    lo = torch.topk(t, k=k, largest=False).indices
+    spread = g.index_select(0, hi).mean() - g.index_select(0, lo).mean()
+    # Encourage high-return graphs to receive higher goodness scores.
+    return F.softplus(0.1 - spread)
 
 
 def _compute_risk_targets(
@@ -621,6 +814,9 @@ def _make_negatives(
     forward_fn=None,
     window_len: int | None = None,
     summary_dim: int = 0,
+    sector_idx: int | None = None,
+    factor_start_idx: int | None = None,
+    factor_dim: int = 0,
 ):
     if use_mode == "self_contrastive":
         use_mode = "shuffle"
@@ -704,6 +900,19 @@ def _make_negatives(
             forward_fn=forward_fn,
             critic=critic,
         )
+    if window_len is not None and int(window_len) > 0:
+        if summary_dim >= 10:
+            if sector_idx is None:
+                sector_idx = int(window_len) + 5
+            if factor_start_idx is None:
+                factor_start_idx = int(window_len) + 6
+            if factor_dim <= 0:
+                factor_dim = 4
+        elif summary_dim >= 2:
+            if factor_start_idx is None:
+                factor_start_idx = int(window_len)
+            if factor_dim <= 0:
+                factor_dim = min(4, int(summary_dim))
     return make_negative(
         x,
         batch,
@@ -711,6 +920,9 @@ def _make_negatives(
         noise_std=noise_std,
         window_len=window_len,
         summary_dim=summary_dim,
+        sector_idx=sector_idx,
+        factor_start_idx=factor_start_idx,
+        factor_dim=factor_dim,
     )
 
 
@@ -798,6 +1010,8 @@ def _make_self_contrastive_view(
         "block_bootstrap",
         "cross_asset_mix",
         "phase_randomize",
+        "sector_swap",
+        "factor_hard",
     }
     if mode not in valid_modes:
         raise ValueError(
@@ -1150,6 +1364,16 @@ def main() -> int:
     parser.add_argument("--neg-mix-end", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--neg-mix-ramp-epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--neg-gate-margin", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--ff-neg-mix", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-neg-mix-weights", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-curriculum-epochs", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-rank-aux-weight", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--ff-hall-every-n-batches", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--ff-hall-warmup-epochs", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--ff-hall-steps", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--ff-concat-posneg", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-layer-cache", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-econ-eval-every", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--self-contrastive-view-mode", default=argparse.SUPPRESS)
     parser.add_argument("--self-contrastive-view-noise-std", type=float, default=argparse.SUPPRESS)
@@ -1182,6 +1406,8 @@ def main() -> int:
         choices=["softplus", "square"],
         default=argparse.SUPPRESS,
     )
+    parser.add_argument("--torch-compile", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--torch-compile-mode", default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -1272,6 +1498,16 @@ def main() -> int:
     neg_mix_end = _get_setting(args, section, "neg_mix_end", 0.7)
     neg_mix_ramp_epochs = _get_setting(args, section, "neg_mix_ramp_epochs", 10)
     neg_gate_margin = _get_setting(args, section, "neg_gate_margin", 0.1)
+    ff_neg_mix_raw = _get_setting(args, section, "ff_neg_mix", [])
+    ff_neg_mix_weights_raw = _get_setting(args, section, "ff_neg_mix_weights", [])
+    ff_curriculum_epochs_raw = _get_setting(args, section, "ff_curriculum_epochs", [])
+    ff_rank_aux_weight = float(_get_setting(args, section, "ff_rank_aux_weight", 0.0))
+    ff_hall_every_n_batches = int(_get_setting(args, section, "ff_hall_every_n_batches", 1))
+    ff_hall_warmup_epochs = int(_get_setting(args, section, "ff_hall_warmup_epochs", 0))
+    ff_hall_steps_override = _get_setting(args, section, "ff_hall_steps", None)
+    ff_concat_posneg = _to_bool(_get_setting(args, section, "ff_concat_posneg", True))
+    ff_layer_cache = _to_bool(_get_setting(args, section, "ff_layer_cache", True))
+    ff_econ_eval_every = int(_get_setting(args, section, "ff_econ_eval_every", 1))
     grad_clip = _get_setting(args, section, "grad_clip", 1.0)
     self_contrastive_temp = float(_get_setting(args, section, "self_contrastive_temp", 0.2))
     self_contrastive_view_mode = str(
@@ -1303,6 +1539,8 @@ def main() -> int:
     amp_requested = _to_bool(_get_setting(args, section, "amp", True))
     amp_dtype_raw = _get_setting(args, section, "amp_dtype", "float16")
     fused_optimizer = _to_bool(_get_setting(args, section, "fused_optimizer", True))
+    torch_compile_enabled = _to_bool(_get_setting(args, section, "torch_compile", False))
+    torch_compile_mode = str(_get_setting(args, section, "torch_compile_mode", "reduce-overhead"))
     ff_layerwise = _get_setting(args, section, "ff_layerwise", False) or getattr(
         args, "ff_layerwise", False
     )
@@ -1331,6 +1569,8 @@ def main() -> int:
         ff_blockwise = False
 
     hall_steps = _get_setting(args, section, "hallucinate_steps", 10)
+    if ff_hall_steps_override not in (None, "", "none", "null"):
+        hall_steps = ff_hall_steps_override
     hall_lr = _get_setting(args, section, "hallucinate_lr", 0.1)
     hall_l2 = _get_setting(args, section, "hallucinate_l2", 0.1)
     hall_mean = _get_setting(args, section, "hallucinate_mean", 0.05)
@@ -1556,6 +1796,17 @@ def main() -> int:
         print("adaptive_goodness_target disabled for self_contrastive mode.")
         adaptive_target_enabled = False
     adaptive_mix_end_max = _clamp(adaptive_mix_end_max, 0.0, 0.99)
+    ff_neg_mix = [m.strip().lower() for m in _parse_str_list(ff_neg_mix_raw)]
+    if not ff_neg_mix:
+        ff_neg_mix = ["time_flip", "sector_swap", "factor_hard", "noise"]
+    ff_neg_mix = [m for m in ff_neg_mix if m in _NEG_AUG_MODES and m not in {"hallucinate"}]
+    ff_neg_mix_weights = _normalize_mode_weights(ff_neg_mix, _parse_float_list(ff_neg_mix_weights_raw))
+    ff_curriculum_epochs = _parse_float_list(ff_curriculum_epochs_raw)
+    ff_rank_aux_weight = max(0.0, float(ff_rank_aux_weight))
+    ff_hall_every_n_batches = max(1, int(ff_hall_every_n_batches))
+    ff_hall_warmup_epochs = max(0, int(ff_hall_warmup_epochs))
+    ff_econ_eval_every = max(1, int(ff_econ_eval_every))
+    torch_compile_mode = str(torch_compile_mode).strip() or "reduce-overhead"
     if neg_mode == "mix":
         neg_mix_end = _clamp(float(neg_mix_end), float(neg_mix_start), adaptive_mix_end_max)
 
@@ -1790,6 +2041,19 @@ def main() -> int:
             f"neg_mix_start: {neg_mix_start} | neg_mix_end: {neg_mix_end} | "
             f"neg_mix_ramp_epochs: {neg_mix_ramp_epochs}"
         )
+    if ff_neg_mix:
+        print(
+            "ff_neg_mix: "
+            + ",".join(f"{m}:{ff_neg_mix_weights.get(m, 0.0):.3f}" for m in ff_neg_mix)
+        )
+    print(
+        "ff_runtime: "
+        f"concat_posneg={ff_concat_posneg}, layer_cache={ff_layer_cache}, "
+        f"rank_aux_weight={ff_rank_aux_weight}, hall_every_n_batches={ff_hall_every_n_batches}, "
+        f"hall_warmup_epochs={ff_hall_warmup_epochs}, econ_eval_every={ff_econ_eval_every}"
+    )
+    if torch_compile_enabled:
+        print(f"torch_compile: enabled (mode={torch_compile_mode})")
     if adaptive_hall_enabled:
         print(
             "adaptive_hallucination: "
@@ -1823,6 +2087,11 @@ def main() -> int:
         residual_edge_max_delta=float(residual_edge_max_delta),
         residual_edge_detach_features=bool(residual_edge_detach_features),
     ).to(device)
+    if torch_compile_enabled and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode=torch_compile_mode)
+        except Exception as exc:
+            print(f"torch.compile disabled due to runtime error: {exc}")
     critic_cfg = {
         "dropout": float(dropout),
         "seed": int(seed),
@@ -2131,7 +2400,9 @@ def main() -> int:
                 "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
                 "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
                 "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
-                "hall_node_fraction_used\n"
+                "hall_node_fraction_used,rank_aux_loss,"
+                "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
+                "time_loss_terms_s,time_optimizer_s,time_econ_eval_s\n"
             )
 
     epoch_iter = tqdm(
@@ -2147,6 +2418,13 @@ def main() -> int:
         epoch_goodness_target = float(goodness_target)
         epoch_neg_mix_end = float(neg_mix_end)
         epoch_neg_gate_margin = float(neg_gate_margin)
+        curriculum_phase = _curriculum_phase(epoch, epochs, ff_curriculum_epochs)
+        if curriculum_phase == 0:
+            epoch_sc_ff_weight = 0.0
+        elif curriculum_phase == 1:
+            epoch_sc_ff_weight = float(self_contrastive_ff_weight)
+        else:
+            epoch_sc_ff_weight = 0.5 * float(self_contrastive_ff_weight)
         hall_cfg = _hall_cfg_for_epoch(epoch)
         hall_cfg_layer = _hall_cfg_for_epoch(
             epoch,
@@ -2167,6 +2445,16 @@ def main() -> int:
         portfolio_loss_sum = 0.0
         portfolio_batches = 0
         dist_forward_sum = 0.0
+        rank_aux_sum = 0.0
+        timing_totals = {
+            "neg_gen": 0.0,
+            "hallucinate": 0.0,
+            "forward_pos": 0.0,
+            "forward_neg": 0.0,
+            "loss_terms": 0.0,
+            "optimizer": 0.0,
+            "econ_eval": 0.0,
+        }
 
         hall_used = 0
         total_used = 0
@@ -2189,6 +2477,7 @@ def main() -> int:
             x = batch.x
             edge_weight = getattr(batch, "edge_weight", None)
 
+            step_idx = batches + 1
             if neg_mode == "schedule":
                 use_mode = "shuffle" if epoch <= neg_warmup_epochs else "hallucinate"
             elif neg_mode == "mix":
@@ -2202,24 +2491,43 @@ def main() -> int:
             else:
                 use_mode = neg_mode
 
-            step_idx = batches + 1
+            use_mode = _pick_curriculum_neg_mode(
+                use_mode,
+                epoch=epoch,
+                epochs=epochs,
+                mix_modes=ff_neg_mix,
+                mix_weights=ff_neg_mix_weights,
+                phase_ratios=ff_curriculum_epochs,
+            )
+            if use_mode == "hallucinate" and not _should_use_hallucination(
+                epoch=epoch,
+                step_idx=step_idx,
+                warmup_epochs=ff_hall_warmup_epochs,
+                every_n_batches=ff_hall_every_n_batches,
+            ):
+                use_mode = "shuffle+noise"
             apply_distance = (
                 distance_forward_weight > 0
                 and (step_idx % distance_forward_interval == 0)
             )
             step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or ff_layerwise)) else None
+            batch_t0 = time.perf_counter()
+            timing_before = timing_totals.copy()
 
             if ff_multiscale:
+                t_fwd_pos = time.perf_counter()
                 if step_scaler is not None:
                     with _autocast_if_needed(True, amp_dtype):
                         layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
                 else:
                     layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                 hall_active = False
                 dist_loss_val = 0.0
 
                 if use_mode == "self_contrastive":
                     total_used += 1
+                    t_neg_gen = time.perf_counter()
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         x_view = _make_self_contrastive_view(
                             x,
@@ -2229,9 +2537,15 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                    timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
+                    t_fwd_neg = time.perf_counter()
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         layers_view = model(
                             x_view, batch.edge_index, edge_weight=edge_weight, return_all=True
                         )
+                    timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                    t_loss_terms = time.perf_counter()
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         batch_loss = 0.0
                         g_pos_last = 0.0
                         g_neg_last = 0.0
@@ -2259,7 +2573,8 @@ def main() -> int:
                                 max_graphs=distance_forward_max_graphs,
                             )
                             batch_loss = batch_loss + distance_forward_weight * dist_loss_val
-                        if self_contrastive_ff_weight > 0:
+                        if epoch_sc_ff_weight > 0:
+                            t_neg_aux = time.perf_counter()
                             x_neg_aux = _make_negatives(
                                 model,
                                 x,
@@ -2274,12 +2589,15 @@ def main() -> int:
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
+                            timing_totals["neg_gen"] += time.perf_counter() - t_neg_aux
+                            t_fwd_neg_aux = time.perf_counter()
                             layers_neg_aux = model(
                                 x_neg_aux,
                                 batch.edge_index,
                                 edge_weight=edge_weight,
                                 return_all=True,
                             )
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg_aux
                             g_pos_aux = goodness(
                                 layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
                             )
@@ -2293,10 +2611,12 @@ def main() -> int:
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
                             )
-                            batch_loss = batch_loss + self_contrastive_ff_weight * ff_aux
+                            batch_loss = batch_loss + epoch_sc_ff_weight * ff_aux
+                    timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
                 else:
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
+                        t_neg_gen = time.perf_counter()
                         x_neg_hall = _make_negatives(
                             model,
                             x,
@@ -2311,6 +2631,9 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        dt_neg = time.perf_counter() - t_neg_gen
+                        timing_totals["neg_gen"] += dt_neg
+                        timing_totals["hallucinate"] += dt_neg
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (
                                 x_neg_hall[:, :returns_len] - x[:, :returns_len]
@@ -2328,6 +2651,7 @@ def main() -> int:
                                 )
                         hall_used += 1
                     else:
+                        t_neg_gen = time.perf_counter()
                         x_neg_hall = _make_negatives(
                             model,
                             x,
@@ -2342,8 +2666,10 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
                     total_used += 1
 
+                    t_neg_time = time.perf_counter()
                     x_neg_time = make_negative(
                         x,
                         batch.batch,
@@ -2352,13 +2678,16 @@ def main() -> int:
                         window_len=returns_len,
                         summary_dim=summary_dim,
                     )
+                    timing_totals["neg_gen"] += time.perf_counter() - t_neg_time
 
+                    t_fwd_neg = time.perf_counter()
                     layers_neg_h = model(
                         x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
                     )
                     layers_neg_t = model(
                         x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
                     )
+                    timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
 
                     if use_mode == "hallucinate":
                         g_pos_probe = goodness(
@@ -2379,13 +2708,16 @@ def main() -> int:
                             hall_used -= 1
                             hall_gated += 1
                             hall_active = False
+                            t_fwd_neg_gate = time.perf_counter()
                             layers_neg_h = model(
                                 x_neg_hall,
                                 batch.edge_index,
                                 edge_weight=edge_weight,
                                 return_all=True,
                             )
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg_gate
 
+                    t_loss_terms = time.perf_counter()
                     batch_loss = 0.0
                     for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
                         g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
@@ -2436,6 +2768,7 @@ def main() -> int:
                         layers_neg_t[-1], batch.batch, temperature=goodness_temp, critic=critic
                     ).mean().item()
                     g_neg_last = (g_neg_h_last + g_neg_t_last) / 2.0
+                    timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
 
                 energy_penalty_val = 0.0
                 energy_penalty_weight_eff = (
@@ -2478,7 +2811,22 @@ def main() -> int:
                     )
                     if portfolio_loss_val is not None:
                         batch_loss = batch_loss + portfolio_loss_weight * portfolio_loss_val
+                rank_aux_val = None
+                if ff_rank_aux_weight > 0:
+                    g_rank = goodness(
+                        layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
+                    )
+                    rank_aux_val = _goodness_rank_alignment_loss(
+                        g_rank,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                    )
+                    if rank_aux_val is None:
+                        rank_aux_val = rank_spread_loss(g_rank)
+                    batch_loss = batch_loss + ff_rank_aux_weight * rank_aux_val
 
+                t_opt = time.perf_counter()
                 _optimizer_step(
                     optim=optim,
                     loss=batch_loss,
@@ -2486,6 +2834,7 @@ def main() -> int:
                     clip_params=optim_params,
                     scaler=step_scaler,
                 )
+                timing_totals["optimizer"] += time.perf_counter() - t_opt
 
                 total_loss += batch_loss.item()
                 total_pos += g_pos_last
@@ -2501,16 +2850,17 @@ def main() -> int:
                 if portfolio_loss_val is not None:
                     portfolio_loss_sum += float(portfolio_loss_val.detach())
                     portfolio_batches += 1
+                if rank_aux_val is not None:
+                    rank_aux_sum += float(rank_aux_val.detach())
                 if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
                     dist_forward_sum += float(dist_loss_val.detach())
             elif ff_layerwise:
                 if ff_blockwise:
                     block_mode = "shuffle" if use_mode == "self_contrastive" else use_mode
                     hall_active = block_mode == "hallucinate"
-                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
 
                     if hall_active:
+                        t_neg_gen = time.perf_counter()
                         x_neg = _make_negatives(
                             model,
                             x,
@@ -2525,6 +2875,9 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        dt_neg = time.perf_counter() - t_neg_gen
+                        timing_totals["neg_gen"] += dt_neg
+                        timing_totals["hallucinate"] += dt_neg
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
                             hall_close_total += 1
@@ -2540,6 +2893,7 @@ def main() -> int:
                                 )
                         hall_used += 1
                     else:
+                        t_neg_gen = time.perf_counter()
                         x_neg = _make_negatives(
                             model,
                             x,
@@ -2554,10 +2908,34 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
                     total_used += 1
 
-                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                        layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                    if ff_layer_cache and ff_concat_posneg and not hall_active:
+                        t_cat = time.perf_counter()
+                        layers_pos, layers_neg = _concat_forward_pos_neg(
+                            model=model,
+                            x_pos=x,
+                            x_neg=x_neg,
+                            edge_index=batch.edge_index,
+                            edge_weight=edge_weight,
+                            batch_nodes=batch.batch,
+                            return_all=True,
+                        )
+                        dt_cat = time.perf_counter() - t_cat
+                        timing_totals["forward_pos"] += 0.5 * dt_cat
+                        timing_totals["forward_neg"] += 0.5 * dt_cat
+                    else:
+                        t_fwd_pos = time.perf_counter()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                        timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_fwd_neg = time.perf_counter()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            layers_neg = model(
+                                x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
+                            )
+                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
                     if hall_active:
                         last_idx = ff_block_endpoints[-1]
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
@@ -2579,10 +2957,12 @@ def main() -> int:
                             hall_used -= 1
                             hall_gated += 1
                             hall_active = False
+                            t_fwd_neg = time.perf_counter()
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
                                 layers_neg = model(
                                     x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
                                 )
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
 
                     block_loss = 0.0
                     block_gpos = 0.0
@@ -2606,6 +2986,7 @@ def main() -> int:
                             block_gpos += g_pos.mean().item()
                             block_gneg += g_neg.mean().item()
                     block_loss = block_loss / max(1, len(ff_block_endpoints))
+                    t_opt = time.perf_counter()
                     _optimizer_step(
                         optim=optim,
                         loss=block_loss,
@@ -2613,6 +2994,7 @@ def main() -> int:
                         clip_params=optim_params,
                         scaler=step_scaler,
                     )
+                    timing_totals["optimizer"] += time.perf_counter() - t_opt
 
                     avg_g_pos = block_gpos / max(1, len(ff_block_endpoints))
                     avg_g_neg = block_gneg / max(1, len(ff_block_endpoints))
@@ -2632,7 +3014,9 @@ def main() -> int:
                         if use_mode == "hallucinate" and li > 0:
                             layer_mode = "shuffle"
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            t_fwd_pos = time.perf_counter()
                             h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
+                            timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
                         hall_active = layer_mode == "hallucinate"
@@ -2640,6 +3024,7 @@ def main() -> int:
                             forward_fn = lambda x_var, li=li: model.forward_layer(
                                 x_var, batch.edge_index, edge_weight, li
                             )
+                            t_neg_gen = time.perf_counter()
                             x_neg = _make_negatives(
                                 model,
                                 x_in,
@@ -2655,6 +3040,9 @@ def main() -> int:
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
+                            dt_neg = time.perf_counter() - t_neg_gen
+                            timing_totals["neg_gen"] += dt_neg
+                            timing_totals["hallucinate"] += dt_neg
                             if hall_min_delta and hall_min_delta > 0:
                                 delta = (
                                     x_neg[:, :returns_len] - x_in[:, :returns_len]
@@ -2672,6 +3060,7 @@ def main() -> int:
                                     )
                             hall_used += 1
                         else:
+                            t_neg_gen = time.perf_counter()
                             x_neg = _make_negatives(
                                 model,
                                 x_in,
@@ -2686,6 +3075,7 @@ def main() -> int:
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
+                            timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
                         total_used += 1
 
                         if layer_mode == "hallucinate":
@@ -2709,7 +3099,9 @@ def main() -> int:
                                 hall_active = False
 
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            t_fwd_neg = time.perf_counter()
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
                             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
                             loss = ff_loss(
                                 g_pos,
@@ -2718,6 +3110,7 @@ def main() -> int:
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
                             )
+                        t_opt = time.perf_counter()
                         _optimizer_step(
                             optim=optim,
                             loss=loss,
@@ -2725,6 +3118,7 @@ def main() -> int:
                             clip_params=optim_params,
                             scaler=step_scaler,
                         )
+                        timing_totals["optimizer"] += time.perf_counter() - t_opt
 
                         layer_losses += loss.item()
                         layer_gpos += g_pos.mean().item()
@@ -2744,7 +3138,10 @@ def main() -> int:
                 if use_mode == "self_contrastive":
                     total_used += 1
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        t_fwd_pos = time.perf_counter()
                         h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_neg_gen = time.perf_counter()
                         x_view = _make_self_contrastive_view(
                             x,
                             batch.batch,
@@ -2753,7 +3150,11 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
+                        t_fwd_neg = time.perf_counter()
                         h_view = model(x_view, batch.edge_index, edge_weight=edge_weight)
+                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                        t_loss_terms = time.perf_counter()
                         loss, pos_score, neg_score, z_pos, z_view = _self_contrastive_batch_loss(
                             h_pos,
                             h_view,
@@ -2772,7 +3173,8 @@ def main() -> int:
                                 max_graphs=distance_forward_max_graphs,
                             )
                             loss = loss + distance_forward_weight * dist_loss_val
-                        if self_contrastive_ff_weight > 0:
+                        if epoch_sc_ff_weight > 0:
+                            t_neg_aux = time.perf_counter()
                             x_neg_aux = _make_negatives(
                                 model,
                                 x,
@@ -2787,7 +3189,10 @@ def main() -> int:
                                 window_len=returns_len,
                                 summary_dim=summary_dim,
                             )
+                            timing_totals["neg_gen"] += time.perf_counter() - t_neg_aux
+                            t_fwd_neg_aux = time.perf_counter()
                             h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg_aux
                             g_pos_aux = goodness(
                                 h_pos,
                                 batch.batch,
@@ -2802,13 +3207,20 @@ def main() -> int:
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
                             )
-                            loss = loss + self_contrastive_ff_weight * ff_aux
+                            loss = loss + epoch_sc_ff_weight * ff_aux
+                        timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
                 else:
-                    h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                    g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
-
+                    t_loss_terms = time.perf_counter()
                     hall_active = use_mode == "hallucinate"
+                    h_pos = None
+                    g_pos = None
+                    if hall_active:
+                        t_fwd_pos = time.perf_counter()
+                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
                     if use_mode == "hallucinate":
+                        t_neg_gen = time.perf_counter()
                         x_neg = _make_negatives(
                             model,
                             x,
@@ -2823,6 +3235,9 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        dt_neg = time.perf_counter() - t_neg_gen
+                        timing_totals["neg_gen"] += dt_neg
+                        timing_totals["hallucinate"] += dt_neg
                         if hall_min_delta and hall_min_delta > 0:
                             delta = (x_neg[:, :returns_len] - x[:, :returns_len]).abs().mean()
                             hall_close_total += 1
@@ -2836,8 +3251,9 @@ def main() -> int:
                                     window_len=returns_len,
                                     summary_dim=summary_dim,
                                 )
-                        hall_used += 1
+                            hall_used += 1
                     else:
+                        t_neg_gen = time.perf_counter()
                         x_neg = _make_negatives(
                             model,
                             x,
@@ -2852,10 +3268,13 @@ def main() -> int:
                             window_len=returns_len,
                             summary_dim=summary_dim,
                         )
+                        timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
                     total_used += 1
 
                     if use_mode == "hallucinate":
+                        t_fwd_neg_probe = time.perf_counter()
                         h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg_probe
                         g_neg_probe = goodness(
                             h_neg_probe, batch.batch, temperature=goodness_temp, critic=critic
                         ).mean().item()
@@ -2872,7 +3291,30 @@ def main() -> int:
                             hall_used -= 1
                             hall_gated += 1
                             hall_active = False
-                    h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                    if hall_active or not ff_concat_posneg:
+                        if h_pos is None:
+                            t_fwd_pos = time.perf_counter()
+                            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                            timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_fwd_neg = time.perf_counter()
+                        h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                    else:
+                        t_fwd_cat = time.perf_counter()
+                        h_pos, h_neg = _concat_forward_pos_neg(
+                            model=model,
+                            x_pos=x,
+                            x_neg=x_neg,
+                            edge_index=batch.edge_index,
+                            edge_weight=edge_weight,
+                            batch_nodes=batch.batch,
+                            return_all=False,
+                        )
+                        dt_cat = time.perf_counter() - t_fwd_cat
+                        timing_totals["forward_pos"] += 0.5 * dt_cat
+                        timing_totals["forward_neg"] += 0.5 * dt_cat
+                    if g_pos is None:
+                        g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
                     g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
 
                     loss = ff_loss(
@@ -2894,6 +3336,7 @@ def main() -> int:
                             max_graphs=distance_forward_max_graphs,
                         )
                         loss = loss + distance_forward_weight * dist_loss_val
+                    timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
 
                 energy_penalty_val = 0.0
                 energy_penalty_weight_eff = (
@@ -2931,6 +3374,19 @@ def main() -> int:
                     )
                     if portfolio_loss_val is not None:
                         loss = loss + portfolio_loss_weight * portfolio_loss_val
+                rank_aux_val = None
+                if ff_rank_aux_weight > 0:
+                    g_rank = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+                    rank_aux_val = _goodness_rank_alignment_loss(
+                        g_rank,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                    )
+                    if rank_aux_val is None:
+                        rank_aux_val = rank_spread_loss(g_rank)
+                    loss = loss + ff_rank_aux_weight * rank_aux_val
+                t_opt = time.perf_counter()
                 _optimizer_step(
                     optim=optim,
                     loss=loss,
@@ -2938,6 +3394,7 @@ def main() -> int:
                     clip_params=optim_params,
                     scaler=step_scaler,
                 )
+                timing_totals["optimizer"] += time.perf_counter() - t_opt
 
                 total_loss += loss.item()
                 total_pos += g_pos_val
@@ -2953,8 +3410,17 @@ def main() -> int:
                 if portfolio_loss_val is not None:
                     portfolio_loss_sum += float(portfolio_loss_val.detach())
                     portfolio_batches += 1
+                if rank_aux_val is not None:
+                    rank_aux_sum += float(rank_aux_val.detach())
                 if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
                     dist_forward_sum += float(dist_loss_val.detach())
+            batch_elapsed = time.perf_counter() - batch_t0
+            known_elapsed = sum(
+                max(0.0, timing_totals[k] - timing_before.get(k, 0.0))
+                for k in ("neg_gen", "hallucinate", "forward_pos", "forward_neg", "loss_terms", "optimizer")
+            )
+            if batch_elapsed > known_elapsed:
+                timing_totals["loss_terms"] += (batch_elapsed - known_elapsed)
             batches += 1
 
         hall_ratio = hall_used / total_used if total_used else 0.0
@@ -2965,6 +3431,14 @@ def main() -> int:
         risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
         portfolio_loss_epoch = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
         dist_forward_epoch = dist_forward_sum / batches if batches else 0.0
+        rank_aux_epoch = rank_aux_sum / batches if batches else 0.0
+        time_neg_gen_epoch = timing_totals["neg_gen"] / batches if batches else 0.0
+        time_hall_epoch = timing_totals["hallucinate"] / batches if batches else 0.0
+        time_fwd_pos_epoch = timing_totals["forward_pos"] / batches if batches else 0.0
+        time_fwd_neg_epoch = timing_totals["forward_neg"] / batches if batches else 0.0
+        time_loss_epoch = timing_totals["loss_terms"] / batches if batches else 0.0
+        time_opt_epoch = timing_totals["optimizer"] / batches if batches else 0.0
+        time_econ_epoch = timing_totals["econ_eval"] / batches if batches else 0.0
         epoch_loss = total_loss / batches if batches else 0.0
         epoch_pos = total_pos / batches if batches else 0.0
         epoch_neg = total_neg / batches if batches else 0.0
@@ -3093,7 +3567,10 @@ def main() -> int:
                     f"{portfolio_loss_epoch:.6f},"
                     f"{dist_forward_epoch:.6f},"
                     f"{epoch_goodness_target:.6f},{epoch_neg_mix_end:.6f},{epoch_neg_gate_margin:.6f},"
-                    f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f}\n"
+                    f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f},"
+                    f"{rank_aux_epoch:.6f},"
+                    f"{time_neg_gen_epoch:.6f},{time_hall_epoch:.6f},{time_fwd_pos_epoch:.6f},{time_fwd_neg_epoch:.6f},"
+                    f"{time_loss_epoch:.6f},{time_opt_epoch:.6f},{time_econ_epoch:.6f}\n"
                 )
 
     if save_encoder:

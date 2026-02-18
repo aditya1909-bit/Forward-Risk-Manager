@@ -266,6 +266,31 @@ def _nan_sub(a: float, b: float) -> float:
     return float(a - b)
 
 
+def _rolling_regime_quantile(
+    goodness_vals: np.ndarray,
+    regimes: np.ndarray,
+    window: int,
+    quantile: float,
+    min_periods: int,
+) -> np.ndarray:
+    n = int(goodness_vals.shape[0])
+    out = np.full(n, np.nan, dtype=float)
+    if n == 0:
+        return out
+    w = max(2, int(window))
+    q = float(np.clip(quantile, 0.01, 0.99))
+    minp = max(2, int(min_periods))
+    for i in range(n):
+        start = max(0, i - w + 1)
+        g_slice = goodness_vals[start : i + 1]
+        r_slice = regimes[start : i + 1]
+        mask = np.isfinite(g_slice) & (r_slice == regimes[i])
+        vals = g_slice[mask]
+        if vals.size >= minp:
+            out[i] = float(np.quantile(vals, q))
+    return out
+
+
 def evaluate_goodness_strategy(
     dates,
     goodness_scores,
@@ -286,6 +311,12 @@ def evaluate_goodness_strategy(
     regime_uncertainty_scale: float = 0.0,
     risk_signal: np.ndarray | None = None,
     regime_risk_scale: float = 0.0,
+    regime_thresholding_enabled: bool = True,
+    regime_threshold_window: int | None = None,
+    regime_threshold_quantile: float | None = None,
+    regime_vol_window: int = 21,
+    regime_low_quantile: float = 0.33,
+    regime_high_quantile: float = 0.67,
 ) -> dict[str, float]:
     out = {
         "econ_num_days": 0.0,
@@ -331,6 +362,17 @@ def evaluate_goodness_strategy(
         "econ_regime_confidence_temp": float(regime_confidence_temp),
         "econ_regime_neutral_exposure": float(regime_neutral_exposure),
         "econ_regime_min_confidence": float(regime_min_confidence),
+        "econ_regime_thresholding_enabled": float(bool(regime_thresholding_enabled)),
+        "econ_regime_threshold_window": float(
+            signal_window if regime_threshold_window is None else regime_threshold_window
+        ),
+        "econ_regime_threshold_quantile": float(
+            signal_quantile if regime_threshold_quantile is None else regime_threshold_quantile
+        ),
+        "econ_regime_low_count": float("nan"),
+        "econ_regime_mid_count": float("nan"),
+        "econ_regime_high_count": float("nan"),
+        "econ_regime_vol_window": float(regime_vol_window),
     }
 
     if fwd_ret_1 is None or len(fwd_ret_1) == 0:
@@ -360,11 +402,47 @@ def evaluate_goodness_strategy(
 
     sw = max(20, int(signal_window))
     sq = float(np.clip(signal_quantile, 0.05, 0.95))
-    roll_q = df["goodness"].rolling(
+    roll_q_global = df["goodness"].rolling(
         sw,
         min_periods=max(10, sw // 3),
     ).quantile(sq)
-    signal = (df["goodness"] >= roll_q).astype(float).fillna(1.0)
+    roll_q_eff = roll_q_global.to_numpy(dtype=float)
+
+    if bool(regime_thresholding_enabled):
+        rw = max(2, int(regime_vol_window))
+        vol = (
+            df["fwd_ret_1"]
+            .rolling(rw, min_periods=max(2, rw // 2))
+            .std()
+            .bfill()
+            .ffill()
+            .fillna(0.0)
+        )
+        vol_vals = vol.to_numpy(dtype=float)
+        lo_q = float(np.clip(regime_low_quantile, 0.01, 0.49))
+        hi_q = float(np.clip(regime_high_quantile, 0.51, 0.99))
+        lo_thr = float(np.nanquantile(vol_vals, lo_q)) if np.isfinite(vol_vals).any() else 0.0
+        hi_thr = float(np.nanquantile(vol_vals, hi_q)) if np.isfinite(vol_vals).any() else 0.0
+        regimes = np.where(vol_vals <= lo_thr, 0, np.where(vol_vals >= hi_thr, 2, 1)).astype(int)
+
+        rt_window = sw if regime_threshold_window is None else max(10, int(regime_threshold_window))
+        rt_q = sq if regime_threshold_quantile is None else float(np.clip(regime_threshold_quantile, 0.05, 0.95))
+        roll_q_regime = _rolling_regime_quantile(
+            df["goodness"].to_numpy(dtype=float),
+            regimes,
+            window=rt_window,
+            quantile=rt_q,
+            min_periods=max(10, rt_window // 3),
+        )
+        roll_q_eff = np.where(np.isfinite(roll_q_regime), roll_q_regime, roll_q_eff)
+        out["econ_regime_threshold_window"] = float(rt_window)
+        out["econ_regime_threshold_quantile"] = float(rt_q)
+        out["econ_regime_low_count"] = float(np.sum(regimes == 0))
+        out["econ_regime_mid_count"] = float(np.sum(regimes == 1))
+        out["econ_regime_high_count"] = float(np.sum(regimes == 2))
+
+    signal = (df["goodness"].to_numpy(dtype=float) >= roll_q_eff).astype(float)
+    signal = pd.Series(signal).fillna(1.0)
     exposure = signal.to_numpy(dtype=float)
 
     if bool(regime_gate_enabled):

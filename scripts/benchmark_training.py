@@ -72,6 +72,8 @@ _NEG_AUG_MODES = {
     "cross_asset_mix",
     "phase_randomize",
     "edge_attack",
+    "sector_swap",
+    "factor_hard",
 }
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
@@ -630,11 +632,13 @@ def _compute_econ_metrics_for_eval(
     eval_dates,
     config: dict,
 ):
+    t0 = time.perf_counter()
     meta = {
         "econ_ticker_requested": str(config.get("econ_ticker", "")),
         "econ_ticker_effective": str(config.get("econ_ticker_effective", "")),
         "econ_ticker_source": str(config.get("econ_ticker_source", "")),
         "econ_ticker_rows": float(config.get("econ_ticker_rows", 0) or 0),
+        "econ_eval_s": 0.0,
     }
     if not bool(config.get("econ_enabled", False)):
         return meta
@@ -688,8 +692,19 @@ def _compute_econ_metrics_for_eval(
         regime_uncertainty_scale=float(config.get("econ_regime_uncertainty_scale", 0.0)),
         risk_signal=risk_signal,
         regime_risk_scale=float(config.get("econ_regime_risk_scale", 0.0)),
+        regime_thresholding_enabled=bool(config.get("econ_regime_thresholding_enabled", True)),
+        regime_threshold_window=int(
+            config.get("econ_regime_threshold_window", config.get("econ_signal_window", 126))
+        ),
+        regime_threshold_quantile=float(
+            config.get("econ_regime_threshold_quantile", config.get("econ_signal_quantile", 0.5))
+        ),
+        regime_vol_window=int(config.get("econ_regime_vol_window", 21)),
+        regime_low_quantile=float(config.get("econ_regime_low_quantile", 0.33)),
+        regime_high_quantile=float(config.get("econ_regime_high_quantile", 0.67)),
     )
     out.update(meta)
+    out["econ_eval_s"] = float(time.perf_counter() - t0)
     return out
 
 
@@ -755,6 +770,25 @@ def _block_endpoint_indices(num_layers: int, block_size: int) -> list[int]:
     return endpoints
 
 
+def _infer_neg_feature_slices(config: dict) -> tuple[int | None, int | None, int]:
+    window_len = int(config.get("window_len", 0) or 0)
+    summary_dim = int(config.get("summary_dim", 0) or 0)
+    if window_len <= 0:
+        return None, None, 0
+    if summary_dim >= 10:
+        # window_plus_summary_fund: [returns | summary(5) | fund(5)].
+        sector_idx = window_len + 5
+        factor_start = sector_idx + 1
+        factor_dim = 4
+        return sector_idx, factor_start, factor_dim
+    if summary_dim >= 2:
+        # Fallback: use summary tail as factor proxies.
+        factor_start = window_len
+        factor_dim = min(4, summary_dim)
+        return None, factor_start, factor_dim
+    return None, None, 0
+
+
 def _make_negatives(
     model,
     x,
@@ -768,7 +802,20 @@ def _make_negatives(
     critic=None,
     window_len: int | None = None,
     summary_dim: int = 0,
+    sector_idx: int | None = None,
+    factor_start_idx: int | None = None,
+    factor_dim: int = 0,
+    timing: dict[str, float] | None = None,
 ):
+    t0 = time.perf_counter()
+    mode_raw = str(use_mode).strip().lower()
+    def _finish(out_tensor: torch.Tensor) -> torch.Tensor:
+        if timing is not None:
+            dt = time.perf_counter() - t0
+            timing["neg_gen"] = timing.get("neg_gen", 0.0) + dt
+            if mode_raw == "hallucinate":
+                timing["hallucinate"] = timing.get("hallucinate", 0.0) + dt
+        return out_tensor
     if use_mode == "self_contrastive":
         use_mode = "shuffle"
     if use_mode == "edge_attack":
@@ -781,7 +828,7 @@ def _make_negatives(
             summary_dim=summary_dim,
         )
         if out.numel() == 0:
-            return out
+            return _finish(out)
         hub_frac = float(getattr(hall_cfg, "adversarial_hub_fraction", 0.2))
         noise_mult = float(getattr(hall_cfg, "adversarial_feature_noise_mult", 3.0))
         flip_prob = float(getattr(hall_cfg, "adversarial_timeflip_prob", 0.5))
@@ -789,7 +836,7 @@ def _make_negatives(
         noise_mult = max(1.0, noise_mult)
         flip_prob = max(0.0, min(1.0, flip_prob))
         if hub_frac <= 0:
-            return out
+            return _finish(out)
         row = edge_index[0]
         col = edge_index[1]
         deg = torch.zeros(out.size(0), device=out.device, dtype=out.dtype)
@@ -818,9 +865,9 @@ def _make_negatives(
                     out_adv[hub_idx, :wlen] = torch.flip(out_adv[hub_idx, :wlen], dims=[1])
                 elif out_adv.size(1) > 1:
                     out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
-        return out_adv
+        return _finish(out_adv)
     if use_mode == "hallucinate":
-        return hallucinate_negative(
+        out_h = hallucinate_negative(
             model,
             x,
             edge_index,
@@ -830,14 +877,32 @@ def _make_negatives(
             edge_weight=edge_weight,
             critic=critic,
         )
-    return make_negative(
+        return _finish(out_h)
+    if window_len is not None and int(window_len) > 0:
+        if summary_dim >= 10:
+            if sector_idx is None:
+                sector_idx = int(window_len) + 5
+            if factor_start_idx is None:
+                factor_start_idx = int(window_len) + 6
+            if factor_dim <= 0:
+                factor_dim = 4
+        elif summary_dim >= 2:
+            if factor_start_idx is None:
+                factor_start_idx = int(window_len)
+            if factor_dim <= 0:
+                factor_dim = min(4, int(summary_dim))
+    out = make_negative(
         x,
         batch,
         mode=use_mode,
         noise_std=noise_std,
         window_len=window_len,
         summary_dim=summary_dim,
+        sector_idx=sector_idx,
+        factor_start_idx=factor_start_idx,
+        factor_dim=factor_dim,
     )
+    return _finish(out)
 
 
 def _make_self_contrastive_view(
@@ -1176,6 +1241,17 @@ def _attach_primary_metrics(out: dict) -> None:
     out["primary_eval_metric_robust"] = robust_val
 
 
+def _baseline_context(config: dict, device: torch.device, num_graphs: int) -> dict[str, float | str]:
+    return {
+        "baseline_seed": int(config.get("seed", 0)),
+        "baseline_split_mode": str(config.get("split_mode", "")),
+        "baseline_device": str(device),
+        "baseline_graphs_total": int(num_graphs),
+        "baseline_batch_size": int(config.get("batch_size", 0)),
+        "baseline_eval_frac": float(config.get("eval_frac", 0.0)),
+    }
+
+
 def _calibrate_goodness_target(
     model,
     critic,
@@ -1326,6 +1402,11 @@ def _benchmark_ff(
         residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
         residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
     ).to(device)
+    if bool(config.get("torch_compile", False)) and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode=str(config.get("torch_compile_mode", "reduce-overhead")))
+        except Exception as exc:
+            print(f"warning: benchmark ff torch.compile disabled: {exc}")
     critic = _build_critic(config, hidden_dim=int(config["hidden_dim"]), device=device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
     risk_horizons_effective = config.get("risk_horizons_effective", [])
@@ -1439,8 +1520,20 @@ def _benchmark_ff(
             "benchmark layerwise blockwise endpoints: "
             + ",".join(str(i + 1) for i in ff_block_endpoints)
         )
+    neg_sector_idx, neg_factor_start_idx, neg_factor_dim = _infer_neg_feature_slices(config)
+    hall_every_n_batches = max(1, int(config.get("ff_hall_every_n_batches", 1)))
+    hall_warmup_epochs = max(0, int(config.get("ff_hall_warmup_epochs", 0)))
 
     epoch_times = []
+    component_times = {
+        "neg_gen": 0.0,
+        "hallucinate": 0.0,
+        "forward_pos": 0.0,
+        "forward_neg": 0.0,
+        "loss_terms": 0.0,
+        "optimizer": 0.0,
+    }
+    steps_total = 0
     risk_loss_sum = 0.0
     risk_batches = 0
     portfolio_loss_sum = 0.0
@@ -1470,8 +1563,13 @@ def _benchmark_ff(
                 config["neg_mix_end"],
                 config["neg_mix_ramp_epochs"],
             )
+            if use_mode == "hallucinate":
+                if epoch <= hall_warmup_epochs or (batch_idx % hall_every_n_batches) != 0:
+                    use_mode = "shuffle+noise"
             apply_distance = dist_weight > 0 and (batch_idx % dist_interval == 0)
             step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or layerwise)) else None
+            batch_t0 = time.perf_counter()
+            comp_before = component_times.copy()
 
             if layerwise:
                 if ff_blockwise:
@@ -1491,10 +1589,18 @@ def _benchmark_ff(
                         critic=critic,
                         window_len=config.get("window_len"),
                         summary_dim=config.get("summary_dim", 0),
+                        sector_idx=neg_sector_idx,
+                        factor_start_idx=neg_factor_start_idx,
+                        factor_dim=neg_factor_dim,
+                        timing=component_times,
                     )
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        t_fwd_pos = time.perf_counter()
                         layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                        component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_fwd_neg = time.perf_counter()
                         layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                        component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                     if layer_mode == "hallucinate":
                         last_idx = ff_block_endpoints[-1]
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
@@ -1520,9 +1626,11 @@ def _benchmark_ff(
                                 summary_dim=config.get("summary_dim", 0),
                             )
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                                t_fwd_neg = time.perf_counter()
                                 layers_neg = model(
                                     x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
                                 )
+                                component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                     loss = 0.0
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         for li in ff_block_endpoints:
@@ -1546,6 +1654,7 @@ def _benchmark_ff(
                                 margin_weight=float(config.get("ff_margin_weight", 1.0)),
                             )
                     loss = loss / max(1, len(ff_block_endpoints))
+                    t_opt = time.perf_counter()
                     _optimizer_step(
                         optim=optim,
                         loss=loss,
@@ -1553,6 +1662,7 @@ def _benchmark_ff(
                         clip_params=clip_params,
                         scaler=step_scaler,
                     )
+                    component_times["optimizer"] += time.perf_counter() - t_opt
                     total_loss += loss.item()
                 else:
                     x_in = x
@@ -1561,7 +1671,9 @@ def _benchmark_ff(
                         if layer_mode == "self_contrastive":
                             layer_mode = "shuffle"
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            t_fwd_pos = time.perf_counter()
                             h_pos = model.forward_layer(x_in, batch.edge_index, edge_weight, li)
+                            component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
                             g_pos = goodness(
                                 h_pos,
                                 batch.batch,
@@ -1581,9 +1693,15 @@ def _benchmark_ff(
                             critic=critic,
                             window_len=config.get("window_len"),
                             summary_dim=config.get("summary_dim", 0),
+                            sector_idx=neg_sector_idx,
+                            factor_start_idx=neg_factor_start_idx,
+                            factor_dim=neg_factor_dim,
+                            timing=component_times,
                         )
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            t_fwd_neg = time.perf_counter()
                             h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                            component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                             g_neg = goodness(
                                 h_neg,
                                 batch.batch,
@@ -1597,6 +1715,7 @@ def _benchmark_ff(
                                 margin=float(config.get("ff_margin", 0.0)),
                                 margin_weight=float(config.get("ff_margin_weight", 1.0)),
                             )
+                        t_opt = time.perf_counter()
                         _optimizer_step(
                             optim=optim,
                             loss=loss,
@@ -1604,12 +1723,16 @@ def _benchmark_ff(
                             clip_params=clip_params,
                             scaler=step_scaler,
                         )
+                        component_times["optimizer"] += time.perf_counter() - t_opt
                         total_loss += loss.item()
                         x_in = h_pos.detach()
             else:
                 if use_mode == "self_contrastive":
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        t_fwd_pos = time.perf_counter()
                         h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_neg_gen = time.perf_counter()
                         x_view = _make_self_contrastive_view(
                             x,
                             batch.batch,
@@ -1618,7 +1741,10 @@ def _benchmark_ff(
                             window_len=config.get("window_len"),
                             summary_dim=config.get("summary_dim", 0),
                         )
+                        component_times["neg_gen"] += time.perf_counter() - t_neg_gen
+                        t_fwd_neg = time.perf_counter()
                         h_view = model(x_view, batch.edge_index, edge_weight=edge_weight)
+                        component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                         loss, _, _, z_pos, z_view = _self_contrastive_step(
                             h_pos,
                             h_view,
@@ -1635,6 +1761,7 @@ def _benchmark_ff(
                                 max_graphs=dist_max_graphs,
                             )
                         if sc_ff_weight > 0:
+                            t_neg_gen = time.perf_counter()
                             x_neg_aux = make_negative(
                                 x,
                                 batch.batch,
@@ -1643,7 +1770,10 @@ def _benchmark_ff(
                                 window_len=config.get("window_len"),
                                 summary_dim=config.get("summary_dim", 0),
                             )
+                            component_times["neg_gen"] += time.perf_counter() - t_neg_gen
+                            t_fwd_neg_aux = time.perf_counter()
                             h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                            component_times["forward_neg"] += time.perf_counter() - t_fwd_neg_aux
                             g_pos_aux = goodness(
                                 h_pos,
                                 batch.batch,
@@ -1664,13 +1794,6 @@ def _benchmark_ff(
                                 margin_weight=float(config.get("ff_margin_weight", 1.0)),
                             )
                 else:
-                    h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                    g_pos = goodness(
-                        h_pos,
-                        batch.batch,
-                        temperature=config["goodness_temp"],
-                        critic=critic,
-                    )
                     x_neg = _make_negatives(
                         model,
                         x,
@@ -1684,8 +1807,44 @@ def _benchmark_ff(
                         critic=critic,
                         window_len=config.get("window_len"),
                         summary_dim=config.get("summary_dim", 0),
+                        sector_idx=neg_sector_idx,
+                        factor_start_idx=neg_factor_start_idx,
+                        factor_dim=neg_factor_dim,
+                        timing=component_times,
                     )
-                    h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                    if bool(config.get("ff_concat_posneg", True)) and use_mode != "hallucinate":
+                        n_nodes = int(x.size(0))
+                        num_graphs = int(batch.batch.max().item()) + 1 if batch.batch.numel() else 0
+                        x_cat = torch.cat([x, x_neg], dim=0)
+                        edge_index_cat = torch.cat(
+                            [batch.edge_index, batch.edge_index + n_nodes], dim=1
+                        )
+                        edge_weight_cat = (
+                            torch.cat([edge_weight, edge_weight], dim=0)
+                            if edge_weight is not None
+                            else None
+                        )
+                        batch_cat = torch.cat([batch.batch, batch.batch + num_graphs], dim=0)
+                        t_fwd = time.perf_counter()
+                        h_cat = model(x_cat, edge_index_cat, edge_weight=edge_weight_cat)
+                        dt_fwd = time.perf_counter() - t_fwd
+                        component_times["forward_pos"] += 0.5 * dt_fwd
+                        component_times["forward_neg"] += 0.5 * dt_fwd
+                        h_pos = h_cat[:n_nodes]
+                        h_neg = h_cat[n_nodes:]
+                    else:
+                        t_fwd_pos = time.perf_counter()
+                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_fwd_neg = time.perf_counter()
+                        h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
+                    g_pos = goodness(
+                        h_pos,
+                        batch.batch,
+                        temperature=config["goodness_temp"],
+                        critic=critic,
+                    )
                     g_neg = goodness(
                         h_neg,
                         batch.batch,
@@ -1736,6 +1895,7 @@ def _benchmark_ff(
                         )
                         if portfolio_loss_val is not None:
                             loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
+                t_opt = time.perf_counter()
                 _optimizer_step(
                     optim=optim,
                     loss=loss,
@@ -1743,6 +1903,7 @@ def _benchmark_ff(
                     clip_params=clip_params,
                     scaler=step_scaler,
                 )
+                component_times["optimizer"] += time.perf_counter() - t_opt
                 total_loss += loss.item()
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
@@ -1751,6 +1912,14 @@ def _benchmark_ff(
                     portfolio_loss_sum += float(portfolio_loss_val.detach())
                     portfolio_batches += 1
 
+            batch_elapsed = time.perf_counter() - batch_t0
+            known_elapsed = sum(
+                max(0.0, component_times[k] - comp_before.get(k, 0.0))
+                for k in ("neg_gen", "hallucinate", "forward_pos", "forward_neg", "loss_terms", "optimizer")
+            )
+            if batch_elapsed > known_elapsed:
+                component_times["loss_terms"] += (batch_elapsed - known_elapsed)
+            steps_total += 1
             graphs_seen += batch.num_graphs
 
         _sync(device)
@@ -1804,9 +1973,17 @@ def _benchmark_ff(
     avg_gps = float(np.mean([g / t for t, g in usable]))
     risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
     portfolio_loss_train = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
+    steps_denom = max(1, int(steps_total))
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
+        "time_neg_gen_s": float(component_times["neg_gen"] / steps_denom),
+        "time_hallucinate_s": float(component_times["hallucinate"] / steps_denom),
+        "time_forward_pos_s": float(component_times["forward_pos"] / steps_denom),
+        "time_forward_neg_s": float(component_times["forward_neg"] / steps_denom),
+        "time_loss_terms_s": float(component_times["loss_terms"] / steps_denom),
+        "time_optimizer_s": float(component_times["optimizer"] / steps_denom),
+        "time_econ_eval_s": 0.0,
         "goodness_target_eval": target_eval,
         "target_cal_acc": target_cal_acc,
         "neg_mode_effective": train_neg_mode,
@@ -1831,6 +2008,7 @@ def _benchmark_ff(
     )
     if econ:
         out.update(econ)
+        out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
 
     eval_neg_modes = config.get("eval_neg_modes", [])
     if isinstance(eval_neg_modes, str):
@@ -1923,6 +2101,11 @@ def _benchmark_backprop(
         residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
         residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
     ).to(device)
+    if bool(config.get("torch_compile", False)) and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode=str(config.get("torch_compile_mode", "reduce-overhead")))
+        except Exception as exc:
+            print(f"warning: benchmark backprop torch.compile disabled: {exc}")
     head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
     risk_horizons_effective = config.get("risk_horizons_effective", [])
@@ -1991,8 +2174,20 @@ def _benchmark_backprop(
     eval_mode = _resolve_mode(config.get("eval_neg_mode", "auto"), train_neg_mode)
     if eval_mode == "self_contrastive":
         eval_mode = "shuffle"
+    neg_sector_idx, neg_factor_start_idx, neg_factor_dim = _infer_neg_feature_slices(config)
+    hall_every_n_batches = max(1, int(config.get("ff_hall_every_n_batches", 1)))
+    hall_warmup_epochs = max(0, int(config.get("ff_hall_warmup_epochs", 0)))
 
     epoch_times = []
+    component_times = {
+        "neg_gen": 0.0,
+        "hallucinate": 0.0,
+        "forward_pos": 0.0,
+        "forward_neg": 0.0,
+        "loss_terms": 0.0,
+        "optimizer": 0.0,
+    }
+    steps_total = 0
     risk_loss_sum = 0.0
     risk_batches = 0
     portfolio_loss_sum = 0.0
@@ -2011,8 +2206,12 @@ def _benchmark_backprop(
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
             x = batch.x
+            batch_t0 = time.perf_counter()
+            comp_before = component_times.copy()
             with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
+                t_fwd_pos = time.perf_counter()
                 h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
                 z_pos = global_mean_pool(h_pos, batch.batch)
                 y_pos = torch.ones(z_pos.size(0), device=device)
 
@@ -2024,6 +2223,10 @@ def _benchmark_backprop(
                 config["neg_mix_end"],
                 config["neg_mix_ramp_epochs"],
             )
+            if use_mode == "hallucinate":
+                batch_step = steps_total + 1
+                if epoch <= hall_warmup_epochs or (batch_step % hall_every_n_batches) != 0:
+                    use_mode = "shuffle+noise"
             x_neg = _make_negatives(
                 model,
                 x,
@@ -2036,9 +2239,15 @@ def _benchmark_backprop(
                 hall_cfg,
                 window_len=config.get("window_len"),
                 summary_dim=config.get("summary_dim", 0),
+                sector_idx=neg_sector_idx,
+                factor_start_idx=neg_factor_start_idx,
+                factor_dim=neg_factor_dim,
+                timing=component_times,
             )
             with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
+                t_fwd_neg = time.perf_counter()
                 h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                 z_neg = global_mean_pool(h_neg, batch.batch)
                 y_neg = torch.zeros(z_neg.size(0), device=device)
 
@@ -2071,6 +2280,7 @@ def _benchmark_backprop(
                     if portfolio_loss_val is not None:
                         loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
 
+            t_opt = time.perf_counter()
             _optimizer_step(
                 optim=optim,
                 loss=loss,
@@ -2078,12 +2288,21 @@ def _benchmark_backprop(
                 clip_params=optim_params,
                 scaler=bp_scaler,
             )
+            component_times["optimizer"] += time.perf_counter() - t_opt
             if risk_loss_val is not None:
                 risk_loss_sum += float(risk_loss_val.detach())
                 risk_batches += 1
             if portfolio_loss_val is not None:
                 portfolio_loss_sum += float(portfolio_loss_val.detach())
                 portfolio_batches += 1
+            batch_elapsed = time.perf_counter() - batch_t0
+            known_elapsed = sum(
+                max(0.0, component_times[k] - comp_before.get(k, 0.0))
+                for k in ("neg_gen", "hallucinate", "forward_pos", "forward_neg", "loss_terms", "optimizer")
+            )
+            if batch_elapsed > known_elapsed:
+                component_times["loss_terms"] += (batch_elapsed - known_elapsed)
+            steps_total += 1
             graphs_seen += batch.num_graphs
         _sync(device)
         dt = time.perf_counter() - t0
@@ -2180,9 +2399,17 @@ def _benchmark_backprop(
     avg_gps = float(np.mean([g / t for t, g in usable]))
     risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
     portfolio_loss_train = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
+    steps_denom = max(1, int(steps_total))
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
+        "time_neg_gen_s": float(component_times["neg_gen"] / steps_denom),
+        "time_hallucinate_s": float(component_times["hallucinate"] / steps_denom),
+        "time_forward_pos_s": float(component_times["forward_pos"] / steps_denom),
+        "time_forward_neg_s": float(component_times["forward_neg"] / steps_denom),
+        "time_loss_terms_s": float(component_times["loss_terms"] / steps_denom),
+        "time_optimizer_s": float(component_times["optimizer"] / steps_denom),
+        "time_econ_eval_s": 0.0,
         "eval_acc": correct / total if total else 0.0,
         "eval_bce": float(np.mean(eval_losses)) if eval_losses else 0.0,
         "eval_g_pos": float(np.mean(gpos)) if gpos else 0.0,
@@ -2214,6 +2441,7 @@ def _benchmark_backprop(
     )
     if econ:
         out.update(econ)
+        out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
     _attach_primary_metrics(out)
     return out
 
@@ -2294,6 +2522,16 @@ def main() -> int:
         "lr": float(train_cfg.get("lr", 1e-3)),
         "neg_mode": str(bench_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))),
         "eval_neg_mode": str(bench_cfg.get("eval_neg_mode", "auto")),
+        "ff_neg_mix": train_cfg.get("ff_neg_mix", []),
+        "ff_neg_mix_weights": train_cfg.get("ff_neg_mix_weights", []),
+        "ff_curriculum_epochs": train_cfg.get("ff_curriculum_epochs", []),
+        "ff_rank_aux_weight": float(train_cfg.get("ff_rank_aux_weight", 0.0)),
+        "ff_hall_every_n_batches": int(train_cfg.get("ff_hall_every_n_batches", 1)),
+        "ff_hall_warmup_epochs": int(train_cfg.get("ff_hall_warmup_epochs", 0)),
+        "ff_hall_steps": int(train_cfg.get("ff_hall_steps", train_cfg.get("hallucinate_steps", 3))),
+        "ff_concat_posneg": bool(train_cfg.get("ff_concat_posneg", True)),
+        "ff_layer_cache": bool(train_cfg.get("ff_layer_cache", True)),
+        "ff_econ_eval_every": int(train_cfg.get("ff_econ_eval_every", 1)),
         "noise_std": float(train_cfg.get("noise_std", 0.05)),
         "neg_warmup_epochs": int(train_cfg.get("neg_warmup_epochs", 0)),
         "neg_mix_start": float(train_cfg.get("neg_mix_start", 0.0)),
@@ -2340,6 +2578,8 @@ def main() -> int:
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(bench_cfg.get("ff_amp", train_cfg.get("amp", True))),
         "amp_dtype": str(bench_cfg.get("amp_dtype", train_cfg.get("amp_dtype", "float16"))),
+        "torch_compile": bool(train_cfg.get("torch_compile", False)),
+        "torch_compile_mode": str(train_cfg.get("torch_compile_mode", "reduce-overhead")),
         "fused_optimizer": bool(
             bench_cfg.get("fused_optimizer", train_cfg.get("fused_optimizer", True))
         ),
@@ -2374,7 +2614,7 @@ def main() -> int:
         "walk_forward_min_eval_graphs": int(bench_cfg.get("walk_forward_min_eval_graphs", 16)),
         "walk_forward_max_folds": int(bench_cfg.get("walk_forward_max_folds", 0)),
         "seed": int(train_cfg.get("seed", 7)),
-        "hall_steps": int(train_cfg.get("hallucinate_steps", 3)),
+        "hall_steps": int(train_cfg.get("ff_hall_steps", train_cfg.get("hallucinate_steps", 3))),
         "hall_lr": float(train_cfg.get("hallucinate_lr", 0.03)),
         "hall_l2": float(train_cfg.get("hallucinate_l2", 0.05)),
         "hall_mean": float(train_cfg.get("hallucinate_mean", 0.01)),
@@ -2430,6 +2670,8 @@ def main() -> int:
         "portfolio_cache_dir": str(train_cfg.get("portfolio_cache_dir", "runs/cache")),
         "portfolio_max_abs_logret": float(train_cfg.get("portfolio_max_abs_logret", 0.5)),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
+        "baseline_ref_csv": str(bench_cfg.get("baseline_ref_csv", "")),
+        "require_baseline_match": bool(bench_cfg.get("require_baseline_match", False)),
         "calibrate_target": bool(bench_cfg.get("calibrate_target", True)),
         "calibrate_batches": int(bench_cfg.get("calibrate_batches", 0)),
         "calibrate_quantiles": int(bench_cfg.get("calibrate_quantiles", 31)),
@@ -2455,6 +2697,18 @@ def main() -> int:
         "econ_regime_min_confidence": float(bench_cfg.get("econ_regime_min_confidence", 0.0)),
         "econ_regime_uncertainty_scale": float(bench_cfg.get("econ_regime_uncertainty_scale", 0.0)),
         "econ_regime_risk_scale": float(bench_cfg.get("econ_regime_risk_scale", 0.0)),
+        "econ_regime_thresholding_enabled": bool(
+            bench_cfg.get("econ_regime_thresholding_enabled", True)
+        ),
+        "econ_regime_threshold_window": int(
+            bench_cfg.get("econ_regime_threshold_window", bench_cfg.get("econ_signal_window", 126))
+        ),
+        "econ_regime_threshold_quantile": float(
+            bench_cfg.get("econ_regime_threshold_quantile", bench_cfg.get("econ_signal_quantile", 0.5))
+        ),
+        "econ_regime_vol_window": int(bench_cfg.get("econ_regime_vol_window", 21)),
+        "econ_regime_low_quantile": float(bench_cfg.get("econ_regime_low_quantile", 0.33)),
+        "econ_regime_high_quantile": float(bench_cfg.get("econ_regime_high_quantile", 0.67)),
         "econ_loader_batch_size": int(bench_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
     }
@@ -2596,6 +2850,7 @@ def main() -> int:
             f"eval_frac={config.get('walk_forward_eval_frac')}, "
             f"step_frac={config.get('walk_forward_step_frac')})"
         )
+    base_ctx = _baseline_context(config, device, len(graphs))
 
     for mode in modes:
         cfg_mode = config.copy()
@@ -2650,6 +2905,7 @@ def main() -> int:
                 res["mode"] = mode
                 res["row_type"] = "fold"
                 res["split_mode_effective"] = "walk_forward"
+                res.update(base_ctx)
                 res["fold_id"] = int(fold["fold_id"])
                 res["fold_train_start_idx"] = int(fold["train_start"])
                 res["fold_train_end_idx"] = int(fold["train_end"]) - 1
@@ -2668,6 +2924,7 @@ def main() -> int:
             agg = _aggregate_fold_results(fold_rows)
             agg["mode"] = mode
             agg["row_type"] = "aggregate"
+            agg.update(base_ctx)
             if isinstance(mode_override, dict):
                 for key, value in mode_override.items():
                     if key not in agg:
@@ -2718,6 +2975,7 @@ def main() -> int:
             else:
                 raise ValueError(f"Unknown mode: {mode}")
             res["mode"] = mode
+            res.update(base_ctx)
             if isinstance(mode_override, dict):
                 for key, value in mode_override.items():
                     if key not in res:
@@ -2728,6 +2986,35 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     import csv
 
+    if bool(config.get("require_baseline_match", False)):
+        ref_raw = str(config.get("baseline_ref_csv", "")).strip()
+        ref_path = Path(ref_raw) if ref_raw else out_path
+        if ref_path.exists():
+            try:
+                ref_df = pd.read_csv(ref_path)
+                if not ref_df.empty:
+                    ref = ref_df.iloc[0].to_dict()
+                    compare_keys = [
+                        "baseline_seed",
+                        "baseline_split_mode",
+                        "baseline_device",
+                        "baseline_graphs_total",
+                        "baseline_batch_size",
+                    ]
+                    mismatches = []
+                    for k in compare_keys:
+                        cur_v = base_ctx.get(k)
+                        ref_v = ref.get(k)
+                        if str(cur_v) != str(ref_v):
+                            mismatches.append(f"{k}: current={cur_v} ref={ref_v}")
+                    if mismatches:
+                        raise RuntimeError(
+                            "Baseline context mismatch; refusing comparison run.\n"
+                            + "\n".join(mismatches)
+                        )
+            except Exception as exc:
+                raise RuntimeError(f"failed baseline context check against {ref_path}: {exc}") from exc
+
     keys = sorted({k for r in results for k in r.keys()})
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
@@ -2736,6 +3023,36 @@ def main() -> int:
             w.writerow(r)
 
     print(f"Wrote {out_path}")
+    baseline_out = str(bench_cfg.get("baseline_out_csv", "")).strip()
+    baseline_path = (
+        Path(baseline_out)
+        if baseline_out
+        else out_path.with_name(f"{out_path.stem}_baseline.csv")
+    )
+    baseline_rows = []
+    for r in results:
+        baseline_rows.append(
+            {
+                "mode": r.get("mode"),
+                "avg_epoch_s": r.get("avg_epoch_s"),
+                "graphs_per_s": r.get("graphs_per_s"),
+                "primary_eval_metric_name": r.get("primary_eval_metric_name"),
+                "primary_eval_metric": r.get("primary_eval_metric"),
+                "econ_sharpe_uplift": r.get("econ_sharpe_uplift"),
+                "baseline_seed": r.get("baseline_seed"),
+                "baseline_split_mode": r.get("baseline_split_mode"),
+                "baseline_device": r.get("baseline_device"),
+                "baseline_graphs_total": r.get("baseline_graphs_total"),
+                "baseline_batch_size": r.get("baseline_batch_size"),
+            }
+        )
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    with baseline_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(baseline_rows[0].keys()) if baseline_rows else ["mode"])
+        w.writeheader()
+        for row in baseline_rows:
+            w.writerow(row)
+    print(f"Wrote {baseline_path}")
     if use_walk_forward and fold_results:
         fold_out = str(bench_cfg.get("walk_forward_out_csv", "")).strip()
         fold_out_path = (

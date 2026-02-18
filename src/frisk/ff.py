@@ -73,10 +73,16 @@ def make_negative(
         "block_bootstrap",
         "cross_asset_mix",
         "phase_randomize",
+        "sector_swap",
+        "factor_hard",
     ] = "shuffle",
     noise_std: float = 0.05,
     window_len: int | None = None,
     summary_dim: int = 0,
+    sector_idx: int | None = None,
+    factor_start_idx: int | None = None,
+    factor_dim: int = 0,
+    hard_topk: int = 3,
 ) -> torch.Tensor:
     out = x.clone()
     if out.numel() == 0:
@@ -152,6 +158,71 @@ def make_negative(
         w_rand = torch.fft.irfft(spec, n=wlen, dim=1)
         return _merge_window_and_tail(w_rand, tail)
 
+    def _sector_swap(tensor: torch.Tensor) -> torch.Tensor:
+        # Swap samples within the same graph and inferred sector bucket.
+        if sector_idx is None or int(sector_idx) < 0 or int(sector_idx) >= tensor.size(1):
+            return tensor
+        out_sec = tensor.clone()
+        sec = tensor[:, int(sector_idx)]
+        did_swap = False
+        for gid in batch_idx.unique():
+            idx = (batch_idx == gid).nonzero(as_tuple=False).view(-1)
+            if idx.numel() <= 1:
+                continue
+            sec_vals = sec.index_select(0, idx)
+            sec_keys = torch.round(sec_vals * 1_000.0).to(torch.long)
+            for key in sec_keys.unique():
+                grp = idx[(sec_keys == key).nonzero(as_tuple=False).view(-1)]
+                if grp.numel() <= 1:
+                    continue
+                perm = grp[torch.randperm(grp.numel(), device=out_sec.device)]
+                out_sec.index_copy_(0, grp, out_sec.index_select(0, perm))
+                did_swap = True
+        if not did_swap:
+            return tensor
+        return out_sec
+
+    def _factor_hard(tensor: torch.Tensor) -> torch.Tensor:
+        # Replace return windows using nearest-neighbor nodes in factor space.
+        w, tail = _split_window_and_tail(tensor)
+        if w.numel() == 0:
+            return tensor
+
+        factors = None
+        if (
+            factor_start_idx is not None
+            and int(factor_start_idx) >= 0
+            and int(factor_dim) > 0
+            and int(factor_start_idx) + int(factor_dim) <= tensor.size(1)
+        ):
+            factors = tensor[:, int(factor_start_idx) : int(factor_start_idx) + int(factor_dim)]
+        elif tail.numel() > 0:
+            fd = min(4, tail.size(1))
+            factors = tail[:, :fd]
+        else:
+            factors = torch.stack([w.mean(dim=1), w.std(dim=1, unbiased=False)], dim=1)
+
+        out_w = w.clone()
+        k_req = max(1, int(hard_topk))
+        for gid in batch_idx.unique():
+            idx = (batch_idx == gid).nonzero(as_tuple=False).view(-1)
+            n = int(idx.numel())
+            if n <= 1:
+                continue
+            local_f = factors.index_select(0, idx)
+            local_f = (local_f - local_f.mean(dim=0, keepdim=True)) / (
+                local_f.std(dim=0, unbiased=False, keepdim=True) + 1e-6
+            )
+            dist = torch.cdist(local_f, local_f, p=2)
+            dist.fill_diagonal_(float("inf"))
+            k = min(k_req, n - 1)
+            nn = torch.topk(dist, k=k, largest=False).indices
+            nn_col = torch.randint(0, k, (n,), device=nn.device)
+            src_local = nn[torch.arange(n, device=nn.device), nn_col]
+            src_idx = idx.index_select(0, src_local)
+            out_w.index_copy_(0, idx, w.index_select(0, src_idx))
+        return _merge_window_and_tail(out_w, tail)
+
     if mode in ("time_flip", "shuffle+time_flip", "time_flip+noise"):
         out = _time_flip(out)
     elif mode == "block_bootstrap":
@@ -160,6 +231,10 @@ def make_negative(
         out = _cross_asset_mix(out)
     elif mode == "phase_randomize":
         out = _phase_randomize(out)
+    elif mode == "sector_swap":
+        out = _sector_swap(out)
+    elif mode == "factor_hard":
+        out = _factor_hard(out)
 
     if mode in ("shuffle", "shuffle+noise", "shuffle+time_flip"):
         # Group-preserving shuffle: each node is reassigned to another node in the same graph.
@@ -293,3 +368,23 @@ def pairwise_distance_forward_loss(
     eye = torch.eye(dist_pp.size(0), dtype=torch.bool, device=dist_pp.device)
     nearest_pos = dist_pp.masked_fill(eye, float("inf")).min(dim=1).values
     return F.relu(float(margin) + nearest_pos - d_neg).mean()
+
+
+def rank_spread_loss(
+    scores: torch.Tensor,
+    top_frac: float = 0.2,
+    margin: float = 0.1,
+) -> torch.Tensor:
+    if scores.ndim != 1:
+        raise ValueError("Expected scores to have shape [num_graphs]")
+    if scores.numel() == 0:
+        return torch.zeros((), device=scores.device, dtype=scores.dtype)
+    n = scores.numel()
+    if n == 1:
+        return torch.zeros((), device=scores.device, dtype=scores.dtype)
+    frac = float(max(1e-3, min(0.49, top_frac)))
+    k = max(1, int(round(frac * n)))
+    k = min(k, n // 2)
+    top = torch.topk(scores, k=k, largest=True).values.mean()
+    bot = torch.topk(scores, k=k, largest=False).values.mean()
+    return F.softplus(float(margin) - (top - bot))
