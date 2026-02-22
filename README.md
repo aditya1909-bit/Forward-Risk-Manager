@@ -337,6 +337,8 @@ self_contrastive_view_noise_std = 0.05
 Stability add-ons:
 - `neg_gate_margin`: if hallucinated negatives are too strong (`g_neg > g_pos + margin`), fall back to shuffle for that batch.
 - `grad_clip`: gradient norm clipping to reduce instability.
+- `ff_rank_aux_weight`: rank-spread auxiliary on goodness.
+- `ff_rank_use_portfolio_targets = true`: when graph dates are available, rank aux is aligned to forward-return targets (`portfolio_ticker`/`portfolio_horizon`) instead of pure unsupervised spread.
 
 Distance-forward auxiliary loss (graph-level pairwise margin):
 ```

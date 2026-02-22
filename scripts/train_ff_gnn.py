@@ -166,6 +166,16 @@ def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
 
 
+def _forward_encoder(model, *args, **kwargs):
+    compiler_ns = getattr(torch, "compiler", None)
+    mark_step = (
+        getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
+    )
+    if callable(mark_step):
+        mark_step()
+    return model(*args, **kwargs)
+
+
 def _optimizer_step(
     optim: torch.optim.Optimizer,
     loss: torch.Tensor,
@@ -361,11 +371,11 @@ def _concat_forward_pos_neg(
         edge_weight_cat = torch.cat([edge_weight, edge_weight], dim=0)
     batch_cat = torch.cat([batch_nodes, batch_nodes + num_graphs], dim=0)
     if return_all:
-        layers = model(x_cat, edge_index_cat, edge_weight=edge_weight_cat, return_all=True)
+        layers = _forward_encoder(model, x_cat, edge_index_cat, edge_weight=edge_weight_cat, return_all=True)
         pos_layers = [h[:n_nodes] for h in layers]
         neg_layers = [h[n_nodes:] for h in layers]
         return pos_layers, neg_layers
-    h = model(x_cat, edge_index_cat, edge_weight=edge_weight_cat)
+    h = _forward_encoder(model, x_cat, edge_index_cat, edge_weight=edge_weight_cat)
     return h[:n_nodes], h[n_nodes:]
 
 
@@ -1070,7 +1080,7 @@ def _try_batch_size(
     x = batch.x
     edge_weight = getattr(batch, "edge_weight", None)
     if multiscale:
-        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+        layers_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight, return_all=True)
         if neg_mode == "self_contrastive":
             x_view = _make_self_contrastive_view(
                 x,
@@ -1080,7 +1090,7 @@ def _try_batch_size(
                 window_len=window_len,
                 summary_dim=summary_dim,
             )
-            layers_view = model(
+            layers_view = _forward_encoder(model, 
                 x_view, batch.edge_index, edge_weight=edge_weight, return_all=True
             )
             loss = 0.0
@@ -1124,7 +1134,7 @@ def _try_batch_size(
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
-                layers_neg_aux = model(
+                layers_neg_aux = _forward_encoder(model, 
                     x_neg_aux,
                     batch.edge_index,
                     edge_weight=edge_weight,
@@ -1172,10 +1182,10 @@ def _try_batch_size(
                 window_len=window_len,
                 summary_dim=summary_dim,
             )
-            layers_neg_h = model(
+            layers_neg_h = _forward_encoder(model, 
                 x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
             )
-            layers_neg_t = model(
+            layers_neg_t = _forward_encoder(model, 
                 x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
             )
             loss = 0.0
@@ -1216,7 +1226,7 @@ def _try_batch_size(
                 )
                 loss = loss + distance_forward_weight * 0.5 * (dist_loss_h + dist_loss_t)
     else:
-        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+        h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
         if neg_mode == "self_contrastive":
             x_view = _make_self_contrastive_view(
                 x,
@@ -1226,7 +1236,7 @@ def _try_batch_size(
                 window_len=window_len,
                 summary_dim=summary_dim,
             )
-            h_view = model(x_view, batch.edge_index, edge_weight=edge_weight)
+            h_view = _forward_encoder(model, x_view, batch.edge_index, edge_weight=edge_weight)
             loss, _, _, z_pos, z_view = _self_contrastive_batch_loss(
                 h_pos,
                 h_view,
@@ -1257,7 +1267,7 @@ def _try_batch_size(
                     window_len=window_len,
                     summary_dim=summary_dim,
                 )
-                h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                h_neg_aux = _forward_encoder(model, x_neg_aux, batch.edge_index, edge_weight=edge_weight)
                 g_pos_aux = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
                 g_neg_aux = goodness(h_neg_aux, batch.batch, temperature=goodness_temp, critic=critic)
                 loss = loss + self_contrastive_ff_weight * ff_loss(
@@ -1283,7 +1293,7 @@ def _try_batch_size(
                 window_len=window_len,
                 summary_dim=summary_dim,
             )
-            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+            h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
             loss = ff_loss(
                 g_pos,
@@ -1356,6 +1366,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--loader-workers", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--auto-tune-batch", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-auto-tune-batch", action="store_true", default=False)
     parser.add_argument("--auto-tune-max-batch", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--auto-tune-factor", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--auto-tune-min-batch", type=int, default=argparse.SUPPRESS)
@@ -1368,6 +1379,11 @@ def main() -> int:
     parser.add_argument("--ff-neg-mix-weights", default=argparse.SUPPRESS)
     parser.add_argument("--ff-curriculum-epochs", default=argparse.SUPPRESS)
     parser.add_argument("--ff-rank-aux-weight", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--ff-rank-use-portfolio-targets",
+        action="store_true",
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--ff-hall-every-n-batches", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--ff-hall-warmup-epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--ff-hall-steps", type=int, default=argparse.SUPPRESS)
@@ -1407,6 +1423,7 @@ def main() -> int:
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--torch-compile", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-torch-compile", action="store_true", default=False)
     parser.add_argument("--torch-compile-mode", default=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -1490,6 +1507,8 @@ def main() -> int:
         _get_setting(args, section, "residual_edge_detach_features", True)
     )
     auto_tune = _get_setting(args, section, "auto_tune_batch", False)
+    if bool(getattr(args, "no_auto_tune_batch", False)):
+        auto_tune = False
     auto_tune_max = _get_setting(args, section, "auto_tune_max_batch", 64)
     auto_tune_factor = _get_setting(args, section, "auto_tune_factor", 2)
     auto_tune_min = _get_setting(args, section, "auto_tune_min_batch", 1)
@@ -1502,6 +1521,9 @@ def main() -> int:
     ff_neg_mix_weights_raw = _get_setting(args, section, "ff_neg_mix_weights", [])
     ff_curriculum_epochs_raw = _get_setting(args, section, "ff_curriculum_epochs", [])
     ff_rank_aux_weight = float(_get_setting(args, section, "ff_rank_aux_weight", 0.0))
+    ff_rank_use_portfolio_targets = _to_bool(
+        _get_setting(args, section, "ff_rank_use_portfolio_targets", True)
+    )
     ff_hall_every_n_batches = int(_get_setting(args, section, "ff_hall_every_n_batches", 1))
     ff_hall_warmup_epochs = int(_get_setting(args, section, "ff_hall_warmup_epochs", 0))
     ff_hall_steps_override = _get_setting(args, section, "ff_hall_steps", None)
@@ -1540,6 +1562,8 @@ def main() -> int:
     amp_dtype_raw = _get_setting(args, section, "amp_dtype", "float16")
     fused_optimizer = _to_bool(_get_setting(args, section, "fused_optimizer", True))
     torch_compile_enabled = _to_bool(_get_setting(args, section, "torch_compile", False))
+    if bool(getattr(args, "no_torch_compile", False)):
+        torch_compile_enabled = False
     torch_compile_mode = str(_get_setting(args, section, "torch_compile_mode", "reduce-overhead"))
     ff_layerwise = _get_setting(args, section, "ff_layerwise", False) or getattr(
         args, "ff_layerwise", False
@@ -1803,6 +1827,7 @@ def main() -> int:
     ff_neg_mix_weights = _normalize_mode_weights(ff_neg_mix, _parse_float_list(ff_neg_mix_weights_raw))
     ff_curriculum_epochs = _parse_float_list(ff_curriculum_epochs_raw)
     ff_rank_aux_weight = max(0.0, float(ff_rank_aux_weight))
+    ff_rank_use_portfolio_targets = bool(ff_rank_use_portfolio_targets)
     ff_hall_every_n_batches = max(1, int(ff_hall_every_n_batches))
     ff_hall_warmup_epochs = max(0, int(ff_hall_warmup_epochs))
     ff_econ_eval_every = max(1, int(ff_econ_eval_every))
@@ -1967,6 +1992,11 @@ def main() -> int:
             f"weight={portfolio_loss_weight} type={portfolio_loss_type} std={portfolio_standardize} "
             f"max_abs_logret={portfolio_max_abs_logret}"
         )
+    if ff_rank_aux_weight > 0:
+        print(
+            f"ff_rank_aux: weight={ff_rank_aux_weight} "
+            f"portfolio_targets={ff_rank_use_portfolio_targets and not ff_layerwise}"
+        )
     print(
         "critic_arch: "
         f"ensemble={critic_ensemble_size}, seq_enabled={sequence_critic_enabled}, "
@@ -2053,7 +2083,7 @@ def main() -> int:
         f"hall_warmup_epochs={ff_hall_warmup_epochs}, econ_eval_every={ff_econ_eval_every}"
     )
     if torch_compile_enabled:
-        print(f"torch_compile: enabled (mode={torch_compile_mode})")
+        print(f"torch_compile: requested (mode={torch_compile_mode})")
     if adaptive_hall_enabled:
         print(
             "adaptive_hallucination: "
@@ -2088,10 +2118,30 @@ def main() -> int:
         residual_edge_detach_features=bool(residual_edge_detach_features),
     ).to(device)
     if torch_compile_enabled and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode=torch_compile_mode)
-        except Exception as exc:
-            print(f"torch.compile disabled due to runtime error: {exc}")
+        requested_mode = str(torch_compile_mode).strip() or "default"
+        compile_candidates: list[str] = []
+        if device.type == "cuda" and requested_mode == "reduce-overhead":
+            # Multi-forward FF training is sensitive to CUDA graph buffer reuse.
+            compile_candidates.append("max-autotune-no-cudagraphs")
+        compile_candidates.append(requested_mode)
+        if "default" not in compile_candidates:
+            compile_candidates.append("default")
+        seen_modes: set[str] = set()
+        compile_candidates = [m for m in compile_candidates if not (m in seen_modes or seen_modes.add(m))]
+        for mode in compile_candidates:
+            try:
+                model = torch.compile(model, mode=mode)
+                torch_compile_mode = mode
+                print(f"torch_compile: active (mode={mode})")
+                break
+            except Exception as exc:
+                print(f"torch.compile failed (mode={mode}): {exc}")
+        else:
+            torch_compile_enabled = False
+            print("torch_compile: disabled after fallback attempts.")
+    elif torch_compile_enabled:
+        torch_compile_enabled = False
+        print("torch_compile: requested but torch.compile is unavailable in this runtime.")
     critic_cfg = {
         "dropout": float(dropout),
         "seed": int(seed),
@@ -2207,13 +2257,21 @@ def main() -> int:
     portfolio_head = None
     portfolio_targets: list[float | None] | None = None
     portfolio_ticker_effective = str(portfolio_ticker)
-    if portfolio_head_enabled:
-        if ff_layerwise:
+    rank_needs_portfolio_targets = (
+        ff_rank_aux_weight > 0 and ff_rank_use_portfolio_targets and not ff_layerwise
+    )
+    load_portfolio_targets = bool(portfolio_head_enabled or rank_needs_portfolio_targets)
+    if load_portfolio_targets:
+        if ff_layerwise and portfolio_head_enabled:
             print("portfolio_head disabled when ff_layerwise is enabled.")
             portfolio_head_enabled = False
-        elif not dates:
-            print("portfolio_head disabled: graphs payload missing dates.")
-            portfolio_head_enabled = False
+        if not dates:
+            if portfolio_head_enabled:
+                print("portfolio_head disabled: graphs payload missing dates.")
+                portfolio_head_enabled = False
+            if rank_needs_portfolio_targets:
+                print("rank_aux portfolio targets unavailable: graphs payload missing dates.")
+                rank_needs_portfolio_targets = False
         else:
             prices_path = build_cfg.get("prices", "data/processed/prices.csv")
             try:
@@ -2239,8 +2297,15 @@ def main() -> int:
                 if not any(t is not None for t in portfolio_targets):
                     raise ValueError("no valid portfolio targets for configured horizon")
             except Exception as exc:
-                print(f"portfolio_head disabled: {exc}")
-                portfolio_head_enabled = False
+                if portfolio_head_enabled:
+                    print(f"portfolio_head disabled: {exc}")
+                    portfolio_head_enabled = False
+                if rank_needs_portfolio_targets:
+                    print(
+                        "rank_aux portfolio targets unavailable; "
+                        f"using spread fallback: {exc}"
+                    )
+                    rank_needs_portfolio_targets = False
                 portfolio_targets = None
 
     if portfolio_head_enabled and portfolio_targets:
@@ -2261,7 +2326,7 @@ def main() -> int:
         batch = next(iter(loader)).to(device)
         x = batch.x
         edge_weight = getattr(batch, "edge_weight", None)
-        h = model(x, batch.edge_index, edge_weight=edge_weight)
+        h = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
         for t in temps:
             g = goodness(h, batch.batch, temperature=t, critic=critic).mean().item()
             print(f"goodness_temp={t} -> mean_goodness={g:.4f}")
@@ -2414,7 +2479,12 @@ def main() -> int:
     )
     for epoch in epoch_iter:
         model.train()
-        critic.train(any(p.requires_grad for p in critic.parameters()))
+        critic_train_mode = any(p.requires_grad for p in critic.parameters()) or bool(
+            sequence_critic_enabled
+        )
+        # cuDNN-backed RNN critics require training mode for backward, even when
+        # critic params are frozen and only encoder grads flow through critic outputs.
+        critic.train(critic_train_mode)
         epoch_goodness_target = float(goodness_target)
         epoch_neg_mix_end = float(neg_mix_end)
         epoch_neg_gate_margin = float(neg_gate_margin)
@@ -2515,13 +2585,6 @@ def main() -> int:
             timing_before = timing_totals.copy()
 
             if ff_multiscale:
-                t_fwd_pos = time.perf_counter()
-                if step_scaler is not None:
-                    with _autocast_if_needed(True, amp_dtype):
-                        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
-                else:
-                    layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
-                timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                 hall_active = False
                 dist_loss_val = 0.0
 
@@ -2538,12 +2601,53 @@ def main() -> int:
                             summary_dim=summary_dim,
                         )
                     timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
-                    t_fwd_neg = time.perf_counter()
-                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                        layers_view = model(
-                            x_view, batch.edge_index, edge_weight=edge_weight, return_all=True
-                        )
-                    timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+
+                    if ff_concat_posneg:
+                        t_fwd_cat = time.perf_counter()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            layers_pos, layers_view = _concat_forward_pos_neg(
+                                model=model,
+                                x_pos=x,
+                                x_neg=x_view,
+                                edge_index=batch.edge_index,
+                                edge_weight=edge_weight,
+                                batch_nodes=batch.batch,
+                                return_all=True,
+                            )
+                        dt_cat = time.perf_counter() - t_fwd_cat
+                        timing_totals["forward_pos"] += 0.5 * dt_cat
+                        timing_totals["forward_neg"] += 0.5 * dt_cat
+                    else:
+                        t_fwd_pos = time.perf_counter()
+                        if step_scaler is not None:
+                            with _autocast_if_needed(True, amp_dtype):
+                                layers_pos = _forward_encoder(
+                                    model,
+                                    x,
+                                    batch.edge_index,
+                                    edge_weight=edge_weight,
+                                    return_all=True,
+                                )
+                        else:
+                            layers_pos = _forward_encoder(
+                                model,
+                                x,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                                return_all=True,
+                            )
+                        timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        t_fwd_neg = time.perf_counter()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            layers_view = _forward_encoder(
+                                model,
+                                x_view,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                                return_all=True,
+                            )
+                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+
                     t_loss_terms = time.perf_counter()
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         batch_loss = 0.0
@@ -2591,7 +2695,8 @@ def main() -> int:
                             )
                             timing_totals["neg_gen"] += time.perf_counter() - t_neg_aux
                             t_fwd_neg_aux = time.perf_counter()
-                            layers_neg_aux = model(
+                            layers_neg_aux = _forward_encoder(
+                                model,
                                 x_neg_aux,
                                 batch.edge_index,
                                 edge_weight=edge_weight,
@@ -2614,6 +2719,25 @@ def main() -> int:
                             batch_loss = batch_loss + epoch_sc_ff_weight * ff_aux
                     timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
                 else:
+                    t_fwd_pos = time.perf_counter()
+                    if step_scaler is not None:
+                        with _autocast_if_needed(True, amp_dtype):
+                            layers_pos = _forward_encoder(
+                                model,
+                                x,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                                return_all=True,
+                            )
+                    else:
+                        layers_pos = _forward_encoder(
+                            model,
+                            x,
+                            batch.edge_index,
+                            edge_weight=edge_weight,
+                            return_all=True,
+                        )
+                    timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
                         t_neg_gen = time.perf_counter()
@@ -2681,10 +2805,10 @@ def main() -> int:
                     timing_totals["neg_gen"] += time.perf_counter() - t_neg_time
 
                     t_fwd_neg = time.perf_counter()
-                    layers_neg_h = model(
+                    layers_neg_h = _forward_encoder(model, 
                         x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
                     )
-                    layers_neg_t = model(
+                    layers_neg_t = _forward_encoder(model, 
                         x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
                     )
                     timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
@@ -2709,7 +2833,7 @@ def main() -> int:
                             hall_gated += 1
                             hall_active = False
                             t_fwd_neg_gate = time.perf_counter()
-                            layers_neg_h = model(
+                            layers_neg_h = _forward_encoder(model, 
                                 x_neg_hall,
                                 batch.edge_index,
                                 edge_weight=edge_weight,
@@ -2719,10 +2843,16 @@ def main() -> int:
 
                     t_loss_terms = time.perf_counter()
                     batch_loss = 0.0
+                    g_pos_last = 0.0
+                    g_neg_h_last = 0.0
+                    g_neg_t_last = 0.0
                     for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
                         g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
                         g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp, critic=critic)
                         g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp, critic=critic)
+                        g_pos_last = g_p.mean().item()
+                        g_neg_h_last = g_n_h.mean().item()
+                        g_neg_t_last = g_n_t.mean().item()
                         batch_loss += ff_loss(
                             g_p,
                             g_n_h,
@@ -2758,15 +2888,6 @@ def main() -> int:
                         dist_loss_val = 0.5 * (dist_loss_h + dist_loss_t)
                         batch_loss = batch_loss + distance_forward_weight * dist_loss_val
 
-                    g_pos_last = goodness(
-                        layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
-                    ).mean().item()
-                    g_neg_h_last = goodness(
-                        layers_neg_h[-1], batch.batch, temperature=goodness_temp, critic=critic
-                    ).mean().item()
-                    g_neg_t_last = goodness(
-                        layers_neg_t[-1], batch.batch, temperature=goodness_temp, critic=critic
-                    ).mean().item()
                     g_neg_last = (g_neg_h_last + g_neg_t_last) / 2.0
                     timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
 
@@ -2928,11 +3049,11 @@ def main() -> int:
                     else:
                         t_fwd_pos = time.perf_counter()
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                            layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                            layers_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight, return_all=True)
                         timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                         t_fwd_neg = time.perf_counter()
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                            layers_neg = model(
+                            layers_neg = _forward_encoder(model, 
                                 x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
                             )
                         timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
@@ -2959,7 +3080,7 @@ def main() -> int:
                             hall_active = False
                             t_fwd_neg = time.perf_counter()
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                                layers_neg = model(
+                                layers_neg = _forward_encoder(model, 
                                     x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
                                 )
                             timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
@@ -3020,6 +3141,8 @@ def main() -> int:
                             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
                         hall_active = layer_mode == "hallucinate"
+                        h_neg = None
+                        g_neg = None
                         if layer_mode == "hallucinate":
                             forward_fn = lambda x_var, li=li: model.forward_layer(
                                 x_var, batch.edge_index, edge_weight, li
@@ -3081,9 +3204,13 @@ def main() -> int:
                         if layer_mode == "hallucinate":
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
                                 h_neg_probe = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                                g_neg_probe = goodness(
-                                    h_neg_probe, batch.batch, temperature=goodness_temp, critic=critic
-                                ).mean().item()
+                                g_neg_probe_t = goodness(
+                                    h_neg_probe,
+                                    batch.batch,
+                                    temperature=goodness_temp,
+                                    critic=critic,
+                                )
+                                g_neg_probe = g_neg_probe_t.mean().item()
                             g_pos_probe = g_pos.mean().item()
                             if g_neg_probe > g_pos_probe + neg_gate_margin:
                                 x_neg = make_negative(
@@ -3097,12 +3224,16 @@ def main() -> int:
                                 hall_used -= 1
                                 hall_gated += 1
                                 hall_active = False
+                            else:
+                                h_neg = h_neg_probe
+                                g_neg = g_neg_probe_t
 
                         with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                            t_fwd_neg = time.perf_counter()
-                            h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
-                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
-                            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
+                            if h_neg is None:
+                                t_fwd_neg = time.perf_counter()
+                                h_neg = model.forward_layer(x_neg, batch.edge_index, edge_weight, li)
+                                timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                                g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
                             loss = ff_loss(
                                 g_pos,
                                 g_neg,
@@ -3138,9 +3269,6 @@ def main() -> int:
                 if use_mode == "self_contrastive":
                     total_used += 1
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                        t_fwd_pos = time.perf_counter()
-                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                        timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                         t_neg_gen = time.perf_counter()
                         x_view = _make_self_contrastive_view(
                             x,
@@ -3151,9 +3279,27 @@ def main() -> int:
                             summary_dim=summary_dim,
                         )
                         timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
-                        t_fwd_neg = time.perf_counter()
-                        h_view = model(x_view, batch.edge_index, edge_weight=edge_weight)
-                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                        if ff_concat_posneg:
+                            t_fwd_cat = time.perf_counter()
+                            h_pos, h_view = _concat_forward_pos_neg(
+                                model=model,
+                                x_pos=x,
+                                x_neg=x_view,
+                                edge_index=batch.edge_index,
+                                edge_weight=edge_weight,
+                                batch_nodes=batch.batch,
+                                return_all=False,
+                            )
+                            dt_cat = time.perf_counter() - t_fwd_cat
+                            timing_totals["forward_pos"] += 0.5 * dt_cat
+                            timing_totals["forward_neg"] += 0.5 * dt_cat
+                        else:
+                            t_fwd_pos = time.perf_counter()
+                            h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
+                            timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                            t_fwd_neg = time.perf_counter()
+                            h_view = _forward_encoder(model, x_view, batch.edge_index, edge_weight=edge_weight)
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
                         t_loss_terms = time.perf_counter()
                         loss, pos_score, neg_score, z_pos, z_view = _self_contrastive_batch_loss(
                             h_pos,
@@ -3191,7 +3337,7 @@ def main() -> int:
                             )
                             timing_totals["neg_gen"] += time.perf_counter() - t_neg_aux
                             t_fwd_neg_aux = time.perf_counter()
-                            h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                            h_neg_aux = _forward_encoder(model, x_neg_aux, batch.edge_index, edge_weight=edge_weight)
                             timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg_aux
                             g_pos_aux = goodness(
                                 h_pos,
@@ -3214,9 +3360,11 @@ def main() -> int:
                     hall_active = use_mode == "hallucinate"
                     h_pos = None
                     g_pos = None
+                    h_neg = None
+                    g_neg = None
                     if hall_active:
                         t_fwd_pos = time.perf_counter()
-                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
                         timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                         g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
                     if use_mode == "hallucinate":
@@ -3273,11 +3421,12 @@ def main() -> int:
 
                     if use_mode == "hallucinate":
                         t_fwd_neg_probe = time.perf_counter()
-                        h_neg_probe = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        h_neg_probe = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
                         timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg_probe
-                        g_neg_probe = goodness(
+                        g_neg_probe_t = goodness(
                             h_neg_probe, batch.batch, temperature=goodness_temp, critic=critic
-                        ).mean().item()
+                        )
+                        g_neg_probe = g_neg_probe_t.mean().item()
                         g_pos_probe = g_pos.mean().item()
                         if g_neg_probe > g_pos_probe + neg_gate_margin:
                             x_neg = make_negative(
@@ -3291,14 +3440,18 @@ def main() -> int:
                             hall_used -= 1
                             hall_gated += 1
                             hall_active = False
+                        else:
+                            h_neg = h_neg_probe
+                            g_neg = g_neg_probe_t
                     if hall_active or not ff_concat_posneg:
                         if h_pos is None:
                             t_fwd_pos = time.perf_counter()
-                            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                            h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
                             timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
-                        t_fwd_neg = time.perf_counter()
-                        h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                        if h_neg is None:
+                            t_fwd_neg = time.perf_counter()
+                            h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
                     else:
                         t_fwd_cat = time.perf_counter()
                         h_pos, h_neg = _concat_forward_pos_neg(
@@ -3315,7 +3468,8 @@ def main() -> int:
                         timing_totals["forward_neg"] += 0.5 * dt_cat
                     if g_pos is None:
                         g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
-                    g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
+                    if g_neg is None:
+                        g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
 
                     loss = ff_loss(
                         g_pos,
