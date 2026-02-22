@@ -540,6 +540,83 @@ def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
 
 
+def _forward_encoder(model, *args, **kwargs):
+    compiler_ns = getattr(torch, "compiler", None)
+    mark_step = (
+        getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
+    )
+    if callable(mark_step):
+        mark_step()
+    return model(*args, **kwargs)
+
+
+def _compile_mode_candidates(requested_mode: str, device: torch.device) -> list[str]:
+    requested = str(requested_mode).strip() or "default"
+    candidates: list[str] = []
+    if device.type == "cuda" and requested == "reduce-overhead":
+        # FF-style multi-forward loops are sensitive to CUDA graph reuse.
+        candidates.append("max-autotune-no-cudagraphs")
+    candidates.append(requested)
+    if "default" not in candidates:
+        candidates.append("default")
+    seen: set[str] = set()
+    return [m for m in candidates if not (m in seen or seen.add(m))]
+
+
+def _maybe_compile_encoder(
+    model: torch.nn.Module,
+    config: dict,
+    device: torch.device,
+    context: str,
+) -> torch.nn.Module:
+    if not bool(config.get("torch_compile", False)):
+        return model
+    if not hasattr(torch, "compile"):
+        config["torch_compile"] = False
+        print(f"warning: {context} torch.compile requested but unavailable; disabled.")
+        return model
+    requested_mode = str(config.get("torch_compile_mode", "max-autotune-no-cudagraphs"))
+    for mode in _compile_mode_candidates(requested_mode, device):
+        try:
+            model = torch.compile(model, mode=mode)
+            config["torch_compile_mode"] = mode
+            print(f"{context} torch_compile active (mode={mode})")
+            return model
+        except Exception as exc:
+            print(f"warning: {context} torch.compile failed (mode={mode}): {exc}")
+    config["torch_compile"] = False
+    print(f"warning: {context} torch.compile disabled after fallback attempts.")
+    return model
+
+
+def _safe_retry_config(cfg_mode: dict) -> dict:
+    safe_cfg = cfg_mode.copy()
+    safe_cfg.update(
+        {
+            "torch_compile": False,
+            "risk_head_enabled": False,
+            "portfolio_head_enabled": False,
+            "sequence_critic_enabled": False,
+            "residual_edge_weight_enabled": False,
+            "amp": False,
+            "backprop_amp": False,
+            "neg_mode": "shuffle+noise",
+            "eval_neg_mode": "shuffle",
+        }
+    )
+    return safe_cfg
+
+
+def _error_metadata(exc: Exception, max_len: int = 1000) -> tuple[str, str]:
+    err_type = type(exc).__name__
+    err_msg = str(exc).strip().replace("\n", " | ")
+    if not err_msg:
+        err_msg = repr(exc)
+    if len(err_msg) > max_len:
+        err_msg = err_msg[: max_len - 3] + "..."
+    return err_type, err_msg
+
+
 def _optimizer_step(optim, loss: torch.Tensor, grad_clip: float, clip_params, scaler) -> None:
     optim.zero_grad(set_to_none=True)
     if scaler is not None:
@@ -582,18 +659,52 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
 def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
     if not fold_rows:
         return {}
+    successful_rows = [r for r in fold_rows if str(r.get("status", "ok")).strip().lower() == "ok"]
+    failed_rows = [r for r in fold_rows if str(r.get("status", "ok")).strip().lower() != "ok"]
+    if not successful_rows:
+        first_fail = failed_rows[0] if failed_rows else fold_rows[0]
+        out_failed = {
+            "walk_forward_num_folds": 0,
+            "walk_forward_num_failed_folds": len(fold_rows),
+            "split_mode_effective": "walk_forward",
+            "status": "failed",
+            "error_type": str(first_fail.get("error_type", "RuntimeError")),
+            "error_message": str(first_fail.get("error_message", "all folds failed")),
+            "retry_applied": bool(any(bool(r.get("retry_applied", False)) for r in fold_rows)),
+            "safe_mode_applied": bool(any(bool(r.get("safe_mode_applied", False)) for r in fold_rows)),
+        }
+        for key in (
+            "eval_objective",
+            "objective_track",
+            "primary_eval_metric_name",
+            "primary_eval_metric_robust_name",
+            "neg_mode_effective",
+            "eval_neg_mode_effective",
+            "risk_head_enabled_effective",
+            "portfolio_head_enabled_effective",
+        ):
+            if key in first_fail:
+                out_failed[key] = first_fail[key]
+        return out_failed
+
     out: dict[str, object] = {}
-    key_union = sorted({k for r in fold_rows for k in r.keys()})
+    key_union = sorted({k for r in successful_rows for k in r.keys()})
     skip_keys = {
         "mode",
         "row_type",
+        "status",
+        "error_type",
+        "error_message",
+        "retry_applied",
+        "safe_mode_applied",
         "walk_forward_num_folds",
+        "walk_forward_num_failed_folds",
     }
     for key in key_union:
         if key in skip_keys or key.startswith("fold_"):
             continue
         vals: list[float] = []
-        for row in fold_rows:
+        for row in successful_rows:
             value = row.get(key)
             if isinstance(value, bool):
                 continue
@@ -607,7 +718,7 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
             out[f"{key}_std"] = std_val
             out[f"{key}_min"] = float(np.min(vals))
             out[f"{key}_max"] = float(np.max(vals))
-    first = fold_rows[0]
+    first = successful_rows[0]
     for key in (
         "eval_objective",
         "objective_track",
@@ -620,8 +731,14 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
     ):
         if key in first:
             out[key] = first[key]
-    out["walk_forward_num_folds"] = len(fold_rows)
+    out["walk_forward_num_folds"] = len(successful_rows)
+    out["walk_forward_num_failed_folds"] = len(failed_rows)
     out["split_mode_effective"] = "walk_forward"
+    out["status"] = "ok"
+    out["error_type"] = ""
+    out["error_message"] = ""
+    out["retry_applied"] = bool(any(bool(r.get("retry_applied", False)) for r in successful_rows))
+    out["safe_mode_applied"] = bool(any(bool(r.get("safe_mode_applied", False)) for r in successful_rows))
     return out
 
 
@@ -806,6 +923,7 @@ def _make_negatives(
     factor_start_idx: int | None = None,
     factor_dim: int = 0,
     timing: dict[str, float] | None = None,
+    forward_fn=None,
 ):
     t0 = time.perf_counter()
     mode_raw = str(use_mode).strip().lower()
@@ -867,6 +985,14 @@ def _make_negatives(
                     out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
         return _finish(out_adv)
     if use_mode == "hallucinate":
+        hall_forward = forward_fn
+        if hall_forward is None:
+            hall_forward = lambda x_in: _forward_encoder(
+                model,
+                x_in,
+                edge_index,
+                edge_weight=edge_weight,
+            )
         out_h = hallucinate_negative(
             model,
             x,
@@ -875,6 +1001,7 @@ def _make_negatives(
             batch,
             hall_cfg,
             edge_weight=edge_weight,
+            forward_fn=hall_forward,
             critic=critic,
         )
         return _finish(out_h)
@@ -1071,8 +1198,8 @@ def _eval_ff_metrics(
                 summary_dim=summary_dim,
             )
             with torch.no_grad():
-                h_a = model(x, batch.edge_index, edge_weight=edge_weight)
-                h_b = model(x_view, batch.edge_index, edge_weight=edge_weight)
+                h_a = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
+                h_b = _forward_encoder(model, x_view, batch.edge_index, edge_weight=edge_weight)
                 z_a = global_mean_pool(h_a, batch.batch)
                 z_b = global_mean_pool(h_b, batch.batch)
                 loss, pos_score, neg_score = self_contrastive_loss(
@@ -1119,7 +1246,7 @@ def _eval_ff_metrics(
         x = batch.x
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
-            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+            h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
         if eval_mode == "hallucinate":
@@ -1156,7 +1283,7 @@ def _eval_ff_metrics(
                 )
 
         with torch.no_grad():
-            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+            h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
             pred_pos = (g_pos > goodness_target)
             pred_neg = (g_neg <= goodness_target)
@@ -1278,7 +1405,7 @@ def _calibrate_goodness_target(
         x = batch.x
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
-            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+            h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
             g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
 
         if neg_mode == "hallucinate":
@@ -1315,7 +1442,7 @@ def _calibrate_goodness_target(
                 )
 
         with torch.no_grad():
-            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+            h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
             g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
 
         pos_vals.append(g_pos.detach().cpu())
@@ -1402,11 +1529,7 @@ def _benchmark_ff(
         residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
         residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
     ).to(device)
-    if bool(config.get("torch_compile", False)) and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode=str(config.get("torch_compile_mode", "reduce-overhead")))
-        except Exception as exc:
-            print(f"warning: benchmark ff torch.compile disabled: {exc}")
+    model = _maybe_compile_encoder(model, config, device, context="benchmark ff")
     critic = _build_critic(config, hidden_dim=int(config["hidden_dim"]), device=device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
     risk_horizons_effective = config.get("risk_horizons_effective", [])
@@ -1596,10 +1719,10 @@ def _benchmark_ff(
                     )
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         t_fwd_pos = time.perf_counter()
-                        layers_pos = model(x, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                        layers_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight, return_all=True)
                         component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
                         t_fwd_neg = time.perf_counter()
-                        layers_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
+                        layers_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True)
                         component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                     if layer_mode == "hallucinate":
                         last_idx = ff_block_endpoints[-1]
@@ -1627,7 +1750,7 @@ def _benchmark_ff(
                             )
                             with _autocast_if_needed(step_scaler is not None, amp_dtype):
                                 t_fwd_neg = time.perf_counter()
-                                layers_neg = model(
+                                layers_neg = _forward_encoder(model, 
                                     x_neg, batch.edge_index, edge_weight=edge_weight, return_all=True
                                 )
                                 component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
@@ -1730,7 +1853,7 @@ def _benchmark_ff(
                 if use_mode == "self_contrastive":
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         t_fwd_pos = time.perf_counter()
-                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
                         component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
                         t_neg_gen = time.perf_counter()
                         x_view = _make_self_contrastive_view(
@@ -1743,7 +1866,7 @@ def _benchmark_ff(
                         )
                         component_times["neg_gen"] += time.perf_counter() - t_neg_gen
                         t_fwd_neg = time.perf_counter()
-                        h_view = model(x_view, batch.edge_index, edge_weight=edge_weight)
+                        h_view = _forward_encoder(model, x_view, batch.edge_index, edge_weight=edge_weight)
                         component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                         loss, _, _, z_pos, z_view = _self_contrastive_step(
                             h_pos,
@@ -1772,7 +1895,7 @@ def _benchmark_ff(
                             )
                             component_times["neg_gen"] += time.perf_counter() - t_neg_gen
                             t_fwd_neg_aux = time.perf_counter()
-                            h_neg_aux = model(x_neg_aux, batch.edge_index, edge_weight=edge_weight)
+                            h_neg_aux = _forward_encoder(model, x_neg_aux, batch.edge_index, edge_weight=edge_weight)
                             component_times["forward_neg"] += time.perf_counter() - t_fwd_neg_aux
                             g_pos_aux = goodness(
                                 h_pos,
@@ -1826,7 +1949,7 @@ def _benchmark_ff(
                         )
                         batch_cat = torch.cat([batch.batch, batch.batch + num_graphs], dim=0)
                         t_fwd = time.perf_counter()
-                        h_cat = model(x_cat, edge_index_cat, edge_weight=edge_weight_cat)
+                        h_cat = _forward_encoder(model, x_cat, edge_index_cat, edge_weight=edge_weight_cat)
                         dt_fwd = time.perf_counter() - t_fwd
                         component_times["forward_pos"] += 0.5 * dt_fwd
                         component_times["forward_neg"] += 0.5 * dt_fwd
@@ -1834,10 +1957,10 @@ def _benchmark_ff(
                         h_neg = h_cat[n_nodes:]
                     else:
                         t_fwd_pos = time.perf_counter()
-                        h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                        h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
                         component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
                         t_fwd_neg = time.perf_counter()
-                        h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+                        h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
                         component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
                     g_pos = goodness(
                         h_pos,
@@ -2101,11 +2224,7 @@ def _benchmark_backprop(
         residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
         residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
     ).to(device)
-    if bool(config.get("torch_compile", False)) and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode=str(config.get("torch_compile_mode", "reduce-overhead")))
-        except Exception as exc:
-            print(f"warning: benchmark backprop torch.compile disabled: {exc}")
+    model = _maybe_compile_encoder(model, config, device, context="benchmark backprop")
     head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
     risk_horizons_effective = config.get("risk_horizons_effective", [])
@@ -2177,6 +2296,7 @@ def _benchmark_backprop(
     neg_sector_idx, neg_factor_start_idx, neg_factor_dim = _infer_neg_feature_slices(config)
     hall_every_n_batches = max(1, int(config.get("ff_hall_every_n_batches", 1)))
     hall_warmup_epochs = max(0, int(config.get("ff_hall_warmup_epochs", 0)))
+    backprop_concat_posneg = bool(config.get("backprop_concat_posneg", True))
 
     epoch_times = []
     component_times = {
@@ -2208,12 +2328,6 @@ def _benchmark_backprop(
             x = batch.x
             batch_t0 = time.perf_counter()
             comp_before = component_times.copy()
-            with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
-                t_fwd_pos = time.perf_counter()
-                h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-                component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
-                z_pos = global_mean_pool(h_pos, batch.batch)
-                y_pos = torch.ones(z_pos.size(0), device=device)
 
             use_mode = _get_use_mode(
                 epoch,
@@ -2245,10 +2359,34 @@ def _benchmark_backprop(
                 timing=component_times,
             )
             with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
-                t_fwd_neg = time.perf_counter()
-                h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
-                component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
-                z_neg = global_mean_pool(h_neg, batch.batch)
+                if backprop_concat_posneg:
+                    n_nodes = int(x.size(0))
+                    num_graphs = int(batch.batch.max().item()) + 1 if batch.batch.numel() else 0
+                    x_cat = torch.cat([x, x_neg], dim=0)
+                    edge_index_cat = torch.cat([batch.edge_index, batch.edge_index + n_nodes], dim=1)
+                    edge_weight_cat = (
+                        torch.cat([edge_weight, edge_weight], dim=0) if edge_weight is not None else None
+                    )
+                    batch_cat = torch.cat([batch.batch, batch.batch + num_graphs], dim=0)
+                    t_fwd = time.perf_counter()
+                    h_cat = _forward_encoder(model, x_cat, edge_index_cat, edge_weight=edge_weight_cat)
+                    dt_fwd = time.perf_counter() - t_fwd
+                    component_times["forward_pos"] += 0.5 * dt_fwd
+                    component_times["forward_neg"] += 0.5 * dt_fwd
+                    h_pos = h_cat[:n_nodes]
+                    h_neg = h_cat[n_nodes:]
+                    z_pos = global_mean_pool(h_pos, batch.batch)
+                    z_neg = global_mean_pool(h_neg, batch.batch)
+                else:
+                    t_fwd_pos = time.perf_counter()
+                    h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
+                    component_times["forward_pos"] += time.perf_counter() - t_fwd_pos
+                    t_fwd_neg = time.perf_counter()
+                    h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
+                    component_times["forward_neg"] += time.perf_counter() - t_fwd_neg
+                    z_pos = global_mean_pool(h_pos, batch.batch)
+                    z_neg = global_mean_pool(h_neg, batch.batch)
+                y_pos = torch.ones(z_pos.size(0), device=device)
                 y_neg = torch.zeros(z_neg.size(0), device=device)
 
                 z = torch.cat([z_pos, z_neg], dim=0)
@@ -2322,11 +2460,6 @@ def _benchmark_backprop(
         batch = batch.to(device)
         edge_weight = getattr(batch, "edge_weight", None)
         x = batch.x
-        with torch.no_grad():
-            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-            z_pos = global_mean_pool(h_pos, batch.batch)
-            y_pos = torch.ones(z_pos.size(0), device=device)
-
         if eval_mode == "hallucinate":
             with torch.enable_grad():
                 x_neg = _make_negatives(
@@ -2359,8 +2492,24 @@ def _benchmark_backprop(
                 )
 
         with torch.no_grad():
-            h_neg = model(x_neg, batch.edge_index, edge_weight=edge_weight)
+            if backprop_concat_posneg:
+                n_nodes = int(x.size(0))
+                num_graphs = int(batch.batch.max().item()) + 1 if batch.batch.numel() else 0
+                x_cat = torch.cat([x, x_neg], dim=0)
+                edge_index_cat = torch.cat([batch.edge_index, batch.edge_index + n_nodes], dim=1)
+                edge_weight_cat = (
+                    torch.cat([edge_weight, edge_weight], dim=0) if edge_weight is not None else None
+                )
+                batch_cat = torch.cat([batch.batch, batch.batch + num_graphs], dim=0)
+                h_cat = _forward_encoder(model, x_cat, edge_index_cat, edge_weight=edge_weight_cat)
+                h_pos = h_cat[:n_nodes]
+                h_neg = h_cat[n_nodes:]
+            else:
+                h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
+                h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
+            z_pos = global_mean_pool(h_pos, batch.batch)
             z_neg = global_mean_pool(h_neg, batch.batch)
+            y_pos = torch.ones(z_pos.size(0), device=device)
             y_neg = torch.zeros(z_neg.size(0), device=device)
 
             z = torch.cat([z_pos, z_neg], dim=0)
@@ -2479,6 +2628,16 @@ def main() -> int:
         torch.set_num_threads(int(train_cfg["torch_num_threads"]))
     if train_cfg.get("torch_num_interop_threads"):
         torch.set_num_interop_threads(int(train_cfg["torch_num_interop_threads"]))
+    if device.type == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
 
     feature_mode = build_cfg.get("feature_mode", "window")
     window_len = int(build_cfg.get("window", 20))
@@ -2578,8 +2737,10 @@ def main() -> int:
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(bench_cfg.get("ff_amp", train_cfg.get("amp", True))),
         "amp_dtype": str(bench_cfg.get("amp_dtype", train_cfg.get("amp_dtype", "float16"))),
-        "torch_compile": bool(train_cfg.get("torch_compile", False)),
-        "torch_compile_mode": str(train_cfg.get("torch_compile_mode", "reduce-overhead")),
+        "torch_compile": bool(bench_cfg.get("torch_compile", False)),
+        "torch_compile_mode": str(
+            bench_cfg.get("torch_compile_mode", "max-autotune-no-cudagraphs")
+        ),
         "fused_optimizer": bool(
             bench_cfg.get("fused_optimizer", train_cfg.get("fused_optimizer", True))
         ),
@@ -2595,6 +2756,7 @@ def main() -> int:
                 bench_cfg.get("fused_optimizer", train_cfg.get("fused_optimizer", True)),
             )
         ),
+        "backprop_concat_posneg": bool(bench_cfg.get("backprop_concat_posneg", True)),
         "loader_workers": int(train_cfg.get("loader_workers", 0)),
         "persistent_workers": bool(train_cfg.get("dataloader_persistent_workers", True)),
         "prefetch_factor": int(train_cfg.get("dataloader_prefetch_factor", 2)),
@@ -2649,7 +2811,12 @@ def main() -> int:
         "hall_attack_edge_drop_prob": float(train_cfg.get("hall_attack_edge_drop_prob", 0.2)),
         "hall_attack_sign_flip_prob": float(train_cfg.get("hall_attack_sign_flip_prob", 0.2)),
         "hall_attack_hub_weight_scale": float(train_cfg.get("hall_attack_hub_weight_scale", 0.5)),
-        "risk_head_enabled": bool(train_cfg.get("risk_head_enabled", False)),
+        "risk_head_enabled": bool(
+            bench_cfg.get(
+                "enable_risk_head",
+                bench_cfg.get("risk_head_enabled", False),
+            )
+        ),
         "risk_ticker": str(train_cfg.get("risk_ticker", "AUTO")),
         "risk_horizon": int(train_cfg.get("risk_horizon", 21)),
         "risk_horizons": _parse_positive_int_list(
@@ -2661,7 +2828,12 @@ def main() -> int:
         "risk_standardize": bool(train_cfg.get("risk_standardize", True)),
         "risk_cache_dir": str(train_cfg.get("risk_cache_dir", "runs/cache")),
         "risk_max_abs_logret": float(train_cfg.get("risk_max_abs_logret", 0.5)),
-        "portfolio_head_enabled": bool(train_cfg.get("portfolio_head_enabled", False)),
+        "portfolio_head_enabled": bool(
+            bench_cfg.get(
+                "enable_portfolio_head",
+                bench_cfg.get("portfolio_head_enabled", False),
+            )
+        ),
         "portfolio_ticker": str(train_cfg.get("portfolio_ticker", "AUTO")),
         "portfolio_horizon": int(train_cfg.get("portfolio_horizon", 5)),
         "portfolio_loss_weight": float(train_cfg.get("portfolio_loss_weight", 0.0)),
@@ -2677,6 +2849,8 @@ def main() -> int:
         "calibrate_quantiles": int(bench_cfg.get("calibrate_quantiles", 31)),
         "ece_bins": int(bench_cfg.get("ece_bins", 10)),
         "eval_neg_modes": bench_cfg.get("eval_neg_modes", []),
+        "retry_safe_on_error": bool(bench_cfg.get("retry_safe_on_error", True)),
+        "continue_on_mode_error": bool(bench_cfg.get("continue_on_mode_error", True)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
         "window_len": int(returns_len),
@@ -2852,6 +3026,51 @@ def main() -> int:
         )
     base_ctx = _baseline_context(config, device, len(graphs))
 
+    retry_safe_on_error = bool(config.get("retry_safe_on_error", True))
+    continue_on_mode_error = bool(config.get("continue_on_mode_error", True))
+    print(
+        "benchmark resiliency: "
+        f"retry_safe_on_error={retry_safe_on_error}, "
+        f"continue_on_mode_error={continue_on_mode_error}, "
+        f"torch_compile={bool(config.get('torch_compile', False))} "
+        f"(mode={config.get('torch_compile_mode')})"
+    )
+
+    def _run_mode_impl(mode_name: str, cfg_run: dict, tr_graphs, ev_graphs, ev_dates):
+        if mode_name == "ff_layerwise":
+            return _benchmark_ff(
+                graphs,
+                device,
+                cfg_run,
+                layerwise=True,
+                train_graphs=tr_graphs,
+                eval_graphs=ev_graphs,
+                eval_dates=ev_dates,
+            )
+        if mode_name == "ff_e2e":
+            return _benchmark_ff(
+                graphs,
+                device,
+                cfg_run,
+                layerwise=False,
+                train_graphs=tr_graphs,
+                eval_graphs=ev_graphs,
+                eval_dates=ev_dates,
+            )
+        if mode_name == "backprop":
+            return _benchmark_backprop(
+                graphs,
+                device,
+                cfg_run,
+                train_graphs=tr_graphs,
+                eval_graphs=ev_graphs,
+                eval_dates=ev_dates,
+            )
+        raise ValueError(f"Unknown mode: {mode_name}")
+
+    mode_success_map: dict[str, bool] = {m: False for m in modes}
+    abort_after_write = False
+
     for mode in modes:
         cfg_mode = config.copy()
         mode_override = mode_overrides.get(mode, {})
@@ -2860,6 +3079,20 @@ def main() -> int:
         _warn_self_contrastive_eval_view(cfg_mode, mode)
         if use_walk_forward:
             fold_rows = []
+            if not walk_forward:
+                fold_rows.append(
+                    {
+                        "mode": mode,
+                        "row_type": "fold",
+                        "split_mode_effective": "walk_forward",
+                        "status": "failed",
+                        "error_type": "ValueError",
+                        "error_message": "no walk-forward folds available",
+                        "retry_applied": False,
+                        "safe_mode_applied": False,
+                        **base_ctx,
+                    }
+                )
             for fold in walk_forward:
                 train_fold = fold["train_items"]
                 eval_fold = fold["eval_items"]
@@ -2868,58 +3101,79 @@ def main() -> int:
                     s = int(fold["eval_start"])
                     e = int(fold["eval_end"])
                     eval_dates_fold = list(graph_dates[s:e])
+                fold_meta = {
+                    "mode": mode,
+                    "row_type": "fold",
+                    "split_mode_effective": "walk_forward",
+                    **base_ctx,
+                    "fold_id": int(fold["fold_id"]),
+                    "fold_train_start_idx": int(fold["train_start"]),
+                    "fold_train_end_idx": int(fold["train_end"]) - 1,
+                    "fold_eval_start_idx": int(fold["eval_start"]),
+                    "fold_eval_end_idx": int(fold["eval_end"]) - 1,
+                }
+                if graph_dates:
+                    fold_meta["fold_eval_start_date"] = str(graph_dates[int(fold["eval_start"])])
+                    fold_meta["fold_eval_end_date"] = str(graph_dates[int(fold["eval_end"]) - 1])
+
                 cfg_fold = cfg_mode.copy()
                 cfg_fold["split_mode"] = "chronological"
-                if mode == "ff_layerwise":
-                    res = _benchmark_ff(
-                        graphs,
-                        device,
-                        cfg_fold,
-                        layerwise=True,
-                        train_graphs=train_fold,
-                        eval_graphs=eval_fold,
-                        eval_dates=eval_dates_fold,
-                    )
-                elif mode == "ff_e2e":
-                    res = _benchmark_ff(
-                        graphs,
-                        device,
-                        cfg_fold,
-                        layerwise=False,
-                        train_graphs=train_fold,
-                        eval_graphs=eval_fold,
-                        eval_dates=eval_dates_fold,
-                    )
-                elif mode == "backprop":
-                    res = _benchmark_backprop(
-                        graphs,
-                        device,
-                        cfg_fold,
-                        train_graphs=train_fold,
-                        eval_graphs=eval_fold,
-                        eval_dates=eval_dates_fold,
-                    )
-                else:
-                    raise ValueError(f"Unknown mode: {mode}")
+                attempts: list[tuple[dict, bool, bool]] = [(cfg_fold, False, False)]
+                if retry_safe_on_error:
+                    attempts.append((_safe_retry_config(cfg_fold), True, True))
 
-                res["mode"] = mode
-                res["row_type"] = "fold"
-                res["split_mode_effective"] = "walk_forward"
-                res.update(base_ctx)
-                res["fold_id"] = int(fold["fold_id"])
-                res["fold_train_start_idx"] = int(fold["train_start"])
-                res["fold_train_end_idx"] = int(fold["train_end"]) - 1
-                res["fold_eval_start_idx"] = int(fold["eval_start"])
-                res["fold_eval_end_idx"] = int(fold["eval_end"]) - 1
-                if graph_dates:
-                    res["fold_eval_start_date"] = str(graph_dates[int(fold["eval_start"])])
-                    res["fold_eval_end_date"] = str(graph_dates[int(fold["eval_end"]) - 1])
+                fold_res = None
+                last_error: tuple[str, str] | None = None
+                for attempt_idx, (cfg_attempt, retry_applied, safe_mode_applied) in enumerate(
+                    attempts,
+                    start=1,
+                ):
+                    try:
+                        fold_res = _run_mode_impl(
+                            mode,
+                            cfg_attempt,
+                            train_fold,
+                            eval_fold,
+                            eval_dates_fold,
+                        )
+                        fold_res.update(fold_meta)
+                        fold_res["status"] = "ok"
+                        fold_res["error_type"] = ""
+                        fold_res["error_message"] = ""
+                        fold_res["retry_applied"] = retry_applied
+                        fold_res["safe_mode_applied"] = safe_mode_applied
+                        break
+                    except Exception as exc:
+                        err_type, err_msg = _error_metadata(exc)
+                        last_error = (err_type, err_msg)
+                        print(
+                            f"warning: mode={mode} fold={fold.get('fold_id')} "
+                            f"attempt={attempt_idx}/{len(attempts)} failed: {err_type}: {err_msg}"
+                        )
+
+                if fold_res is None:
+                    err_type, err_msg = last_error if last_error is not None else ("RuntimeError", "")
+                    fold_res = {
+                        **fold_meta,
+                        "status": "failed",
+                        "error_type": err_type,
+                        "error_message": err_msg,
+                        "retry_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                        "safe_mode_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                    }
+                    if not continue_on_mode_error:
+                        abort_after_write = True
+
                 if isinstance(mode_override, dict):
                     for key, value in mode_override.items():
-                        if key not in res:
-                            res[key] = value
-                fold_rows.append(res)
-                fold_results.append(res)
+                        if key not in fold_res:
+                            fold_res[key] = value
+                fold_rows.append(fold_res)
+                fold_results.append(fold_res)
+                if str(fold_res.get("status", "")).strip().lower() == "ok":
+                    mode_success_map[mode] = True
+                if abort_after_write and not continue_on_mode_error:
+                    break
 
             agg = _aggregate_fold_results(fold_rows)
             agg["mode"] = mode
@@ -2930,6 +3184,10 @@ def main() -> int:
                     if key not in agg:
                         agg[key] = value
             results.append(agg)
+            if str(agg.get("status", "")).strip().lower() == "ok":
+                mode_success_map[mode] = True
+            if abort_after_write and not continue_on_mode_error:
+                break
         else:
             split_mode_mode = str(cfg_mode.get("split_mode", config.get("split_mode", "chronological")))
             eval_frac_mode = float(cfg_mode.get("eval_frac", config.get("eval_frac", 0.2)))
@@ -2943,49 +3201,68 @@ def main() -> int:
             train_graphs_mode = [graphs[i] for i in tr_idx]
             eval_graphs_mode = [graphs[i] for i in ev_idx]
             eval_dates_mode = [graph_dates[i] for i in ev_idx] if graph_dates else []
-            if mode == "ff_layerwise":
-                res = _benchmark_ff(
-                    graphs,
-                    device,
-                    cfg_mode,
-                    layerwise=True,
-                    train_graphs=train_graphs_mode,
-                    eval_graphs=eval_graphs_mode,
-                    eval_dates=eval_dates_mode,
-                )
-            elif mode == "ff_e2e":
-                res = _benchmark_ff(
-                    graphs,
-                    device,
-                    cfg_mode,
-                    layerwise=False,
-                    train_graphs=train_graphs_mode,
-                    eval_graphs=eval_graphs_mode,
-                    eval_dates=eval_dates_mode,
-                )
-            elif mode == "backprop":
-                res = _benchmark_backprop(
-                    graphs,
-                    device,
-                    cfg_mode,
-                    train_graphs=train_graphs_mode,
-                    eval_graphs=eval_graphs_mode,
-                    eval_dates=eval_dates_mode,
-                )
+
+            attempts = [(cfg_mode, False, False)]
+            if retry_safe_on_error:
+                attempts.append((_safe_retry_config(cfg_mode), True, True))
+
+            mode_row = None
+            last_error: tuple[str, str] | None = None
+            for attempt_idx, (cfg_attempt, retry_applied, safe_mode_applied) in enumerate(attempts, start=1):
+                try:
+                    mode_row = _run_mode_impl(
+                        mode,
+                        cfg_attempt,
+                        train_graphs_mode,
+                        eval_graphs_mode,
+                        eval_dates_mode,
+                    )
+                    mode_row.update(base_ctx)
+                    mode_row["mode"] = mode
+                    mode_row["status"] = "ok"
+                    mode_row["error_type"] = ""
+                    mode_row["error_message"] = ""
+                    mode_row["retry_applied"] = retry_applied
+                    mode_row["safe_mode_applied"] = safe_mode_applied
+                    break
+                except Exception as exc:
+                    err_type, err_msg = _error_metadata(exc)
+                    last_error = (err_type, err_msg)
+                    print(
+                        f"warning: mode={mode} attempt={attempt_idx}/{len(attempts)} "
+                        f"failed: {err_type}: {err_msg}"
+                    )
+            if mode_row is None:
+                err_type, err_msg = last_error if last_error is not None else ("RuntimeError", "")
+                mode_row = {
+                    **base_ctx,
+                    "mode": mode,
+                    "status": "failed",
+                    "error_type": err_type,
+                    "error_message": err_msg,
+                    "retry_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                    "safe_mode_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                    "split_mode_effective": split_mode_mode,
+                }
+                if not continue_on_mode_error:
+                    abort_after_write = True
             else:
-                raise ValueError(f"Unknown mode: {mode}")
-            res["mode"] = mode
-            res.update(base_ctx)
+                mode_success_map[mode] = True
             if isinstance(mode_override, dict):
                 for key, value in mode_override.items():
-                    if key not in res:
-                        res[key] = value
-            results.append(res)
+                    if key not in mode_row:
+                        mode_row[key] = value
+            results.append(mode_row)
+            if abort_after_write and not continue_on_mode_error:
+                break
+
+    all_modes_failed = bool(modes) and not any(mode_success_map.values())
 
     out_path = Path(bench_cfg.get("out_csv", "runs/experiments/manual/metrics/benchmark.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     import csv
 
+    baseline_check_failed = False
     if bool(config.get("require_baseline_match", False)):
         ref_raw = str(config.get("baseline_ref_csv", "")).strip()
         ref_path = Path(ref_raw) if ref_raw else out_path
@@ -3008,14 +3285,25 @@ def main() -> int:
                         if str(cur_v) != str(ref_v):
                             mismatches.append(f"{k}: current={cur_v} ref={ref_v}")
                     if mismatches:
-                        raise RuntimeError(
-                            "Baseline context mismatch; refusing comparison run.\n"
+                        baseline_check_failed = True
+                        print(
+                            "warning: baseline context mismatch; comparison safeguards failed:\n"
                             + "\n".join(mismatches)
                         )
             except Exception as exc:
-                raise RuntimeError(f"failed baseline context check against {ref_path}: {exc}") from exc
+                baseline_check_failed = True
+                print(f"warning: failed baseline context check against {ref_path}: {exc}")
 
-    keys = sorted({k for r in results for k in r.keys()})
+    base_cols = {
+        "mode",
+        "row_type",
+        "status",
+        "error_type",
+        "error_message",
+        "retry_applied",
+        "safe_mode_applied",
+    }
+    keys = sorted(base_cols | {k for r in results for k in r.keys()})
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
@@ -3053,7 +3341,7 @@ def main() -> int:
         for row in baseline_rows:
             w.writerow(row)
     print(f"Wrote {baseline_path}")
-    if use_walk_forward and fold_results:
+    if use_walk_forward or str(bench_cfg.get("walk_forward_out_csv", "")).strip():
         fold_out = str(bench_cfg.get("walk_forward_out_csv", "")).strip()
         fold_out_path = (
             Path(fold_out)
@@ -3061,7 +3349,18 @@ def main() -> int:
             else out_path.with_name(f"{out_path.stem}_walk_forward_folds.csv")
         )
         fold_out_path.parent.mkdir(parents=True, exist_ok=True)
-        fold_keys = sorted({k for r in fold_results for k in r.keys()})
+        fold_base_cols = {
+            "mode",
+            "row_type",
+            "split_mode_effective",
+            "fold_id",
+            "status",
+            "error_type",
+            "error_message",
+            "retry_applied",
+            "safe_mode_applied",
+        }
+        fold_keys = sorted(fold_base_cols | {k for r in fold_results for k in r.keys()})
         with fold_out_path.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fold_keys)
             w.writeheader()
@@ -3076,9 +3375,18 @@ def main() -> int:
     try:
         import matplotlib.pyplot as plt
 
-        xs = [r["graphs_per_s"] for r in results]
-        ys = [r.get("eval_sep", 0.0) for r in results]
-        labels = [r["mode"] for r in results]
+        plot_rows = [
+            r
+            for r in results
+            if str(r.get("status", "ok")).strip().lower() == "ok"
+            and isinstance(r.get("graphs_per_s"), (int, float, np.number))
+            and np.isfinite(float(r.get("graphs_per_s")))
+        ]
+        if not plot_rows:
+            raise RuntimeError("no successful benchmark rows available for plotting")
+        xs = [float(r.get("graphs_per_s")) for r in plot_rows]
+        ys = [float(r.get("eval_sep", 0.0) or 0.0) for r in plot_rows]
+        labels = [str(r.get("mode", "")) for r in plot_rows]
 
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.scatter(xs, ys, color="#4C78A8")
@@ -3096,10 +3404,10 @@ def main() -> int:
 
         # Bar chart summary (avg_epoch_s + objective-aware quality)
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        modes = [r["mode"] for r in results]
-        avg_epoch_s = [r["avg_epoch_s"] for r in results]
+        modes = [str(r.get("mode", "")) for r in plot_rows]
+        avg_epoch_s = [float(r.get("avg_epoch_s", float("nan"))) for r in plot_rows]
         quality = []
-        for r in results:
+        for r in plot_rows:
             if str(r.get("eval_objective", "")).strip().lower() == "self_contrastive":
                 quality.append(r.get("eval_sc_gap", r.get("eval_sep", 0.0)))
             else:
@@ -3123,7 +3431,15 @@ def main() -> int:
         print(f"Wrote {bar_plot_path}")
     except Exception as exc:
         print(f"Plotting failed: {exc}")
-    return 0
+    exit_code = 0
+    if baseline_check_failed:
+        exit_code = 1
+    if abort_after_write:
+        exit_code = 1
+    if all_modes_failed:
+        exit_code = 1
+        print("warning: all benchmark modes failed; outputs were written with failure metadata.")
+    return exit_code
 
 
 if __name__ == "__main__":

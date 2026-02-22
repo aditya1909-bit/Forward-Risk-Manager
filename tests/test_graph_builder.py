@@ -575,3 +575,97 @@ def test_sector_static_edges_work_even_when_feature_mode_is_not_fund():
     idx = {t: i for i, t in enumerate(tickers[-1])}
     pairs = set(zip(graphs[-1].edge_index[0].tolist(), graphs[-1].edge_index[1].tolist()))
     assert (idx["AAA"], idx["BBB"]) in pairs
+
+
+def test_build_rolling_corr_graphs_prefilter_keeps_stats_consistent():
+    dates = pd.date_range("2020-01-01", periods=8, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.02, 0.03, 0.01, -0.01, 0.00, 0.02, 0.01],
+            "BBB": [0.00, 0.01, 0.02, 0.00, -0.02, -0.01, 0.01, 0.00],
+            "CCC": [0.02, 0.01, 0.00, -0.01, -0.01, 0.00, 0.01, 0.02],
+        },
+        index=dates,
+    )
+    membership = {
+        dates[2]: ["AAA", "BBB", "CCC"],
+        dates[4]: ["AAA", "BBB", "CCC"],
+        dates[6]: ["AAA", "BBB", "CCC"],
+    }
+    cfg = GraphBuildConfig(
+        window=3,
+        step=1,
+        feature_mode="window",
+        normalize=False,
+        top_k=1,
+        min_nodes=2,
+        feature_lag_days=2,
+        membership_lag_days=1,
+        edge_norm=False,
+    )
+    graphs, _, _, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        macro=None,
+        num_workers=2,
+        parallel_backend="threadpool",
+        progress=False,
+    )
+    assert len(graphs) == stats["built"]
+    assert stats["total_windows"] == 6
+    assert stats["skipped_lag_history"] == 2
+    assert stats["skipped_no_members"] == 2
+    assert stats["built"] == 2
+    accounted = (
+        stats["built"]
+        + stats["skipped_lag_history"]
+        + stats["skipped_no_members"]
+        + stats["skipped_no_cols"]
+        + stats["skipped_min_nodes"]
+        + stats["skipped_no_edges"]
+    )
+    assert accounted == stats["total_windows"]
+
+
+def test_build_rolling_corr_graphs_prefilter_counts_missing_membership_windows():
+    dates = pd.date_range("2020-01-01", periods=7, freq="D").strftime("%Y-%m-%d")
+    returns = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.01, 0.02, 0.02, 0.03, 0.01, 0.00],
+            "BBB": [0.00, 0.01, 0.01, 0.02, 0.02, 0.01, 0.00],
+            "CCC": [0.02, 0.01, 0.00, -0.01, 0.00, 0.01, 0.02],
+        },
+        index=dates,
+    )
+    membership = {
+        dates[2]: ["AAA", "BBB", "CCC"],
+        dates[4]: ["AAA", "BBB", "CCC"],
+    }
+    cfg = GraphBuildConfig(
+        window=3,
+        step=1,
+        top_k=1,
+        min_nodes=2,
+        feature_mode="window",
+        normalize=False,
+        edge_norm=False,
+    )
+    graphs, _, _, stats = build_rolling_corr_graphs(
+        returns,
+        None,
+        membership,
+        cfg,
+        fundamentals=None,
+        macro=None,
+        num_workers=2,
+        parallel_backend="threadpool",
+        progress=False,
+    )
+    # end_idx windows: 2..6 => 5 total. membership present at dates[2] and dates[4].
+    assert stats["total_windows"] == 5
+    assert stats["skipped_no_members"] == 3
+    assert stats["built"] == 2
+    assert len(graphs) == 2

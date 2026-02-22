@@ -756,7 +756,26 @@ def build_rolling_corr_graphs(
         "built": 0,
     }
 
-    end_indices = list(range(config.window - 1, len(dates), config.step))
+    raw_end_indices = list(range(config.window - 1, len(dates), config.step))
+    eligible_end_indices: List[int] = []
+    for end_idx in raw_end_indices:
+        corr_end_idx = end_idx - max(0, int(config.corr_lag_days))
+        feature_end_idx = end_idx - max(0, int(config.feature_lag_days))
+        member_end_idx = end_idx - max(0, int(config.membership_lag_days))
+        macro_end_idx = feature_end_idx - max(0, int(config.macro_lag_days))
+        if min(corr_end_idx, feature_end_idx, member_end_idx, macro_end_idx) < 0:
+            stats["skipped_lag_history"] += 1
+            continue
+        corr_start_idx = corr_end_idx - config.window + 1
+        feature_start_idx = feature_end_idx - config.window + 1
+        if corr_start_idx < 0 or feature_start_idx < 0:
+            stats["skipped_lag_history"] += 1
+            continue
+        member_date = dates[member_end_idx]
+        if not membership_map.get(member_date):
+            stats["skipped_no_members"] += 1
+            continue
+        eligible_end_indices.append(end_idx)
 
     def _task(end_idx: int):
         return _window_to_graph_data(
@@ -783,7 +802,7 @@ def build_rolling_corr_graphs(
             n_jobs = joblib_n_jobs if joblib_n_jobs is not None else num_workers
             if progress and joblib_prefer == "threads":
                 pbar = tqdm(
-                    total=len(end_indices),
+                    total=len(eligible_end_indices),
                     desc="Building graphs",
                     unit="win",
                     dynamic_ncols=True,
@@ -799,24 +818,24 @@ def build_rolling_corr_graphs(
                     n_jobs=n_jobs,
                     prefer=joblib_prefer,
                     batch_size="auto",
-                )(delayed(_task_pbar)(end_idx) for end_idx in end_indices)
+                )(delayed(_task_pbar)(end_idx) for end_idx in eligible_end_indices)
                 pbar.close()
             else:
                 results = Parallel(
                     n_jobs=n_jobs,
                     prefer=joblib_prefer,
                     batch_size="auto",
-                )(delayed(_task)(end_idx) for end_idx in end_indices)
+                )(delayed(_task)(end_idx) for end_idx in eligible_end_indices)
         except Exception as exc:
             print(f"joblib parallel failed ({exc}); falling back to ThreadPoolExecutor")
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                it = executor.map(_task, end_indices)
+                it = executor.map(_task, eligible_end_indices)
                 if progress:
                     it = tqdm(
                         it,
-                        total=len(end_indices),
+                        total=len(eligible_end_indices),
                         desc="Building graphs",
                         unit="win",
                         dynamic_ncols=True,
@@ -827,11 +846,11 @@ def build_rolling_corr_graphs(
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            it = executor.map(_task, end_indices)
+            it = executor.map(_task, eligible_end_indices)
             if progress:
                 it = tqdm(
                     it,
-                    total=len(end_indices),
+                    total=len(eligible_end_indices),
                     desc="Building graphs",
                     unit="win",
                     dynamic_ncols=True,
@@ -839,11 +858,11 @@ def build_rolling_corr_graphs(
                 )
             results = list(it)
     else:
-        it = end_indices
+        it = eligible_end_indices
         if progress:
             it = tqdm(
                 it,
-                total=len(end_indices),
+                total=len(eligible_end_indices),
                 desc="Building graphs",
                 unit="win",
                 dynamic_ncols=True,
@@ -851,7 +870,7 @@ def build_rolling_corr_graphs(
             )
         results = [_task(end_idx) for end_idx in it]
 
-    stats["total_windows"] = len(results)
+    stats["total_windows"] = len(raw_end_indices)
     for result, reason in results:
         if result is None:
             if reason == "lag_history":
