@@ -217,6 +217,70 @@ def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
     assert float(out["econ_regime_vol_window"]) == 11.0
 
 
+def test_ff_sweep_build_econ_payload_falls_back_to_inference(monkeypatch):
+    mod = _load_script("ff_sweep.py")
+    eval_dates = ["2024-01-01", "2024-01-02", "2024-01-03"]
+    eval_graphs = [object(), object(), object()]
+    cfg = {
+        "econ_enabled": False,
+        "econ_payload_enabled": True,
+        "goodness_temp": 0.42,
+        "batch_size": 8,
+        "econ_loader_batch_size": 16,
+    }
+    called: dict[str, object] = {}
+
+    def _fake_infer(model, graphs, goodness_temp, batch_size=128, critic=None):
+        import numpy as np
+
+        called["model"] = model
+        called["graphs_len"] = len(graphs)
+        called["goodness_temp"] = goodness_temp
+        called["batch_size"] = batch_size
+        called["critic"] = critic
+        return np.asarray([0.11, 0.22, 0.33], dtype=float), None
+
+    monkeypatch.setattr(mod, "infer_graph_goodness_with_uncertainty", _fake_infer)
+    dummy_model = object()
+
+    goodness_vals, payloads = mod._build_econ_payload(
+        model=dummy_model,
+        critic=None,
+        eval_graphs=eval_graphs,
+        eval_dates=eval_dates,
+        cfg=cfg,
+        eval_pos_cache=None,
+    )
+
+    assert called["model"] is dummy_model
+    assert int(called["graphs_len"]) == 3
+    assert float(called["goodness_temp"]) == 0.42
+    assert int(called["batch_size"]) == 16
+    assert goodness_vals == [0.11, 0.22, 0.33]
+    assert payloads == [{"goodness": [0.11, 0.22, 0.33], "dates": eval_dates}]
+
+
+def test_ff_sweep_build_econ_payload_prefers_cached_gpos(monkeypatch):
+    mod = _load_script("ff_sweep.py")
+    eval_dates = ["2024-01-01", "2024-01-02", "2024-01-03"]
+    eval_pos_cache = {"g_pos_all": [0.4, 0.5, 0.6]}
+
+    def _fail_infer(*_args, **_kwargs):
+        raise AssertionError("fallback inference should not run when g_pos_all cache is present")
+
+    monkeypatch.setattr(mod, "infer_graph_goodness_with_uncertainty", _fail_infer)
+    goodness_vals, payloads = mod._build_econ_payload(
+        model=object(),
+        critic=None,
+        eval_graphs=[object(), object(), object()],
+        eval_dates=eval_dates,
+        cfg={"econ_enabled": False, "econ_payload_enabled": True},
+        eval_pos_cache=eval_pos_cache,
+    )
+    assert goodness_vals == [0.4, 0.5, 0.6]
+    assert payloads == [{"goodness": [0.4, 0.5, 0.6], "dates": eval_dates}]
+
+
 def test_baseline_context_includes_seed_split_device_and_sizes():
     mod = _load_script("benchmark_training.py")
     cfg = {"seed": 11, "split_mode": "chronological", "batch_size": 32, "eval_frac": 0.2}

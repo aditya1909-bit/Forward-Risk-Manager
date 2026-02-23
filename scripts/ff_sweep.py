@@ -1142,6 +1142,47 @@ def _compute_econ_metrics_for_eval(
     return out
 
 
+def _build_econ_payload(
+    model,
+    critic,
+    eval_graphs,
+    eval_dates,
+    cfg: dict,
+    eval_pos_cache: dict | None,
+):
+    g_for_econ = None
+    payloads = []
+    if isinstance(eval_pos_cache, dict):
+        gvals = eval_pos_cache.get("g_pos_all")
+        if isinstance(gvals, list):
+            g_for_econ = [float(_to_float(v, float("nan"))) for v in gvals]
+    if eval_dates and isinstance(g_for_econ, list) and len(g_for_econ) == len(eval_dates):
+        payloads.append({"goodness": list(g_for_econ), "dates": list(eval_dates)})
+
+    need_fallback = (
+        g_for_econ is None
+        and model is not None
+        and bool(eval_graphs)
+        and bool(eval_dates)
+        and (
+            bool(cfg.get("econ_enabled", False))
+            or bool(cfg.get("econ_payload_enabled", False))
+        )
+    )
+    if need_fallback:
+        g_np, _ = infer_graph_goodness_with_uncertainty(
+            model,
+            eval_graphs,
+            goodness_temp=float(cfg.get("goodness_temp", 1.0)),
+            batch_size=int(cfg.get("econ_loader_batch_size", cfg.get("batch_size", 64))),
+            critic=critic,
+        )
+        if g_np.size > 0 and int(g_np.shape[0]) == int(len(eval_dates)):
+            g_for_econ = [float(_to_float(v, float("nan"))) for v in g_np.tolist()]
+            payloads = [{"goodness": list(g_for_econ), "dates": list(eval_dates)}]
+    return g_for_econ, payloads
+
+
 def _run_ff_trial(
     graphs,
     graph_dates,
@@ -1824,13 +1865,16 @@ def _run_ff_trial(
         else float("nan"),
     }
     out.update(eval_metrics)
-    g_for_econ = None
-    if isinstance(eval_pos_cache, dict):
-        gvals = eval_pos_cache.get("g_pos_all")
-        if isinstance(gvals, list):
-            g_for_econ = [float(_to_float(v, float("nan"))) for v in gvals]
-            if eval_dates and len(g_for_econ) == len(eval_dates):
-                out["__econ_payloads"] = [{"goodness": list(g_for_econ), "dates": list(eval_dates)}]
+    g_for_econ, econ_payloads = _build_econ_payload(
+        model,
+        critic,
+        eval_graphs,
+        eval_dates,
+        cfg,
+        eval_pos_cache,
+    )
+    if econ_payloads:
+        out["__econ_payloads"] = econ_payloads
     econ = _compute_econ_metrics_for_eval(
         model,
         critic,
@@ -2484,6 +2528,7 @@ def main() -> int:
                 cfg_mode.update(mode_override)
             if econ_two_stage:
                 cfg_mode["econ_enabled"] = False
+                cfg_mode["econ_payload_enabled"] = True
             if run_idx <= len(modes):
                 _warn_self_contrastive_eval_view(cfg_mode, mode)
             eval_neg_modes_cfg = cfg_mode.get("eval_neg_modes", [])
