@@ -2197,7 +2197,8 @@ def main() -> int:
         ckpt = Path(str(encoder_checkpoint_in))
         if not ckpt.exists():
             raise FileNotFoundError(f"encoder_checkpoint_in not found: {ckpt}")
-        model.load_state_dict(_load_state_dict_compat(str(ckpt)))
+        encoder_target = getattr(model, "_orig_mod", model)
+        encoder_target.load_state_dict(_load_state_dict_compat(str(ckpt)))
         print(f"loaded encoder checkpoint: {ckpt}")
     if critic_checkpoint_in:
         ckpt = Path(str(critic_checkpoint_in))
