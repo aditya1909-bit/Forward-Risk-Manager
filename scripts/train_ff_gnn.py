@@ -11,6 +11,7 @@ import csv
 import math
 import hashlib
 import time
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +60,9 @@ _NEG_AUG_MODES = {
     "factor_hard",
 }
 
+# Upstream deprecation warning emitted from inductor internals; not actionable here.
+warnings.filterwarnings("ignore", message="TypedStorage is deprecated.*", category=UserWarning)
+
 
 def _load_config(path: str | None) -> dict:
     if not path:
@@ -85,9 +89,19 @@ def _load_state_dict_compat(path: str):
         state = torch.load(path, map_location="cpu")
     if isinstance(state, dict):
         if isinstance(state.get("state_dict"), dict):
-            return state["state_dict"]
+            state = state["state_dict"]
         if isinstance(state.get("model"), dict):
-            return state["model"]
+            state = state["model"]
+    if isinstance(state, dict):
+        # torch.compile() and DataParallel can prefix keys with wrappers.
+        out = {}
+        for k, v in state.items():
+            kk = str(k)
+            for prefix in ("_orig_mod.", "module."):
+                if kk.startswith(prefix):
+                    kk = kk[len(prefix) :]
+            out[kk] = v
+        return out
     return state
 
 
@@ -164,6 +178,25 @@ def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
     if not enabled:
         return contextlib.nullcontext()
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
+
+
+def _configure_cuda_runtime(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+
+def _state_dict_for_save(module: torch.nn.Module):
+    inner = getattr(module, "_orig_mod", module)
+    return inner.state_dict()
 
 
 def _forward_encoder(model, *args, **kwargs):
@@ -1942,6 +1975,7 @@ def main() -> int:
     if torch_num_interop_threads:
         torch.set_num_interop_threads(int(torch_num_interop_threads))
     device = resolve_device(device_choice)
+    _configure_cuda_runtime(device)
     amp_dtype = _parse_amp_dtype(amp_dtype_raw)
     amp_enabled = bool(amp_requested and device.type == "cuda")
     if amp_enabled and amp_dtype == torch.bfloat16:
@@ -3730,17 +3764,17 @@ def main() -> int:
     if save_encoder:
         save_path = Path(str(save_encoder))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), save_path)
+        torch.save(_state_dict_for_save(model), save_path)
     elif save_model:
         # Backward-compat: if only save_model is provided, treat it as encoder checkpoint output.
         save_path = Path(str(save_model))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), save_path)
+        torch.save(_state_dict_for_save(model), save_path)
 
     if save_critic:
         save_path = Path(str(save_critic))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(critic.state_dict(), save_path)
+        torch.save(_state_dict_for_save(critic), save_path)
 
     if log_csv and plot_path:
         try:

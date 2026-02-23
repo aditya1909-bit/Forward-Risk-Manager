@@ -30,9 +30,19 @@ def _load_state_dict_compat(path: str):
         state = torch.load(path, map_location="cpu")
     if isinstance(state, dict):
         if isinstance(state.get("state_dict"), dict):
-            return state["state_dict"]
+            state = state["state_dict"]
         if isinstance(state.get("model"), dict):
-            return state["model"]
+            state = state["model"]
+    if isinstance(state, dict):
+        # torch.compile() and DataParallel can prefix keys with wrappers.
+        out = {}
+        for k, v in state.items():
+            kk = str(k)
+            for prefix in ("_orig_mod.", "module."):
+                if kk.startswith(prefix):
+                    kk = kk[len(prefix) :]
+            out[kk] = v
+        return out
     return state
 
 
@@ -642,14 +652,20 @@ def main() -> int:
         dropout=float(train_cfg.get("dropout", 0.1)),
         conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
+        residual_edge_enabled=bool(train_cfg.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(train_cfg.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(train_cfg.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(train_cfg.get("residual_edge_detach_features", True)),
     )
-    model_path = train_cfg.get("save_model", "")
-    if model_path and Path(model_path).exists():
-        try:
-            state = torch.load(model_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            state = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state)
+    model_path = (
+        str(train_cfg.get("save_encoder", "")).strip()
+        or str(train_cfg.get("save_model", "")).strip()
+    )
+    if not model_path:
+        raise ValueError("No encoder checkpoint path provided in train.save_encoder/train.save_model.")
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found: {model_path}")
+    model.load_state_dict(_load_state_dict_compat(model_path))
     model.eval()
 
     critic = None

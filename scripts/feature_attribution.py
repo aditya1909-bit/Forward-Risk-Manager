@@ -29,9 +29,19 @@ def _load_state_dict_compat(path: str):
         state = torch.load(path, map_location="cpu")
     if isinstance(state, dict):
         if isinstance(state.get("state_dict"), dict):
-            return state["state_dict"]
+            state = state["state_dict"]
         if isinstance(state.get("model"), dict):
-            return state["model"]
+            state = state["model"]
+    if isinstance(state, dict):
+        # torch.compile() and DataParallel can prefix keys with wrappers.
+        out = {}
+        for k, v in state.items():
+            kk = str(k)
+            for prefix in ("_orig_mod.", "module."):
+                if kk.startswith(prefix):
+                    kk = kk[len(prefix) :]
+            out[kk] = v
+        return out
     return state
 
 
@@ -56,7 +66,10 @@ def main() -> int:
     train_cfg = cfg.get("train", {})
 
     graphs_path = Path(args.graphs or train_cfg.get("graphs", "data/processed/graphs.pt"))
-    payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
+    try:
+        payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(graphs_path, map_location="cpu")
     graphs = payload["graphs"] if isinstance(payload, dict) else payload
     dates = payload.get("dates", []) if isinstance(payload, dict) else []
     if not graphs:
@@ -75,6 +88,10 @@ def main() -> int:
         dropout=float(train_cfg.get("dropout", 0.1)),
         conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
+        residual_edge_enabled=bool(train_cfg.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(train_cfg.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(train_cfg.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(train_cfg.get("residual_edge_detach_features", True)),
     )
     model.load_state_dict(_load_state_dict_compat(model_path))
     model.eval()

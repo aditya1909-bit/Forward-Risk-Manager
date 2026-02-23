@@ -24,6 +24,29 @@ def _load_config(path: str) -> dict:
         return tomllib.load(f)
 
 
+def _load_state_dict_compat(path: str):
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict):
+        if isinstance(state.get("state_dict"), dict):
+            state = state["state_dict"]
+        if isinstance(state.get("model"), dict):
+            state = state["model"]
+    if isinstance(state, dict):
+        # torch.compile() and DataParallel can prefix keys with wrappers.
+        out = {}
+        for k, v in state.items():
+            kk = str(k)
+            for prefix in ("_orig_mod.", "module."):
+                if kk.startswith(prefix):
+                    kk = kk[len(prefix) :]
+            out[kk] = v
+        return out
+    return state
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot real vs hallucinated return windows.")
     parser.add_argument("--config", required=True, help="Path to TOML config")
@@ -106,14 +129,19 @@ def main() -> int:
         hidden_dim=int(train_cfg.get("hidden_dim", 64)),
         num_layers=int(train_cfg.get("num_layers", 2)),
         dropout=float(train_cfg.get("dropout", 0.1)),
+        conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
+        residual_edge_enabled=bool(train_cfg.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(train_cfg.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(train_cfg.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(train_cfg.get("residual_edge_detach_features", True)),
     )
-    model_path = train_cfg.get("save_model", "")
-    if model_path and Path(model_path).exists():
-        try:
-            state = torch.load(model_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            state = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state)
+    model_path = str(
+        train_cfg.get("save_encoder", train_cfg.get("save_model", ""))
+    ).strip()
+    if not model_path or not Path(model_path).exists():
+        raise FileNotFoundError("Model checkpoint not found. Train and save model first.")
+    model.load_state_dict(_load_state_dict_compat(model_path))
     model.eval()
 
     hall_cfg = HallucinationConfig(

@@ -18,6 +18,8 @@ def _run(cmd: list[str]) -> None:
     print("running:", " ".join(cmd))
     env = os.environ.copy()
     env.setdefault("PYTHONFAULTHANDLER", "1")
+    # Keep two-stage subprocess logs compact unless explicitly overridden by caller.
+    env.setdefault("LOG_AUTOTUNE_RESULTS", "0")
     subprocess.run(cmd, check=True, env=env)
 
 
@@ -183,13 +185,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--stage1-compile-mode",
-        default="max-autotune-no-cudagraphs",
-        help="Compile mode override for encoder stage (default: max-autotune-no-cudagraphs).",
+        default="default",
+        help="Compile mode override for encoder stage (default: default).",
     )
     parser.add_argument(
         "--stage2-compile-mode",
-        default="max-autotune-no-cudagraphs",
-        help="Compile mode override for critic stage (default: max-autotune-no-cudagraphs).",
+        default="default",
+        help="Compile mode override for critic stage (default: default).",
     )
     args = parser.parse_args()
 
