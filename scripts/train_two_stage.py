@@ -185,13 +185,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--stage1-compile-mode",
-        default="default",
-        help="Compile mode override for encoder stage (default: default).",
+        default="",
+        help="Compile mode override for encoder stage (default: use config value).",
     )
     parser.add_argument(
         "--stage2-compile-mode",
-        default="default",
-        help="Compile mode override for critic stage (default: default).",
+        default="",
+        help="Compile mode override for critic stage (default: use config value).",
     )
     args = parser.parse_args()
 

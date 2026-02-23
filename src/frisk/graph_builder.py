@@ -902,7 +902,8 @@ def build_rolling_corr_graphs(
                     edge_index, edge_weight, num_nodes=len(tickers), add_self_loops=False
                 )
 
-        x_tensor = torch.from_numpy(x).float()
+        # Ensure writable backing memory before converting to torch tensor.
+        x_tensor = torch.from_numpy(np.array(x, copy=True)).float()
         data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(tickers))
         data.edge_weight = edge_weight
         if ret_mean is not None and ret_std is not None:

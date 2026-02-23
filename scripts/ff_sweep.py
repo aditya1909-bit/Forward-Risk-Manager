@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
+import math
 import random
 import time
 from pathlib import Path
@@ -61,6 +62,8 @@ _NEG_AUG_MODES = {
     "cross_asset_mix",
     "phase_randomize",
     "edge_attack",
+    "sector_swap",
+    "factor_hard",
 }
 
 
@@ -234,6 +237,103 @@ def _to_float(value, default: float = float("nan")) -> float:
     if not np.isfinite(out):
         return default
     return out
+
+
+def _parse_mode_list(value) -> list[str]:
+    if value is None:
+        return []
+    items: list[str] = []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        parts = [p.strip().strip("'").strip('"') for p in text.split(",")]
+        items = [p for p in parts if p]
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            items.extend(_parse_mode_list(v))
+    else:
+        text = str(value).strip()
+        if text:
+            items = [text]
+    out: list[str] = []
+    seen = set()
+    for item in items:
+        key = str(item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _mode_key(mode: str) -> str:
+    return str(mode).strip().lower().replace("+", "_plus_")
+
+
+def _attach_eval_neg_aggregate_metrics(
+    row: dict,
+    *,
+    include_base: bool = True,
+    agg_mode: str = "mean",
+) -> None:
+    agg = str(agg_mode).strip().lower() or "mean"
+    if agg not in {"mean", "median", "min", "max"}:
+        agg = "mean"
+    base_mode = str(row.get("eval_neg_mode_effective", "")).strip().lower()
+    reported_modes = _parse_mode_list(row.get("eval_neg_modes_reported", ""))
+    if not reported_modes:
+        reported_modes = _parse_mode_list(row.get("eval_neg_modes", ""))
+
+    modes_aggregated: list[str] = []
+    seen_modes = set()
+    if include_base and base_mode:
+        modes_aggregated.append(base_mode)
+        seen_modes.add(base_mode)
+    for m in reported_modes:
+        if m in seen_modes:
+            continue
+        modes_aggregated.append(m)
+        seen_modes.add(m)
+
+    metric_names = ("sep", "auroc", "auprc", "acc", "brier", "ece")
+    max_count = 0
+    for metric in metric_names:
+        vals: list[float] = []
+        if include_base:
+            base_val = _to_float(row.get(f"eval_{metric}"), float("nan"))
+            if np.isfinite(base_val):
+                vals.append(base_val)
+        for mode in reported_modes:
+            if include_base and mode == base_mode:
+                continue
+            v = _to_float(row.get(f"eval_{_mode_key(mode)}_{metric}"), float("nan"))
+            if np.isfinite(v):
+                vals.append(v)
+        if not vals:
+            continue
+        arr = np.asarray(vals, dtype=float)
+        row[f"eval_{metric}_agg_mean"] = float(np.mean(arr))
+        row[f"eval_{metric}_agg_median"] = float(np.median(arr))
+        row[f"eval_{metric}_agg_min"] = float(np.min(arr))
+        row[f"eval_{metric}_agg_max"] = float(np.max(arr))
+        row[f"eval_{metric}_agg_std"] = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+        if agg == "median":
+            row[f"eval_{metric}_agg"] = row[f"eval_{metric}_agg_median"]
+        elif agg == "min":
+            row[f"eval_{metric}_agg"] = row[f"eval_{metric}_agg_min"]
+        elif agg == "max":
+            row[f"eval_{metric}_agg"] = row[f"eval_{metric}_agg_max"]
+        else:
+            row[f"eval_{metric}_agg"] = row[f"eval_{metric}_agg_mean"]
+        max_count = max(max_count, int(arr.size))
+
+    row["eval_neg_aggregate_mode"] = agg
+    row["eval_neg_aggregate_include_base"] = int(bool(include_base))
+    row["eval_neg_aggregate_count"] = int(max_count)
+    row["eval_neg_modes_aggregated"] = ",".join(modes_aggregated)
 
 
 def _objective_rank_metric(result: dict, rank_mode: str = "objective") -> tuple[str, float]:
@@ -512,6 +612,19 @@ def _make_negatives(
                     out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
         return out_adv
     if use_mode == "hallucinate":
+        if x.device.type == "cuda":
+            with torch.autocast(device_type="cuda", enabled=False):
+                return hallucinate_negative(
+                    model,
+                    x,
+                    edge_index,
+                    edge_attr,
+                    batch,
+                    hall_cfg,
+                    edge_weight=edge_weight,
+                    forward_fn=forward_fn,
+                    critic=critic,
+                )
         return hallucinate_negative(
             model,
             x,
@@ -554,6 +667,8 @@ def _make_self_contrastive_view(
         "block_bootstrap",
         "cross_asset_mix",
         "phase_randomize",
+        "sector_swap",
+        "factor_hard",
     }
     if mode not in valid_modes:
         raise ValueError(
@@ -606,6 +721,8 @@ def _eval_ff_metrics(
     window_len: int | None = None,
     summary_dim: int = 0,
     ece_bins: int = 10,
+    pos_cache: dict | None = None,
+    return_pos_cache: bool = False,
 ):
     eval_mode = str(neg_mode).strip().lower()
     if eval_mode == "self_contrastive":
@@ -649,7 +766,7 @@ def _eval_ff_metrics(
         model.train(prev_mode)
         pos_mean = float(np.mean(sc_pos)) if sc_pos else 0.0
         neg_mean = float(np.mean(sc_neg)) if sc_neg else 0.0
-        return {
+        metrics = {
             "eval_objective": "self_contrastive",
             "eval_sc_loss": float(np.mean(sc_losses)) if sc_losses else 0.0,
             "eval_sc_pos": pos_mean,
@@ -667,6 +784,9 @@ def _eval_ff_metrics(
             "eval_brier": float("nan"),
             "eval_ece": float("nan"),
         }
+        if return_pos_cache:
+            return metrics, None
+        return metrics
 
     model.eval()
     gpos = []
@@ -675,13 +795,33 @@ def _eval_ff_metrics(
     gneg_all = []
     acc_num = 0
     acc_den = 0
-    for batch in loader:
+    cached_g_pos_batches = []
+    use_cached_gpos_all = False
+    if isinstance(pos_cache, dict):
+        cached = pos_cache.get("g_pos_batches")
+        if isinstance(cached, list):
+            cached_g_pos_batches = cached
+        cached_all = pos_cache.get("g_pos_all")
+        if isinstance(cached_all, list):
+            gpos_all = list(cached_all)
+            use_cached_gpos_all = True
+    g_pos_batches_out = [] if return_pos_cache and not cached_g_pos_batches else cached_g_pos_batches
+    for batch_idx, batch in enumerate(loader):
         batch = batch.to(next(model.parameters()).device)
         x = batch.x
         edge_weight = getattr(batch, "edge_weight", None)
-        with torch.no_grad():
-            h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+        g_pos = None
+        if batch_idx < len(cached_g_pos_batches):
+            try:
+                g_pos = cached_g_pos_batches[batch_idx].to(x.device, non_blocking=True)
+            except Exception:
+                g_pos = None
+        if g_pos is None:
+            with torch.no_grad():
+                h_pos = model(x, batch.edge_index, edge_weight=edge_weight)
+                g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+            if return_pos_cache:
+                g_pos_batches_out.append(g_pos.detach().cpu())
 
         if eval_mode == "hallucinate":
             with torch.enable_grad():
@@ -725,7 +865,8 @@ def _eval_ff_metrics(
             acc_den += 2 * g_pos.numel()
             gpos.append(g_pos.mean().item())
             gneg.append(g_neg.mean().item())
-            gpos_all.extend(g_pos.detach().cpu().tolist())
+            if not use_cached_gpos_all:
+                gpos_all.extend(g_pos.detach().cpu().tolist())
             gneg_all.extend(g_neg.detach().cpu().tolist())
     acc = acc_num / acc_den if acc_den else 0.0
     pos_mean = float(np.mean(gpos)) if gpos else 0.0
@@ -736,7 +877,7 @@ def _eval_ff_metrics(
         threshold=float(goodness_target),
         ece_bins=int(ece_bins),
     )
-    return {
+    metrics = {
         "eval_objective": "ff",
         "eval_g_pos": pos_mean,
         "eval_g_neg": neg_mean,
@@ -744,6 +885,13 @@ def _eval_ff_metrics(
         "eval_acc": float(acc),
         **cls_metrics,
     }
+    if return_pos_cache:
+        cache = {
+            "g_pos_batches": g_pos_batches_out,
+            "g_pos_all": list(gpos_all),
+        }
+        return metrics, cache
+    return metrics
 
 
 def _metric_value_or_none(row: dict, key: str):
@@ -773,8 +921,23 @@ def _objective_primary_metric(row: dict) -> tuple[str, float]:
 
 
 def _objective_primary_metric_robust(row: dict) -> tuple[str, float]:
-    # Robust metric intentionally mirrors objective-primary metric.
-    # Time-flip discrimination belongs to critic evaluation/sanity checks, not self-contrastive ranking.
+    objective = str(row.get("eval_objective", "")).strip().lower()
+    if objective == "self_contrastive":
+        for key in ("eval_sc_gap", "eval_sep_agg_min", "eval_sep_agg_mean", "eval_sep"):
+            value = _metric_value_or_none(row, key)
+            if value is not None:
+                return key, value
+        return _objective_primary_metric(row)
+    if objective in {"bce", "backprop"}:
+        for key in ("eval_auroc_agg_min", "eval_auroc_agg_mean", "eval_auroc", "eval_auprc"):
+            value = _metric_value_or_none(row, key)
+            if value is not None:
+                return key, value
+        return _objective_primary_metric(row)
+    for key in ("eval_sep_agg_min", "eval_sep_agg_mean", "eval_sep", "eval_auroc_agg_min", "eval_auroc"):
+        value = _metric_value_or_none(row, key)
+        if value is not None:
+            return key, value
     return _objective_primary_metric(row)
 
 
@@ -795,6 +958,34 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
         return float(values[0]), 0.0
     arr = np.asarray(values, dtype=float)
     return float(np.mean(arr)), float(np.std(arr, ddof=1))
+
+
+def _aggregate_numeric_rows(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    out: dict[str, object] = {}
+    keys = sorted({k for row in rows for k in row.keys()})
+    for key in keys:
+        vals: list[float] = []
+        for row in rows:
+            value = row.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.number)):
+                fv = float(value)
+                if np.isfinite(fv):
+                    vals.append(fv)
+        if vals:
+            mean_val, std_val = _mean_std(vals)
+            out[key] = mean_val
+            out[f"{key}_std"] = std_val
+            out[f"{key}_min"] = float(np.min(vals))
+            out[f"{key}_max"] = float(np.max(vals))
+    first = rows[0]
+    for key, value in first.items():
+        if isinstance(value, str):
+            out.setdefault(key, value)
+    return out
 
 
 def _aggregate_fold_rows(rows: list[dict]) -> dict:
@@ -835,6 +1026,20 @@ def _aggregate_fold_rows(rows: list[dict]) -> dict:
             out[key] = first[key]
     out["walk_forward_num_folds"] = len(rows)
     out["split_mode_effective"] = "walk_forward"
+    econ_payloads = []
+    for row in rows:
+        payload = row.get("__econ_payloads")
+        if not isinstance(payload, list):
+            continue
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            g = entry.get("goodness")
+            d = entry.get("dates")
+            if isinstance(g, list) and isinstance(d, list) and len(g) == len(d):
+                econ_payloads.append({"goodness": list(g), "dates": list(d)})
+    if econ_payloads:
+        out["__econ_payloads"] = econ_payloads
     return out
 
 
@@ -844,6 +1049,8 @@ def _compute_econ_metrics_for_eval(
     eval_graphs,
     eval_dates,
     cfg: dict,
+    goodness_values=None,
+    goodness_uncertainty=None,
 ):
     meta = {
         "econ_ticker_requested": str(cfg.get("econ_ticker", "")),
@@ -853,19 +1060,36 @@ def _compute_econ_metrics_for_eval(
     }
     if not bool(cfg.get("econ_enabled", False)):
         return meta
-    if not eval_graphs or not eval_dates:
+    if not eval_dates:
+        return meta
+    if goodness_values is None and not eval_graphs:
         return meta
     fwd_ret_1 = cfg.get("econ_fwd_ret_1")
     if fwd_ret_1 is None:
         return meta
-    g, g_unc = infer_graph_goodness_with_uncertainty(
-        model,
-        eval_graphs,
-        goodness_temp=float(cfg.get("goodness_temp", 1.0)),
-        batch_size=int(cfg.get("econ_loader_batch_size", cfg.get("batch_size", 64))),
-        critic=critic,
-    )
+    if goodness_values is not None:
+        g = np.nan_to_num(
+            np.asarray(goodness_values, dtype=float),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        g_unc = (
+            None
+            if goodness_uncertainty is None
+            else np.asarray(goodness_uncertainty, dtype=float)
+        )
+    else:
+        g, g_unc = infer_graph_goodness_with_uncertainty(
+            model,
+            eval_graphs,
+            goodness_temp=float(cfg.get("goodness_temp", 1.0)),
+            batch_size=int(cfg.get("econ_loader_batch_size", cfg.get("batch_size", 64))),
+            critic=critic,
+        )
     if g.size == 0:
+        return meta
+    if int(g.shape[0]) != int(len(eval_dates)):
         return meta
     risk_signal = None
     if bool(cfg.get("econ_regime_gate_enabled", False)):
@@ -903,6 +1127,16 @@ def _compute_econ_metrics_for_eval(
         regime_uncertainty_scale=float(cfg.get("econ_regime_uncertainty_scale", 0.0)),
         risk_signal=risk_signal,
         regime_risk_scale=float(cfg.get("econ_regime_risk_scale", 0.0)),
+        regime_thresholding_enabled=bool(cfg.get("econ_regime_thresholding_enabled", True)),
+        regime_threshold_window=int(
+            cfg.get("econ_regime_threshold_window", cfg.get("econ_signal_window", 126))
+        ),
+        regime_threshold_quantile=float(
+            cfg.get("econ_regime_threshold_quantile", cfg.get("econ_signal_quantile", 0.5))
+        ),
+        regime_vol_window=int(cfg.get("econ_regime_vol_window", 21)),
+        regime_low_quantile=float(cfg.get("econ_regime_low_quantile", 0.33)),
+        regime_high_quantile=float(cfg.get("econ_regime_high_quantile", 0.67)),
     )
     out.update(meta)
     return out
@@ -987,7 +1221,30 @@ def _run_ff_trial(
         if mp_ctx:
             loader_kwargs["multiprocessing_context"] = mp_ctx
     loader = DataLoader(train_graphs, **loader_kwargs)
-    eval_loader = DataLoader(eval_graphs, batch_size=cfg["batch_size"], shuffle=False)
+    eval_batch_size = max(1, int(cfg.get("eval_batch_size", cfg["batch_size"])))
+    eval_loader_workers = max(0, int(cfg.get("eval_loader_workers", cfg.get("loader_workers", 0))))
+    eval_loader_kwargs = {
+        "batch_size": eval_batch_size,
+        "shuffle": False,
+        "drop_last": False,
+        "num_workers": eval_loader_workers,
+        "pin_memory": bool(cfg.get("eval_pin_memory", cfg.get("pin_memory", False)))
+        if device.type == "cuda"
+        else False,
+    }
+    if eval_loader_workers > 0:
+        eval_loader_kwargs["persistent_workers"] = bool(
+            cfg.get("eval_persistent_workers", cfg.get("persistent_workers", True))
+        )
+        eval_loader_kwargs["prefetch_factor"] = int(
+            cfg.get("eval_prefetch_factor", cfg.get("prefetch_factor", 2))
+        )
+        eval_mp_ctx = str(
+            cfg.get("eval_multiprocessing_context", cfg.get("multiprocessing_context", ""))
+        ).strip()
+        if eval_mp_ctx:
+            eval_loader_kwargs["multiprocessing_context"] = eval_mp_ctx
+    eval_loader = DataLoader(eval_graphs, **eval_loader_kwargs)
 
     model = GCNEncoder(
         in_dim=graphs[0].x.shape[1],
@@ -1121,6 +1378,29 @@ def _run_ff_trial(
             amp_dtype = torch.float16
     scaler = _make_scaler(amp_enabled and amp_dtype == torch.float16)
 
+    early_stop_enabled = bool(cfg.get("early_stop_enabled", False))
+    early_stop_min_epochs = max(1, int(cfg.get("early_stop_min_epochs", cfg["epochs"])))
+    early_stop_patience = max(1, int(cfg.get("early_stop_patience", 2)))
+    early_stop_min_delta = float(cfg.get("early_stop_min_delta", 1e-4))
+    early_stop_eval_every = max(1, int(cfg.get("early_stop_eval_every", 1)))
+    early_stop_eval_graphs = int(cfg.get("early_stop_eval_graphs", 128))
+    early_stop_rank_mode = str(cfg.get("early_stop_rank_mode", "objective")).strip() or "objective"
+    early_stop_triggered = False
+    early_stop_epoch = int(cfg["epochs"])
+    early_stop_metric_name = ""
+    early_stop_best = float("-inf")
+    early_stop_bad_epochs = 0
+    early_eval_loader = None
+    if early_stop_enabled:
+        if int(cfg["epochs"]) <= early_stop_min_epochs or len(eval_graphs) < 2:
+            early_stop_enabled = False
+        else:
+            if early_stop_eval_graphs > 0 and early_stop_eval_graphs < len(eval_graphs):
+                early_graphs = list(eval_graphs[:early_stop_eval_graphs])
+                early_eval_loader = DataLoader(early_graphs, **eval_loader_kwargs)
+            else:
+                early_eval_loader = eval_loader
+
     epoch_times = []
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
@@ -1141,7 +1421,7 @@ def _run_ff_trial(
                 cfg["neg_mix_ramp_epochs"],
             )
             apply_distance = dist_weight > 0 and (batch_idx % dist_interval == 0)
-            step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or layerwise)) else None
+            step_scaler = scaler if amp_enabled else None
 
             if layerwise:
                 if ff_blockwise:
@@ -1461,8 +1741,45 @@ def _run_ff_trial(
         _sync(device)
         dt = time.perf_counter() - t0
         epoch_times.append((dt, graphs_seen))
+        if (
+            early_stop_enabled
+            and early_eval_loader is not None
+            and epoch >= early_stop_min_epochs
+            and (epoch % early_stop_eval_every == 0)
+        ):
+            early_metrics = _eval_ff_metrics(
+                model,
+                critic,
+                early_eval_loader,
+                cfg["goodness_temp"],
+                cfg["goodness_target"],
+                eval_mode,
+                cfg["noise_std"],
+                hall_cfg,
+                sc_temp=sc_temp,
+                sc_view_mode=cfg.get("self_contrastive_eval_view_mode", "shuffle+noise"),
+                sc_view_noise_std=cfg.get("self_contrastive_eval_noise_std"),
+                window_len=cfg.get("window_len"),
+                summary_dim=cfg.get("summary_dim", 0),
+                ece_bins=int(cfg.get("ece_bins", 10)),
+            )
+            metric_name, metric_val = _objective_rank_metric(
+                early_metrics, rank_mode=early_stop_rank_mode
+            )
+            early_stop_metric_name = metric_name
+            if np.isfinite(_to_float(metric_val, float("nan"))) and (
+                metric_val > early_stop_best + early_stop_min_delta
+            ):
+                early_stop_best = float(metric_val)
+                early_stop_bad_epochs = 0
+            else:
+                early_stop_bad_epochs += 1
+                if early_stop_bad_epochs >= early_stop_patience:
+                    early_stop_triggered = True
+                    early_stop_epoch = int(epoch)
+                    break
 
-    eval_metrics = _eval_ff_metrics(
+    eval_out = _eval_ff_metrics(
         model,
         critic,
         eval_loader,
@@ -1477,7 +1794,12 @@ def _run_ff_trial(
         window_len=cfg.get("window_len"),
         summary_dim=cfg.get("summary_dim", 0),
         ece_bins=int(cfg.get("ece_bins", 10)),
+        return_pos_cache=True,
     )
+    if isinstance(eval_out, tuple):
+        eval_metrics, eval_pos_cache = eval_out
+    else:
+        eval_metrics, eval_pos_cache = eval_out, None
     warm = int(cfg.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
     avg_time = float(np.mean([t for t, _ in usable]))
@@ -1485,24 +1807,53 @@ def _run_ff_trial(
     out = {
         "avg_epoch_s": avg_time,
         "graphs_per_s": avg_gps,
+        "epochs_target": int(cfg["epochs"]),
+        "epochs_run": int(len(epoch_times)),
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
+        "early_stop_enabled": int(bool(early_stop_enabled)),
+        "early_stop_triggered": int(bool(early_stop_triggered)),
+        "early_stop_epoch": int(early_stop_epoch),
+        "early_stop_patience": int(early_stop_patience),
+        "early_stop_min_epochs": int(early_stop_min_epochs),
+        "early_stop_eval_every": int(early_stop_eval_every),
+        "early_stop_rank_mode": early_stop_rank_mode,
+        "early_stop_metric_name": early_stop_metric_name,
+        "early_stop_best_metric": float(early_stop_best)
+        if np.isfinite(_to_float(early_stop_best, float("nan")))
+        else float("nan"),
     }
     out.update(eval_metrics)
+    g_for_econ = None
+    if isinstance(eval_pos_cache, dict):
+        gvals = eval_pos_cache.get("g_pos_all")
+        if isinstance(gvals, list):
+            g_for_econ = [float(_to_float(v, float("nan"))) for v in gvals]
+            if eval_dates and len(g_for_econ) == len(eval_dates):
+                out["__econ_payloads"] = [{"goodness": list(g_for_econ), "dates": list(eval_dates)}]
     econ = _compute_econ_metrics_for_eval(
         model,
         critic,
         eval_graphs,
         eval_dates,
         cfg,
+        goodness_values=g_for_econ,
     )
     if econ:
         out.update(econ)
 
-    eval_neg_modes = cfg.get("eval_neg_modes", [])
-    if isinstance(eval_neg_modes, str):
-        eval_neg_modes = [m.strip() for m in eval_neg_modes.split(",") if m.strip()]
-    extra_modes = [str(m).strip().lower() for m in eval_neg_modes if str(m).strip()]
+    eval_neg_modes_requested = cfg.get("eval_neg_modes", [])
+    if isinstance(eval_neg_modes_requested, str):
+        eval_neg_modes_requested = [
+            m.strip() for m in eval_neg_modes_requested.split(",") if m.strip()
+        ]
+    requested_modes = [
+        str(m).strip().lower() for m in eval_neg_modes_requested if str(m).strip()
+    ]
+    eval_neg_modes_enabled = bool(cfg.get("eval_neg_modes_enabled", True))
+    extra_modes = list(requested_modes) if eval_neg_modes_enabled else []
+    out["eval_neg_modes_enabled"] = int(bool(eval_neg_modes_enabled))
+    out["eval_neg_modes_configured"] = ",".join(requested_modes)
     if extra_modes:
         reported = []
         skipped = []
@@ -1526,6 +1877,7 @@ def _run_ff_trial(
                 window_len=cfg.get("window_len"),
                 summary_dim=cfg.get("summary_dim", 0),
                 ece_bins=int(cfg.get("ece_bins", 10)),
+                pos_cache=eval_pos_cache,
             )
             mode_key = mode.replace("+", "_plus_")
             out[f"eval_{mode_key}_acc"] = mode_metrics.get("eval_acc")
@@ -1538,6 +1890,13 @@ def _run_ff_trial(
         out["eval_neg_modes_reported"] = ",".join(reported)
         if skipped:
             out["eval_neg_modes_skipped"] = ",".join(skipped)
+    elif requested_modes and not eval_neg_modes_enabled:
+        out["eval_neg_modes_skipped"] = ",".join(requested_modes)
+    _attach_eval_neg_aggregate_metrics(
+        out,
+        include_base=bool(cfg.get("eval_neg_aggregate_include_base", True)),
+        agg_mode=str(cfg.get("eval_neg_aggregate", "mean")),
+    )
     _attach_primary_metrics(out)
     return out
 
@@ -1552,6 +1911,7 @@ def _run_trial_worker(args):
         seed,
         worker_threads,
         worker_interop_threads,
+        trial_idx,
     ) = args
     if worker_threads:
         torch.set_num_threads(int(worker_threads))
@@ -1560,7 +1920,9 @@ def _run_trial_worker(args):
     _set_seed(seed)
     device = _choose_device(device_str)
     graphs, graph_dates = _load_graphs_cached(graphs_path)
-    return _run_ff_trial(graphs, graph_dates, device, cfg, layerwise=layerwise)
+    out = _run_ff_trial(graphs, graph_dates, device, cfg, layerwise=layerwise)
+    out["__trial_idx"] = int(trial_idx)
+    return out
 
 
 def main() -> int:
@@ -1732,6 +2094,10 @@ def main() -> int:
         "neg_gate_margin": float(train_cfg.get("neg_gate_margin", 1.0)),
         "eval_neg_mode": str(sweep_cfg.get("eval_neg_mode", "auto")),
         "eval_neg_modes": sweep_cfg.get("eval_neg_modes", []),
+        "eval_neg_aggregate": str(sweep_cfg.get("eval_neg_aggregate", "mean")),
+        "eval_neg_aggregate_include_base": bool(
+            sweep_cfg.get("eval_neg_aggregate_include_base", True)
+        ),
         "ece_bins": int(sweep_cfg.get("ece_bins", 10)),
         "timing_warmup_epochs": int(sweep_cfg.get("timing_warmup_epochs", 1)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
@@ -1759,9 +2125,35 @@ def main() -> int:
         "econ_regime_min_confidence": float(sweep_cfg.get("econ_regime_min_confidence", 0.0)),
         "econ_regime_uncertainty_scale": float(sweep_cfg.get("econ_regime_uncertainty_scale", 0.0)),
         "econ_regime_risk_scale": float(sweep_cfg.get("econ_regime_risk_scale", 0.0)),
+        "econ_regime_thresholding_enabled": bool(
+            sweep_cfg.get("econ_regime_thresholding_enabled", True)
+        ),
+        "econ_regime_threshold_window": int(
+            sweep_cfg.get("econ_regime_threshold_window", sweep_cfg.get("econ_signal_window", 126))
+        ),
+        "econ_regime_threshold_quantile": float(
+            sweep_cfg.get("econ_regime_threshold_quantile", sweep_cfg.get("econ_signal_quantile", 0.5))
+        ),
+        "econ_regime_vol_window": int(sweep_cfg.get("econ_regime_vol_window", 21)),
+        "econ_regime_low_quantile": float(sweep_cfg.get("econ_regime_low_quantile", 0.33)),
+        "econ_regime_high_quantile": float(sweep_cfg.get("econ_regime_high_quantile", 0.67)),
         "econ_loader_batch_size": int(sweep_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(sweep_cfg.get("econ_trading_days", 252)),
     }
+    walk_forward_cap_applied = False
+    wf_cap = int(sweep_cfg.get("walk_forward_max_folds_cap", 3))
+    if (
+        is_walk_forward_mode(str(base.get("split_mode", "chronological")))
+        and int(base.get("walk_forward_max_folds", 0)) <= 0
+        and wf_cap > 0
+    ):
+        base["walk_forward_max_folds"] = int(wf_cap)
+        walk_forward_cap_applied = True
+        print(
+            "sweep walk_forward_max_folds capped to "
+            f"{int(wf_cap)} (set walk_forward_max_folds>0 or walk_forward_max_folds_cap<=0 to override)."
+        )
+    base["walk_forward_max_folds_cap_applied"] = int(walk_forward_cap_applied)
     base["econ_fwd_ret_1"] = None
     base["econ_ticker_effective"] = ""
     base["econ_ticker_source"] = ""
@@ -1809,12 +2201,18 @@ def main() -> int:
         "walk_forward_min_train_graphs",
         "walk_forward_min_eval_graphs",
         "walk_forward_max_folds",
+        "walk_forward_max_folds_cap",
         "out_csv",
         "modes",
         "seed",
         "max_runs",
         "timing_warmup_epochs",
         "eval_neg_mode",
+        "eval_neg_modes",
+        "eval_neg_top_k",
+        "eval_neg_pre_rank_mode",
+        "eval_neg_aggregate",
+        "eval_neg_aggregate_include_base",
         "top_k",
         "auto_expand",
         "auto_expand_size",
@@ -1832,7 +2230,13 @@ def main() -> int:
         "stability_penalty",
         "stability_penalty_lambda",
         "econ_sharpe_uplift_min_floor",
+        "finance_sep_gate_metric",
+        "finance_sep_gate_floor",
+        "finance_auroc_gate_metric",
+        "finance_auroc_gate_floor",
         "rank_gate_penalty",
+        "econ_top_k",
+        "econ_pre_rank_mode",
         "econ_enabled",
         "econ_ticker",
         "econ_prices",
@@ -1850,8 +2254,20 @@ def main() -> int:
         "econ_regime_min_confidence",
         "econ_regime_uncertainty_scale",
         "econ_regime_risk_scale",
+        "econ_regime_thresholding_enabled",
+        "econ_regime_threshold_window",
+        "econ_regime_threshold_quantile",
+        "econ_regime_vol_window",
+        "econ_regime_low_quantile",
+        "econ_regime_high_quantile",
         "econ_loader_batch_size",
         "econ_trading_days",
+        "successive_halving_enabled",
+        "successive_halving_stage_fracs",
+        "successive_halving_keep_ratio",
+        "successive_halving_min_keep",
+        "successive_halving_rank_mode",
+        "successive_halving_disable_eval_neg_before_final",
     }
 
     grid_keys = []
@@ -1881,7 +2297,7 @@ def main() -> int:
     parallel_workers = int(sweep_cfg.get("parallel_workers", 1))
     parallel_backend = str(sweep_cfg.get("parallel_backend", "process")).lower()
     parallel_mp_context = str(sweep_cfg.get("parallel_mp_context", "spawn"))
-    parallel_force_cpu = bool(sweep_cfg.get("parallel_force_cpu", True))
+    parallel_force_cpu = bool(sweep_cfg.get("parallel_force_cpu", False))
     worker_threads = int(sweep_cfg.get("worker_torch_threads", 1 if parallel_workers > 1 else 0))
     worker_interop = int(sweep_cfg.get("worker_torch_interop_threads", 1 if parallel_workers > 1 else 0))
     worker_loader_workers = int(sweep_cfg.get("worker_loader_workers", base["loader_workers"]))
@@ -1919,17 +2335,143 @@ def main() -> int:
         if train_cfg.get("torch_num_interop_threads"):
             torch.set_num_interop_threads(int(train_cfg["torch_num_interop_threads"]))
 
-    results = []
-    run_idx = 0
-    tasks = []
     total_trials = len(combos) * len(modes)
-    pbar = tqdm(
-        total=total_trials,
-        desc="Sweep",
-        unit="trial",
-        dynamic_ncols=True,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    econ_top_k = max(0, int(sweep_cfg.get("econ_top_k", 0)))
+    econ_pre_rank_mode = str(sweep_cfg.get("econ_pre_rank_mode", "objective")).strip() or "objective"
+    econ_two_stage = (
+        bool(base.get("econ_enabled", False))
+        and econ_top_k > 0
+        and econ_top_k < max(1, total_trials)
     )
+    if econ_two_stage:
+        print(
+            f"Two-stage econ sweep enabled: preselect top-{econ_top_k} by {econ_pre_rank_mode}, "
+            "then run econ metrics only for selected trials."
+        )
+    eval_neg_top_k = max(0, int(sweep_cfg.get("eval_neg_top_k", 0)))
+    eval_neg_pre_rank_mode = (
+        str(sweep_cfg.get("eval_neg_pre_rank_mode", "objective")).strip() or "objective"
+    )
+    eval_neg_two_stage = eval_neg_top_k > 0 and eval_neg_top_k < max(1, total_trials)
+
+    sh_enabled = bool(sweep_cfg.get("successive_halving_enabled", False))
+    sh_stage_fracs_raw = sweep_cfg.get("successive_halving_stage_fracs", [1.0])
+    sh_keep_ratio = float(sweep_cfg.get("successive_halving_keep_ratio", 0.5))
+    sh_keep_ratio = _clamp(sh_keep_ratio, 0.05, 1.0)
+    sh_min_keep = max(1, int(sweep_cfg.get("successive_halving_min_keep", 4)))
+    sh_rank_mode = str(sweep_cfg.get("successive_halving_rank_mode", "objective")).strip() or "objective"
+    sh_disable_eval_neg_before_final = bool(
+        sweep_cfg.get("successive_halving_disable_eval_neg_before_final", True)
+    )
+    sh_stage_fracs: list[float] = []
+    if isinstance(sh_stage_fracs_raw, (list, tuple)):
+        sh_items = list(sh_stage_fracs_raw)
+    else:
+        sh_items = str(sh_stage_fracs_raw).split(",")
+    for item in sh_items:
+        try:
+            frac = float(item)
+        except (TypeError, ValueError):
+            continue
+        if frac <= 0:
+            continue
+        sh_stage_fracs.append(_clamp(frac, 0.01, 1.0))
+    if not sh_stage_fracs:
+        sh_stage_fracs = [1.0]
+    sh_stage_fracs = sorted(set(float(f) for f in sh_stage_fracs))
+    if sh_stage_fracs[-1] < 1.0:
+        sh_stage_fracs.append(1.0)
+    if not sh_enabled or len(sh_stage_fracs) <= 1 or total_trials <= sh_min_keep:
+        sh_enabled = False
+        sh_stage_fracs = [1.0]
+    if eval_neg_two_stage and not sh_enabled:
+        print(
+            "eval_neg_top_k requested but successive halving is disabled; "
+            "robust eval-neg modes will run for all trials."
+        )
+        eval_neg_two_stage = False
+    if sh_enabled:
+        print(
+            "Successive halving enabled: "
+            f"stages={sh_stage_fracs}, keep_ratio={sh_keep_ratio:.2f}, min_keep={sh_min_keep}"
+        )
+    if eval_neg_two_stage:
+        print(
+            f"Two-stage eval-neg enabled: run robust eval-neg modes only on top-{eval_neg_top_k} "
+            f"by {eval_neg_pre_rank_mode} in final stage."
+        )
+
+    tracked_cfg_keys = (
+        "neg_mode",
+        "eval_neg_mode",
+        "goodness_temp",
+        "goodness_target",
+        "eval_batch_size",
+        "eval_loader_workers",
+        "eval_pin_memory",
+        "eval_prefetch_factor",
+        "eval_persistent_workers",
+        "early_stop_enabled",
+        "early_stop_min_epochs",
+        "early_stop_patience",
+        "early_stop_min_delta",
+        "early_stop_eval_every",
+        "early_stop_eval_graphs",
+        "early_stop_rank_mode",
+        "neg_mix_end",
+        "hall_steps",
+        "hall_lr",
+        "hall_node_fraction",
+        "hall_attack_hub_fraction",
+        "hall_attack_noise_mult",
+        "hall_attack_timeflip_prob",
+        "hall_attack_edge_drop_prob",
+        "hall_attack_sign_flip_prob",
+        "hall_attack_hub_weight_scale",
+        "layerwise_neg_mode",
+        "layerwise_noise_std",
+        "layerwise_hall_corr",
+        "layerwise_hall_mean",
+        "layerwise_hall_std",
+        "self_contrastive_max_graphs",
+        "distance_forward_max_graphs",
+        "distance_forward_interval",
+        "self_contrastive_ff_weight",
+        "self_contrastive_ff_neg_mode",
+        "self_contrastive_ff_noise_std",
+        "self_contrastive_ff_target",
+        "amp",
+        "amp_dtype",
+        "fused_optimizer",
+        "ff_blockwise",
+        "ff_block_size",
+        "critic_hidden_dim",
+        "critic_num_layers",
+        "critic_dropout",
+        "critic_positive_activation",
+        "critic_ensemble_size",
+        "critic_ensemble_seed_stride",
+        "sequence_critic_enabled",
+        "sequence_critic_weight",
+        "sequence_critic_hidden_dim",
+        "sequence_critic_num_layers",
+        "sequence_critic_dropout",
+        "sequence_critic_positive_activation",
+        "sequence_critic_force_chrono",
+        "econ_regime_thresholding_enabled",
+        "econ_regime_threshold_window",
+        "econ_regime_threshold_quantile",
+        "econ_regime_vol_window",
+        "econ_regime_low_quantile",
+        "econ_regime_high_quantile",
+        "residual_edge_weight_enabled",
+        "residual_edge_hidden_dim",
+        "residual_edge_max_delta",
+        "residual_edge_detach_features",
+    )
+
+    run_idx = 0
+    trial_records: list[dict] = []
     for combo in combos:
         cfg_run = base.copy()
         cfg_run.update(combo)
@@ -1940,218 +2482,326 @@ def main() -> int:
             mode_override = mode_overrides.get(mode, {})
             if isinstance(mode_override, dict):
                 cfg_mode.update(mode_override)
+            if econ_two_stage:
+                cfg_mode["econ_enabled"] = False
             if run_idx <= len(modes):
                 _warn_self_contrastive_eval_view(cfg_mode, mode)
+            eval_neg_modes_cfg = cfg_mode.get("eval_neg_modes", [])
+            if isinstance(eval_neg_modes_cfg, str):
+                eval_neg_modes_cfg = [
+                    m.strip() for m in str(eval_neg_modes_cfg).split(",") if m.strip()
+                ]
+            has_eval_neg_modes = any(str(m).strip() for m in eval_neg_modes_cfg)
             seed = int(cfg_mode.get("seed", 7)) + run_idx
-            if parallel_workers > 1:
+            trial_idx = len(trial_records)
+            trial_records.append(
+                {
+                    "trial_idx": trial_idx,
+                    "cfg_mode": cfg_mode.copy(),
+                    "combo": dict(combo),
+                    "layerwise": bool(layerwise),
+                    "mode": str(mode),
+                    "seed": int(seed),
+                    "has_eval_neg_modes": bool(has_eval_neg_modes),
+                }
+            )
+    trial_by_id = {int(r["trial_idx"]): r for r in trial_records}
+
+    def _build_stage_cfg(rec: dict, stage_frac: float, enable_eval_neg_modes: bool):
+        cfg_stage = dict(rec["cfg_mode"])
+        target_epochs = max(1, int(cfg_stage.get("epochs", base.get("epochs", 1))))
+        stage_epochs = max(1, int(math.ceil(float(target_epochs) * float(stage_frac))))
+        cfg_stage["epochs"] = int(stage_epochs)
+        cfg_stage["eval_neg_modes_enabled"] = bool(enable_eval_neg_modes)
+        if econ_two_stage:
+            cfg_stage["econ_enabled"] = False
+        return cfg_stage, stage_epochs, target_epochs
+
+    def _decorate_result(
+        res: dict,
+        rec: dict,
+        cfg_stage: dict,
+        *,
+        stage_idx: int,
+        stage_frac: float,
+        stage_epochs: int,
+        target_epochs: int,
+        eval_neg_enabled: bool,
+    ) -> dict:
+        res["mode"] = rec["mode"]
+        res["__trial_idx"] = int(rec["trial_idx"])
+        res.update(rec["combo"])
+        for k in tracked_cfg_keys:
+            if k in cfg_stage:
+                res[k] = cfg_stage[k]
+        res["successive_halving_enabled"] = int(bool(sh_enabled))
+        res["successive_halving_stage"] = int(stage_idx + 1)
+        res["successive_halving_stage_frac"] = float(stage_frac)
+        res["successive_halving_stage_epochs"] = int(stage_epochs)
+        res["successive_halving_target_epochs"] = int(target_epochs)
+        res["successive_halving_pruned"] = 0
+        res["eval_neg_topk_enabled"] = int(bool(eval_neg_two_stage))
+        res["eval_neg_eval_topk"] = int(bool(eval_neg_enabled and rec.get("has_eval_neg_modes", False)))
+        return res
+
+    def _run_stage(records: list[dict], stage_idx: int, stage_frac: float, enable_eval_neg_modes: bool):
+        stage_results: list[dict] = []
+        stage_desc = f"Sweep S{stage_idx + 1}/{len(sh_stage_fracs)}"
+        pbar = tqdm(
+            total=len(records),
+            desc=stage_desc,
+            unit="trial",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
+        if parallel_workers > 1 and records:
+            if parallel_backend not in ("process", "thread", "threads"):
+                raise ValueError(f"Unknown parallel_backend: {parallel_backend}")
+            tasks = []
+            task_meta = []
+            for rec in records:
+                cfg_stage, stage_epochs, target_epochs = _build_stage_cfg(
+                    rec, stage_frac, enable_eval_neg_modes
+                )
                 tasks.append(
                     (
                         str(graphs_path),
-                        cfg_mode,
-                        combo,
-                        layerwise,
+                        cfg_stage,
+                        rec["combo"],
+                        rec["layerwise"],
                         device_str,
-                        seed,
+                        rec["seed"],
                         worker_threads,
                         worker_interop,
+                        rec["trial_idx"],
                     )
                 )
+                task_meta.append((rec, cfg_stage, stage_epochs, target_epochs))
+            if parallel_backend in ("thread", "threads"):
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+                    for res, meta in zip(ex.map(_run_trial_worker, tasks), task_meta):
+                        rec, cfg_stage, stage_epochs, target_epochs = meta
+                        stage_results.append(
+                            _decorate_result(
+                                res,
+                                rec,
+                                cfg_stage,
+                                stage_idx=stage_idx,
+                                stage_frac=stage_frac,
+                                stage_epochs=stage_epochs,
+                                target_epochs=target_epochs,
+                                eval_neg_enabled=enable_eval_neg_modes,
+                            )
+                        )
+                        pbar.update(1)
             else:
-                _set_seed(seed)
+                from concurrent.futures import ProcessPoolExecutor
+                import multiprocessing as mp
+
+                ctx = mp.get_context(parallel_mp_context)
+                with ProcessPoolExecutor(max_workers=parallel_workers, mp_context=ctx) as ex:
+                    for res, meta in zip(ex.map(_run_trial_worker, tasks), task_meta):
+                        rec, cfg_stage, stage_epochs, target_epochs = meta
+                        stage_results.append(
+                            _decorate_result(
+                                res,
+                                rec,
+                                cfg_stage,
+                                stage_idx=stage_idx,
+                                stage_frac=stage_frac,
+                                stage_epochs=stage_epochs,
+                                target_epochs=target_epochs,
+                                eval_neg_enabled=enable_eval_neg_modes,
+                            )
+                        )
+                        pbar.update(1)
+        else:
+            for rec in records:
+                cfg_stage, stage_epochs, target_epochs = _build_stage_cfg(
+                    rec, stage_frac, enable_eval_neg_modes
+                )
+                _set_seed(int(rec["seed"]))
                 res = _run_ff_trial(
                     graphs,
                     graph_dates,
                     device,
-                    cfg_mode,
-                    layerwise=layerwise,
+                    cfg_stage,
+                    layerwise=bool(rec["layerwise"]),
                 )
-                res["mode"] = mode
-                res.update(combo)
-                for k in (
-                    "neg_mode",
-                    "eval_neg_mode",
-                    "goodness_temp",
-                    "goodness_target",
-                    "neg_mix_end",
-                    "hall_steps",
-                    "hall_lr",
-                    "hall_node_fraction",
-                    "hall_attack_hub_fraction",
-                    "hall_attack_noise_mult",
-                    "hall_attack_timeflip_prob",
-                    "hall_attack_edge_drop_prob",
-                    "hall_attack_sign_flip_prob",
-                    "hall_attack_hub_weight_scale",
-                    "layerwise_neg_mode",
-                    "layerwise_noise_std",
-                    "layerwise_hall_corr",
-                    "layerwise_hall_mean",
-                    "layerwise_hall_std",
-                    "self_contrastive_max_graphs",
-                    "distance_forward_max_graphs",
-                    "distance_forward_interval",
-                    "self_contrastive_ff_weight",
-                    "self_contrastive_ff_neg_mode",
-                    "self_contrastive_ff_noise_std",
-                    "self_contrastive_ff_target",
-                    "amp",
-                    "amp_dtype",
-                    "fused_optimizer",
-                    "ff_blockwise",
-                    "ff_block_size",
-                    "critic_hidden_dim",
-                    "critic_num_layers",
-                    "critic_dropout",
-                    "critic_positive_activation",
-                    "critic_ensemble_size",
-                    "critic_ensemble_seed_stride",
-                    "sequence_critic_enabled",
-                    "sequence_critic_weight",
-                    "sequence_critic_hidden_dim",
-                    "sequence_critic_num_layers",
-                    "sequence_critic_dropout",
-                    "sequence_critic_positive_activation",
-                    "sequence_critic_force_chrono",
-                    "residual_edge_weight_enabled",
-                    "residual_edge_hidden_dim",
-                    "residual_edge_max_delta",
-                    "residual_edge_detach_features",
-                ):
-                    if k in cfg_mode:
-                        res[k] = cfg_mode[k]
-                results.append(res)
+                stage_results.append(
+                    _decorate_result(
+                        res,
+                        rec,
+                        cfg_stage,
+                        stage_idx=stage_idx,
+                        stage_frac=stage_frac,
+                        stage_epochs=stage_epochs,
+                        target_epochs=target_epochs,
+                        eval_neg_enabled=enable_eval_neg_modes,
+                    )
+                )
                 pbar.update(1)
+        pbar.close()
+        return stage_results
 
-    if parallel_workers > 1 and tasks:
-        if parallel_backend not in ("process", "thread", "threads"):
-            raise ValueError(f"Unknown parallel_backend: {parallel_backend}")
-        if parallel_backend in ("thread", "threads"):
-            from concurrent.futures import ThreadPoolExecutor
+    results_by_trial: dict[int, dict] = {}
+    active_records = list(trial_records)
+    for stage_idx, stage_frac in enumerate(sh_stage_fracs):
+        is_final_stage = stage_idx == (len(sh_stage_fracs) - 1)
+        enable_eval_neg_modes = True
+        if eval_neg_two_stage and sh_disable_eval_neg_before_final and not is_final_stage:
+            enable_eval_neg_modes = False
+        stage_rows = _run_stage(
+            active_records,
+            stage_idx=stage_idx,
+            stage_frac=float(stage_frac),
+            enable_eval_neg_modes=enable_eval_neg_modes,
+        )
+        for row in stage_rows:
+            trial_idx = int(row.get("__trial_idx", -1))
+            if trial_idx >= 0:
+                results_by_trial[trial_idx] = row
+        if is_final_stage:
+            break
 
-            with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
-                for res, task in zip(ex.map(_run_trial_worker, tasks), tasks):
-                    _, cfg_mode, combo, layerwise, *_ = task
-                    res["mode"] = "ff_layerwise" if layerwise else "ff_e2e"
-                    res.update(combo)
-                    for k in (
-                        "neg_mode",
-                        "eval_neg_mode",
-                        "goodness_temp",
-                        "goodness_target",
-                        "neg_mix_end",
-                        "hall_steps",
-                        "hall_lr",
-                        "hall_node_fraction",
-                        "hall_attack_hub_fraction",
-                        "hall_attack_noise_mult",
-                        "hall_attack_timeflip_prob",
-                        "hall_attack_edge_drop_prob",
-                        "hall_attack_sign_flip_prob",
-                        "hall_attack_hub_weight_scale",
-                        "layerwise_neg_mode",
-                        "layerwise_noise_std",
-                        "layerwise_hall_corr",
-                        "layerwise_hall_mean",
-                        "layerwise_hall_std",
-                        "self_contrastive_max_graphs",
-                        "distance_forward_max_graphs",
-                        "distance_forward_interval",
-                        "self_contrastive_ff_weight",
-                        "self_contrastive_ff_neg_mode",
-                        "self_contrastive_ff_noise_std",
-                        "self_contrastive_ff_target",
-                        "amp",
-                        "amp_dtype",
-                        "fused_optimizer",
-                        "ff_blockwise",
-                        "ff_block_size",
-                        "critic_hidden_dim",
-                        "critic_num_layers",
-                        "critic_dropout",
-                        "critic_positive_activation",
-                        "critic_ensemble_size",
-                        "critic_ensemble_seed_stride",
-                        "sequence_critic_enabled",
-                        "sequence_critic_weight",
-                        "sequence_critic_hidden_dim",
-                        "sequence_critic_num_layers",
-                        "sequence_critic_dropout",
-                        "sequence_critic_positive_activation",
-                        "sequence_critic_force_chrono",
-                        "residual_edge_weight_enabled",
-                        "residual_edge_hidden_dim",
-                        "residual_edge_max_delta",
-                        "residual_edge_detach_features",
-                    ):
-                        if k in cfg_mode:
-                            res[k] = cfg_mode[k]
-                    results.append(res)
-                    pbar.update(1)
+        rank_mode_stage = sh_rank_mode
+        if eval_neg_two_stage and stage_idx == (len(sh_stage_fracs) - 2):
+            rank_mode_stage = eval_neg_pre_rank_mode
+        ranked_stage = []
+        for row in stage_rows:
+            trial_idx = int(row.get("__trial_idx", -1))
+            metric_name, metric_val = _objective_rank_metric(row, rank_mode=rank_mode_stage)
+            row["successive_halving_rank_metric"] = metric_name
+            row["successive_halving_rank_value"] = metric_val
+            ranked_stage.append((trial_idx, metric_val))
+        ranked_stage.sort(
+            key=lambda iv: (
+                np.isfinite(_to_float(iv[1], float("nan"))),
+                _to_float(iv[1], float("-inf")),
+            ),
+            reverse=True,
+        )
+        keep_count = max(sh_min_keep, int(math.ceil(len(stage_rows) * sh_keep_ratio)))
+        keep_count = min(keep_count, len(stage_rows))
+        if eval_neg_two_stage and stage_idx == (len(sh_stage_fracs) - 2):
+            keep_count = min(keep_count, max(1, int(eval_neg_top_k)))
+        keep_count = max(1, keep_count)
+        keep_ids = {int(idx) for idx, _ in ranked_stage[:keep_count] if int(idx) >= 0}
+        pruned = 0
+        for row in stage_rows:
+            trial_idx = int(row.get("__trial_idx", -1))
+            if trial_idx >= 0 and trial_idx not in keep_ids:
+                row["successive_halving_pruned"] = 1
+                row["successive_halving_pruned_stage"] = int(stage_idx + 1)
+                pruned += 1
+        if pruned > 0:
+            print(
+                f"Successive halving stage {stage_idx + 1}: kept {len(keep_ids)} / "
+                f"{len(stage_rows)} trials."
+            )
+        active_records = [trial_by_id[tid] for tid in sorted(keep_ids) if tid in trial_by_id]
+
+    final_trial_ids = {int(rec["trial_idx"]) for rec in active_records}
+    results = []
+    for rec in trial_records:
+        trial_idx = int(rec["trial_idx"])
+        row = results_by_trial.get(trial_idx)
+        if row is None:
+            continue
+        if sh_enabled and trial_idx not in final_trial_ids:
+            row["successive_halving_pruned"] = 1
+            row.setdefault("successive_halving_pruned_stage", max(1, len(sh_stage_fracs) - 1))
         else:
-            from concurrent.futures import ProcessPoolExecutor
-            import multiprocessing as mp
-
-            ctx = mp.get_context(parallel_mp_context)
-            with ProcessPoolExecutor(max_workers=parallel_workers, mp_context=ctx) as ex:
-                for res, task in zip(ex.map(_run_trial_worker, tasks), tasks):
-                    _, cfg_mode, combo, layerwise, *_ = task
-                    res["mode"] = "ff_layerwise" if layerwise else "ff_e2e"
-                    res.update(combo)
-                    for k in (
-                        "neg_mode",
-                        "eval_neg_mode",
-                        "goodness_temp",
-                        "goodness_target",
-                        "neg_mix_end",
-                        "hall_steps",
-                        "hall_lr",
-                        "hall_node_fraction",
-                        "hall_attack_hub_fraction",
-                        "hall_attack_noise_mult",
-                        "hall_attack_timeflip_prob",
-                        "hall_attack_edge_drop_prob",
-                        "hall_attack_sign_flip_prob",
-                        "hall_attack_hub_weight_scale",
-                        "layerwise_neg_mode",
-                        "layerwise_noise_std",
-                        "layerwise_hall_corr",
-                        "layerwise_hall_mean",
-                        "layerwise_hall_std",
-                        "self_contrastive_max_graphs",
-                        "distance_forward_max_graphs",
-                        "distance_forward_interval",
-                        "self_contrastive_ff_weight",
-                        "self_contrastive_ff_neg_mode",
-                        "self_contrastive_ff_noise_std",
-                        "self_contrastive_ff_target",
-                        "amp",
-                        "amp_dtype",
-                        "fused_optimizer",
-                        "ff_blockwise",
-                        "ff_block_size",
-                        "critic_hidden_dim",
-                        "critic_num_layers",
-                        "critic_dropout",
-                        "critic_positive_activation",
-                        "critic_ensemble_size",
-                        "critic_ensemble_seed_stride",
-                        "sequence_critic_enabled",
-                        "sequence_critic_weight",
-                        "sequence_critic_hidden_dim",
-                        "sequence_critic_num_layers",
-                        "sequence_critic_dropout",
-                        "sequence_critic_positive_activation",
-                        "sequence_critic_force_chrono",
-                        "residual_edge_weight_enabled",
-                        "residual_edge_hidden_dim",
-                        "residual_edge_max_delta",
-                        "residual_edge_detach_features",
-                    ):
-                        if k in cfg_mode:
-                            res[k] = cfg_mode[k]
-                    results.append(res)
-                    pbar.update(1)
-    pbar.close()
+            row["successive_halving_pruned"] = 0
+        if not eval_neg_two_stage and rec.get("has_eval_neg_modes", False):
+            row["eval_neg_eval_topk"] = 1
+        results.append(row)
+    eval_neg_evaluated_trial_ids: set[int] | None = None
+    if results:
+        eval_neg_evaluated_trial_ids = {
+            int(r.get("__trial_idx", -1))
+            for r in results
+            if int(r.get("eval_neg_eval_topk", 0)) > 0 and int(r.get("__trial_idx", -1)) >= 0
+        }
+    econ_evaluated_trial_ids: set[int] | None = None
+    if econ_two_stage and results:
+        candidate_indices = [
+            idx
+            for idx, r in enumerate(results)
+            if int(r.get("successive_halving_pruned", 0)) == 0
+        ]
+        if not candidate_indices:
+            candidate_indices = list(range(len(results)))
+        ranked_pre = []
+        for idx in candidate_indices:
+            r = results[idx]
+            pre_metric, pre_val = _objective_rank_metric(r, rank_mode=econ_pre_rank_mode)
+            r["econ_pre_rank_metric"] = pre_metric
+            r["econ_pre_rank_value"] = pre_val
+            ranked_pre.append((idx, pre_val))
+        ranked_pre.sort(
+            key=lambda iv: (
+                np.isfinite(_to_float(iv[1], float("nan"))),
+                _to_float(iv[1], float("-inf")),
+            ),
+            reverse=True,
+        )
+        selected_idx = [idx for idx, _ in ranked_pre[: min(econ_top_k, len(ranked_pre))]]
+        econ_evaluated_trial_ids = set()
+        if selected_idx:
+            econ_bar = tqdm(
+                total=len(selected_idx),
+                desc="Econ Top-K",
+                unit="trial",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+            for idx in selected_idx:
+                trial_idx = int(results[idx].get("__trial_idx", -1))
+                if not (0 <= trial_idx < len(trial_records)):
+                    econ_bar.update(1)
+                    continue
+                rec = trial_records[trial_idx]
+                cfg_mode = dict(rec["cfg_mode"])
+                cfg_mode["econ_enabled"] = True
+                payloads = results[idx].get("__econ_payloads")
+                if not isinstance(payloads, list):
+                    payloads = []
+                econ_rows = []
+                for payload in payloads:
+                    if not isinstance(payload, dict):
+                        continue
+                    dates_payload = payload.get("dates")
+                    goodness_payload = payload.get("goodness")
+                    if not isinstance(dates_payload, list) or not isinstance(goodness_payload, list):
+                        continue
+                    if len(dates_payload) != len(goodness_payload) or not dates_payload:
+                        continue
+                    econ_row = _compute_econ_metrics_for_eval(
+                        None,
+                        None,
+                        [],
+                        dates_payload,
+                        cfg_mode,
+                        goodness_values=goodness_payload,
+                    )
+                    if econ_row:
+                        econ_rows.append(econ_row)
+                if econ_rows:
+                    econ_merged = (
+                        econ_rows[0] if len(econ_rows) == 1 else _aggregate_numeric_rows(econ_rows)
+                    )
+                    for k, v in econ_merged.items():
+                        if str(k).startswith("econ_"):
+                            results[idx][k] = v
+                    results[idx]["econ_eval_topk"] = 1
+                    econ_evaluated_trial_ids.add(trial_idx)
+                econ_bar.update(1)
+            econ_bar.close()
+        for r in results:
+            r.setdefault("econ_eval_topk", 0)
 
     if results:
         default_rank_mode = "finance_first" if bool(base.get("econ_enabled", False)) else "objective"
@@ -2161,12 +2811,45 @@ def main() -> int:
         stability_penalty = bool(sweep_cfg.get("stability_penalty", finance_rank))
         stability_lambda = max(0.0, float(sweep_cfg.get("stability_penalty_lambda", 0.5)))
         rank_gate_floor = _to_float(sweep_cfg.get("econ_sharpe_uplift_min_floor"), float("nan"))
+        sep_gate_metric = str(
+            sweep_cfg.get("finance_sep_gate_metric", "eval_sep_agg_min")
+        ).strip() or "eval_sep_agg_min"
+        sep_gate_floor = _to_float(sweep_cfg.get("finance_sep_gate_floor"), float("nan"))
+        auroc_gate_metric = str(
+            sweep_cfg.get("finance_auroc_gate_metric", "eval_auroc_agg_min")
+        ).strip() or "eval_auroc_agg_min"
+        auroc_gate_floor = _to_float(sweep_cfg.get("finance_auroc_gate_floor"), float("nan"))
         rank_gate_penalty = abs(float(sweep_cfg.get("rank_gate_penalty", 1e6)))
         for r in results:
             rank_metric, rank_value = _objective_rank_metric(r, rank_mode=rank_mode)
             rank_base_metric = rank_metric
             rank_base_value = rank_value
             gate_failed = False
+            gate_reasons: list[str] = []
+            trial_idx = int(r.get("__trial_idx", -1))
+
+            if sh_enabled and int(r.get("successive_halving_pruned", 0)) > 0:
+                gate_failed = True
+                gate_reasons.append("successive_halving_pruned")
+
+            if (
+                finance_rank
+                and eval_neg_two_stage
+                and bool(str(r.get("eval_neg_modes_configured", "")).strip())
+                and eval_neg_evaluated_trial_ids is not None
+                and trial_idx not in eval_neg_evaluated_trial_ids
+            ):
+                gate_failed = True
+                gate_reasons.append("eval_neg_not_evaluated")
+
+            if (
+                finance_rank
+                and econ_two_stage
+                and econ_evaluated_trial_ids is not None
+                and trial_idx not in econ_evaluated_trial_ids
+            ):
+                gate_failed = True
+                gate_reasons.append("econ_not_evaluated")
 
             if finance_rank and stability_penalty:
                 sharpe_mean = _to_float(r.get("econ_sharpe_uplift"), float("nan"))
@@ -2181,10 +2864,31 @@ def main() -> int:
                 floor_metric = _to_float(r.get("econ_sharpe_uplift_min"), float("nan"))
                 if np.isfinite(floor_metric) and floor_metric < rank_gate_floor:
                     gate_failed = True
-                    rank_value = rank_value - rank_gate_penalty
+                    gate_reasons.append("econ_sharpe_uplift_min")
                     r["rank_gate_metric"] = "econ_sharpe_uplift_min"
                     r["rank_gate_floor"] = float(rank_gate_floor)
                     r["rank_gate_value"] = float(floor_metric)
+            if finance_rank and np.isfinite(sep_gate_floor):
+                sep_val = _to_float(r.get(sep_gate_metric), float("nan"))
+                if np.isfinite(sep_val) and sep_val < sep_gate_floor:
+                    gate_failed = True
+                    gate_reasons.append(sep_gate_metric)
+                    if "rank_gate_metric" not in r:
+                        r["rank_gate_metric"] = sep_gate_metric
+                        r["rank_gate_floor"] = float(sep_gate_floor)
+                        r["rank_gate_value"] = float(sep_val)
+            if finance_rank and np.isfinite(auroc_gate_floor):
+                auroc_val = _to_float(r.get(auroc_gate_metric), float("nan"))
+                if np.isfinite(auroc_val) and auroc_val < auroc_gate_floor:
+                    gate_failed = True
+                    gate_reasons.append(auroc_gate_metric)
+                    if "rank_gate_metric" not in r:
+                        r["rank_gate_metric"] = auroc_gate_metric
+                        r["rank_gate_floor"] = float(auroc_gate_floor)
+                        r["rank_gate_value"] = float(auroc_val)
+            if gate_failed:
+                rank_value = rank_value - rank_gate_penalty
+                r["rank_gate_reasons"] = ",".join(gate_reasons)
 
             r["rank_base_metric"] = rank_base_metric
             r["rank_base_value"] = rank_base_value
@@ -2194,7 +2898,7 @@ def main() -> int:
             r["rank_gate_failed"] = int(gate_failed)
 
         econ_metric_name = str(sweep_cfg.get("composite_econ_metric", "econ_sharpe_uplift"))
-        sep_metric_name = str(sweep_cfg.get("composite_sep_metric", "eval_sep"))
+        sep_metric_name = str(sweep_cfg.get("composite_sep_metric", "eval_sep_agg_mean"))
         econ_weight = max(0.0, float(sweep_cfg.get("econ_weight", 0.45)))
         sep_weight = max(0.0, float(sweep_cfg.get("sep_weight", 0.35)))
         speed_weight = max(0.0, float(sweep_cfg.get("speed_weight", 0.20)))
@@ -2241,6 +2945,11 @@ def main() -> int:
             r["sep_weight"] = sep_weight
             r["speed_weight"] = speed_weight
             r["score"] = econ_weight * econ_norm + sep_weight * sep_norm + speed_weight * speed_norm
+
+    for r in results:
+        for k in tuple(r.keys()):
+            if str(k).startswith("__"):
+                r.pop(k, None)
 
     out_path = Path(sweep_cfg.get("out_csv", "runs/experiments/manual/metrics/ff_sweep.csv"))
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 from pathlib import Path
 import random
 import sys
 import tomllib
-import csv
-import math
 import hashlib
 import time
 import warnings
@@ -42,9 +41,14 @@ from frisk.ff import (
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
 from frisk.econ_eval import resolve_price_ticker
+from frisk.targets import (
+    compute_forward_return_targets_cached,
+    compute_risk_targets_cached,
+)
 
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+_AUTOTUNE_BATCH_CACHE: dict[str, dict[str, int]] = {}
 _NEG_AUG_MODES = {
     "shuffle",
     "noise",
@@ -143,6 +147,47 @@ def _parse_amp_dtype(value) -> torch.dtype:
     if name in {"bf16", "bfloat16"}:
         return torch.bfloat16
     return torch.float16
+
+
+def _autotune_cache_key(parts: dict) -> str:
+    raw = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _load_autotune_cache(path: str | None) -> tuple[str | None, dict[str, int]]:
+    if not path:
+        return None, {}
+    p = str(Path(path).expanduser())
+    if p in _AUTOTUNE_BATCH_CACHE:
+        return p, _AUTOTUNE_BATCH_CACHE[p]
+    out: dict[str, int] = {}
+    cache_path = Path(p)
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text())
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    try:
+                        vi = int(v)
+                    except Exception:
+                        continue
+                    if vi > 0:
+                        out[str(k)] = vi
+        except Exception:
+            out = {}
+    _AUTOTUNE_BATCH_CACHE[p] = out
+    return p, out
+
+
+def _save_autotune_cache(path: str | None, cache: dict[str, int]) -> None:
+    if not path:
+        return
+    cache_path = Path(path)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
+    except Exception:
+        return
 
 
 def _build_optimizer(params, lr: float, device: torch.device, use_fused: bool):
@@ -456,134 +501,16 @@ def _compute_risk_targets(
     max_abs_logret: float,
     cache_dir: str | None = "runs/cache",
 ) -> tuple[list[float | None], float, float]:
-    prices_file = Path(prices_path)
-    try:
-        st = prices_file.stat()
-        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
-    except OSError:
-        file_sig = "missing"
-    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
-    cache_key = hashlib.sha1(
-        "|".join(
-            [
-                str(prices_file.resolve()),
-                str(ticker).upper(),
-                str(horizon),
-                str(int(bool(standardize))),
-                f"{float(max_abs_logret):.8f}",
-                file_sig,
-                dates_hash,
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
-
-    cached = _RISK_TARGET_MEM_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    cache_path: Path | None = None
-    if cache_dir:
-        cache_path = Path(cache_dir) / f"risk_targets_{cache_key}.pt"
-        if cache_path.exists():
-            try:
-                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                targets = payload["targets"]
-                mean = float(payload["mean"])
-                std = float(payload["std"])
-                result = (targets, mean, std)
-                _RISK_TARGET_MEM_CACHE[cache_key] = result
-                return result
-            except Exception:
-                pass
-
-    prices_by_date: dict[str, list[float]] = {}
-    ticker_norm = str(ticker).upper()
-    with Path(prices_path).open() as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError("prices.csv missing header")
-        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
-        for row in r:
-            if str(row.get("ticker", "")).upper() != ticker_norm:
-                continue
-            date = row.get("date")
-            if not date:
-                continue
-            val = row.get(price_col, "")
-            if not val:
-                continue
-            try:
-                price = float(val)
-            except ValueError:
-                continue
-            if not math.isfinite(price) or price <= 0:
-                continue
-            prices_by_date.setdefault(date, []).append(price)
-    prices: list[tuple[str, float]] = []
-    for date, vals in prices_by_date.items():
-        if not vals:
-            continue
-        vals_sorted = sorted(vals)
-        mid = len(vals_sorted) // 2
-        if len(vals_sorted) % 2 == 1:
-            px = vals_sorted[mid]
-        else:
-            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
-        prices.append((date, float(px)))
-    if not prices:
-        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
-
-    prices.sort(key=lambda x: x[0])
-    date_list = [d for d, _ in prices]
-    price_list = [p for _, p in prices]
-    returns = []
-    clip = float(max_abs_logret)
-    for i in range(len(price_list) - 1):
-        if price_list[i] <= 0 or price_list[i + 1] <= 0:
-            returns.append(0.0)
-            continue
-        ret = math.log(price_list[i + 1] / price_list[i])
-        if clip > 0 and abs(ret) > clip:
-            ret = math.copysign(clip, ret)
-        returns.append(ret)
-    idx_map = {d: i for i, d in enumerate(date_list)}
-
-    targets: list[float | None] = []
-    for d in dates:
-        idx = idx_map.get(d)
-        if idx is None:
-            targets.append(None)
-            continue
-        if idx + horizon > len(returns):
-            targets.append(None)
-            continue
-        window = returns[idx : idx + horizon]
-        if not window:
-            targets.append(None)
-            continue
-        mean = sum(window) / len(window)
-        var = sum((x - mean) ** 2 for x in window) / len(window)
-        vol = math.sqrt(var)
-        targets.append(vol)
-
-    finite = [t for t in targets if t is not None]
-    if not finite:
-        return targets, 0.0, 1.0
-    mean = sum(finite) / len(finite)
-    var = sum((x - mean) ** 2 for x in finite) / len(finite)
-    std = math.sqrt(var) if var > 0 else 1.0
-
-    if standardize:
-        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
-    result = (targets, mean, std)
-    _RISK_TARGET_MEM_CACHE[cache_key] = result
-    if cache_path is not None:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
-        except Exception:
-            pass
-    return result
+    return compute_risk_targets_cached(
+        prices_path=prices_path,
+        ticker=ticker,
+        dates=dates,
+        horizon=horizon,
+        standardize=standardize,
+        max_abs_logret=max_abs_logret,
+        cache_dir=cache_dir,
+        mem_cache=_RISK_TARGET_MEM_CACHE,
+    )
 
 
 def _compute_forward_return_targets(
@@ -595,136 +522,16 @@ def _compute_forward_return_targets(
     max_abs_logret: float,
     cache_dir: str | None = "runs/cache",
 ) -> tuple[list[float | None], float, float]:
-    prices_file = Path(prices_path)
-    try:
-        st = prices_file.stat()
-        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
-    except OSError:
-        file_sig = "missing"
-    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
-    cache_key = hashlib.sha1(
-        "|".join(
-            [
-                "portfolio_targets",
-                str(prices_file.resolve()),
-                str(ticker).upper(),
-                str(horizon),
-                str(int(bool(standardize))),
-                f"{float(max_abs_logret):.8f}",
-                file_sig,
-                dates_hash,
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
-
-    cached = _PORT_TARGET_MEM_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    cache_path: Path | None = None
-    if cache_dir:
-        cache_path = Path(cache_dir) / f"portfolio_targets_{cache_key}.pt"
-        if cache_path.exists():
-            try:
-                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                targets = payload["targets"]
-                mean = float(payload["mean"])
-                std = float(payload["std"])
-                result = (targets, mean, std)
-                _PORT_TARGET_MEM_CACHE[cache_key] = result
-                return result
-            except Exception:
-                pass
-
-    prices_by_date: dict[str, list[float]] = {}
-    ticker_norm = str(ticker).upper()
-    with Path(prices_path).open() as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError("prices.csv missing header")
-        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
-        for row in r:
-            if str(row.get("ticker", "")).upper() != ticker_norm:
-                continue
-            date = row.get("date")
-            if not date:
-                continue
-            val = row.get(price_col, "")
-            if not val:
-                continue
-            try:
-                price = float(val)
-            except ValueError:
-                continue
-            if not math.isfinite(price) or price <= 0:
-                continue
-            prices_by_date.setdefault(date, []).append(price)
-    prices: list[tuple[str, float]] = []
-    for date, vals in prices_by_date.items():
-        if not vals:
-            continue
-        vals_sorted = sorted(vals)
-        mid = len(vals_sorted) // 2
-        if len(vals_sorted) % 2 == 1:
-            px = vals_sorted[mid]
-        else:
-            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
-        prices.append((date, float(px)))
-    if not prices:
-        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
-
-    prices.sort(key=lambda x: x[0])
-    date_list = [d for d, _ in prices]
-    price_list = [p for _, p in prices]
-    log_returns = []
-    clip = float(max_abs_logret)
-    for i in range(len(price_list) - 1):
-        if price_list[i] <= 0 or price_list[i + 1] <= 0:
-            log_returns.append(0.0)
-            continue
-        ret = math.log(price_list[i + 1] / price_list[i])
-        if clip > 0 and abs(ret) > clip:
-            ret = math.copysign(clip, ret)
-        log_returns.append(ret)
-    idx_map = {d: i for i, d in enumerate(date_list)}
-
-    targets: list[float | None] = []
-    horizon = max(1, int(horizon))
-    for d in dates:
-        idx = idx_map.get(d)
-        if idx is None:
-            targets.append(None)
-            continue
-        if idx + horizon > len(log_returns):
-            targets.append(None)
-            continue
-        window = log_returns[idx : idx + horizon]
-        if not window:
-            targets.append(None)
-            continue
-        cum_log = float(sum(window))
-        targets.append(float(math.exp(cum_log) - 1.0))
-
-    finite = [t for t in targets if t is not None]
-    if not finite:
-        result = (targets, 0.0, 1.0)
-        _PORT_TARGET_MEM_CACHE[cache_key] = result
-        return result
-    mean = sum(finite) / len(finite)
-    var = sum((x - mean) ** 2 for x in finite) / len(finite)
-    std = math.sqrt(var) if var > 0 else 1.0
-
-    if standardize:
-        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
-    result = (targets, mean, std)
-    _PORT_TARGET_MEM_CACHE[cache_key] = result
-    if cache_path is not None:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
-        except Exception:
-            pass
-    return result
+    return compute_forward_return_targets_cached(
+        prices_path=prices_path,
+        ticker=ticker,
+        dates=dates,
+        horizon=horizon,
+        standardize=standardize,
+        max_abs_logret=max_abs_logret,
+        cache_dir=cache_dir,
+        mem_cache=_PORT_TARGET_MEM_CACHE,
+    )
 
 
 def _compute_portfolio_head_loss(
@@ -932,6 +739,19 @@ def _make_negatives(
                     out_adv[hub_idx] = torch.flip(out_adv[hub_idx], dims=[1])
         return out_adv
     if use_mode == "hallucinate":
+        if x.device.type == "cuda":
+            with torch.autocast(device_type="cuda", enabled=False):
+                return hallucinate_negative(
+                    model,
+                    x,
+                    edge_index,
+                    edge_attr,
+                    batch,
+                    hall_cfg,
+                    edge_weight=edge_weight,
+                    forward_fn=forward_fn,
+                    critic=critic,
+                )
         return hallucinate_negative(
             model,
             x,
@@ -1545,6 +1365,10 @@ def main() -> int:
     auto_tune_max = _get_setting(args, section, "auto_tune_max_batch", 64)
     auto_tune_factor = _get_setting(args, section, "auto_tune_factor", 2)
     auto_tune_min = _get_setting(args, section, "auto_tune_min_batch", 1)
+    auto_tune_cache = _to_bool(_get_setting(args, section, "auto_tune_cache", True))
+    auto_tune_cache_path = _get_setting(
+        args, section, "auto_tune_cache_path", "runs/cache/auto_tune_batch.json"
+    )
     neg_warmup_epochs = _get_setting(args, section, "neg_warmup_epochs", 0)
     neg_mix_start = _get_setting(args, section, "neg_mix_start", 0.0)
     neg_mix_end = _get_setting(args, section, "neg_mix_end", 0.7)
@@ -1562,6 +1386,7 @@ def main() -> int:
     ff_hall_steps_override = _get_setting(args, section, "ff_hall_steps", None)
     ff_concat_posneg = _to_bool(_get_setting(args, section, "ff_concat_posneg", True))
     ff_layer_cache = _to_bool(_get_setting(args, section, "ff_layer_cache", True))
+    ff_dual_neg_every_n_batches = int(_get_setting(args, section, "ff_dual_neg_every_n_batches", 4))
     ff_econ_eval_every = int(_get_setting(args, section, "ff_econ_eval_every", 1))
     grad_clip = _get_setting(args, section, "grad_clip", 1.0)
     self_contrastive_temp = float(_get_setting(args, section, "self_contrastive_temp", 0.2))
@@ -1863,7 +1688,10 @@ def main() -> int:
     ff_rank_use_portfolio_targets = bool(ff_rank_use_portfolio_targets)
     ff_hall_every_n_batches = max(1, int(ff_hall_every_n_batches))
     ff_hall_warmup_epochs = max(0, int(ff_hall_warmup_epochs))
+    ff_dual_neg_every_n_batches = max(1, int(ff_dual_neg_every_n_batches))
     ff_econ_eval_every = max(1, int(ff_econ_eval_every))
+    if ff_econ_eval_every != 1:
+        print("ff_econ_eval_every is deprecated and currently ignored.")
     torch_compile_mode = str(torch_compile_mode).strip() or "reduce-overhead"
     if neg_mode == "mix":
         neg_mix_end = _clamp(float(neg_mix_end), float(neg_mix_start), adaptive_mix_end_max)
@@ -2114,7 +1942,8 @@ def main() -> int:
         "ff_runtime: "
         f"concat_posneg={ff_concat_posneg}, layer_cache={ff_layer_cache}, "
         f"rank_aux_weight={ff_rank_aux_weight}, hall_every_n_batches={ff_hall_every_n_batches}, "
-        f"hall_warmup_epochs={ff_hall_warmup_epochs}, econ_eval_every={ff_econ_eval_every}"
+        f"hall_warmup_epochs={ff_hall_warmup_epochs}, "
+        f"dual_neg_every_n_batches={ff_dual_neg_every_n_batches}"
     )
     if torch_compile_enabled:
         print(f"torch_compile: requested (mode={torch_compile_mode})")
@@ -2137,6 +1966,11 @@ def main() -> int:
         "auto_tune_batch: "
         f"{auto_tune} (max={auto_tune_max}, factor={auto_tune_factor}, min={auto_tune_min})"
     )
+    if auto_tune:
+        print(
+            "auto_tune_cache: "
+            f"{bool(auto_tune_cache)} path={auto_tune_cache_path if auto_tune_cache else ''}"
+        )
 
     input_dim = graphs[0].x.shape[1]
     model = GCNEncoder(
@@ -2373,10 +2207,9 @@ def main() -> int:
         train_shuffle = False
 
     if auto_tune and device.type in ("cuda", "mps"):
-        print(f"Auto-tuning batch size for {device.type.upper()}...")
-        test_bs = batch_size
         best_bs = None
-        while test_bs <= auto_tune_max:
+
+        def _probe_batch_size(test_bs: int) -> tuple[bool, bool]:
             try:
                 model.train()
                 _try_batch_size(
@@ -2409,65 +2242,93 @@ def main() -> int:
                     ff_margin_weight,
                     loader_shuffle=train_shuffle,
                 )
-                best_bs = test_bs
-                test_bs = int(test_bs * auto_tune_factor)
-                if test_bs == best_bs:
-                    break
+                return True, False
             except RuntimeError as exc:
                 if _is_oom(exc):
-                    break
+                    return False, True
                 raise
             finally:
                 empty_device_cache(device)
 
-        if best_bs is None:
-            test_bs = max(auto_tune_min, int(batch_size / auto_tune_factor))
-            while test_bs >= auto_tune_min:
+        cache_key = None
+        cache_map: dict[str, int] = {}
+        cache_path_norm = None
+        if auto_tune_cache:
+            cache_path_norm, cache_map = _load_autotune_cache(str(auto_tune_cache_path))
+            device_name = ""
+            if device.type == "cuda":
                 try:
-                    model.train()
-                    _try_batch_size(
-                        graphs,
-                        model,
-                        critic,
-                        device,
-                        test_bs,
-                        loader_workers,
-                        neg_mode,
-                        noise_std,
-                        goodness_target,
-                        goodness_temp,
-                        hall_cfg,
-                        returns_len,
-                        summary_dim,
-                        ff_multiscale,
-                        self_contrastive_temp,
-                        self_contrastive_max_graphs,
-                        self_contrastive_view_mode,
-                        self_contrastive_view_noise_std,
-                        self_contrastive_ff_weight,
-                        self_contrastive_ff_neg_mode,
-                        self_contrastive_ff_noise_std,
-                        self_contrastive_ff_target,
-                        distance_forward_weight,
-                        distance_forward_margin,
-                        distance_forward_max_graphs,
-                        ff_margin,
-                        ff_margin_weight,
-                        loader_shuffle=train_shuffle,
-                    )
+                    dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+                    device_name = str(torch.cuda.get_device_name(dev_idx))
+                except Exception:
+                    device_name = "cuda"
+            elif device.type == "mps":
+                device_name = "mps"
+            cache_key = _autotune_cache_key(
+                {
+                    "device_type": str(device.type),
+                    "device_name": device_name,
+                    "torch": str(torch.__version__),
+                    "input_dim": int(input_dim),
+                    "num_graphs": int(len(graphs)),
+                    "hidden_dim": int(hidden_dim),
+                    "num_layers": int(num_layers),
+                    "encoder_conv_type": str(encoder_conv_type),
+                    "encoder_gat_heads": int(encoder_gat_heads),
+                    "neg_mode": str(neg_mode),
+                    "ff_layerwise": bool(ff_layerwise),
+                    "ff_multiscale": bool(ff_multiscale),
+                    "amp": bool(amp_enabled),
+                    "amp_dtype": str(amp_dtype_raw),
+                    "compile": bool(torch_compile_enabled),
+                }
+            )
+            cached_bs = int(cache_map.get(cache_key, 0))
+            if cached_bs > 0:
+                cached_bs = max(auto_tune_min, min(auto_tune_max, cached_bs))
+                ok, is_oom = _probe_batch_size(cached_bs)
+                if ok:
+                    print(f"Auto-tune cache hit: batch_size={cached_bs}")
+                    best_bs = int(cached_bs)
+                elif is_oom:
+                    print(f"Auto-tune cache invalid (OOM at {cached_bs}); re-tuning.")
+
+        if best_bs is None:
+            print(f"Auto-tuning batch size for {device.type.upper()}...")
+            test_bs = batch_size
+            while test_bs <= auto_tune_max:
+                ok, is_oom = _probe_batch_size(test_bs)
+                if ok:
                     best_bs = test_bs
+                    test_bs = int(test_bs * auto_tune_factor)
+                    if test_bs == best_bs:
+                        break
+                    continue
+                if is_oom:
                     break
-                except RuntimeError as exc:
-                    if _is_oom(exc):
+                break
+
+            if best_bs is None:
+                test_bs = max(auto_tune_min, int(batch_size / auto_tune_factor))
+                while test_bs >= auto_tune_min:
+                    ok, is_oom = _probe_batch_size(test_bs)
+                    if ok:
+                        best_bs = test_bs
+                        break
+                    if is_oom:
                         test_bs = int(test_bs / auto_tune_factor)
                         continue
-                    raise
-                finally:
-                    empty_device_cache(device)
+                    break
 
         if best_bs is not None and best_bs != batch_size:
             print(f"Auto-tune selected batch_size={best_bs}")
             batch_size = best_bs
+        if auto_tune_cache and cache_key and cache_path_norm and best_bs is not None:
+            prev_bs = int(cache_map.get(cache_key, 0))
+            if prev_bs != int(best_bs):
+                cache_map[cache_key] = int(best_bs)
+                _AUTOTUNE_BATCH_CACHE[cache_path_norm] = cache_map
+                _save_autotune_cache(cache_path_norm, cache_map)
 
     loader_kwargs = {
         "batch_size": batch_size,
@@ -2502,7 +2363,7 @@ def main() -> int:
                 "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
                 "hall_node_fraction_used,rank_aux_loss,"
                 "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
-                "time_loss_terms_s,time_optimizer_s,time_econ_eval_s\n"
+                "time_loss_terms_s,time_optimizer_s\n"
             )
 
     epoch_iter = tqdm(
@@ -2558,7 +2419,6 @@ def main() -> int:
             "forward_neg": 0.0,
             "loss_terms": 0.0,
             "optimizer": 0.0,
-            "econ_eval": 0.0,
         }
 
         hall_used = 0
@@ -2615,7 +2475,7 @@ def main() -> int:
                 distance_forward_weight > 0
                 and (step_idx % distance_forward_interval == 0)
             )
-            step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or ff_layerwise)) else None
+            step_scaler = scaler if amp_enabled else None
             batch_t0 = time.perf_counter()
             timing_before = timing_totals.copy()
 
@@ -2828,23 +2688,33 @@ def main() -> int:
                         timing_totals["neg_gen"] += time.perf_counter() - t_neg_gen
                     total_used += 1
 
-                    t_neg_time = time.perf_counter()
-                    x_neg_time = make_negative(
-                        x,
-                        batch.batch,
-                        mode="time_flip",
-                        noise_std=noise_std,
-                        window_len=returns_len,
-                        summary_dim=summary_dim,
+                    use_dual_neg = (
+                        ff_dual_neg_every_n_batches <= 1
+                        or (step_idx % ff_dual_neg_every_n_batches == 0)
                     )
-                    timing_totals["neg_gen"] += time.perf_counter() - t_neg_time
+                    x_neg_time = None
+                    if use_dual_neg:
+                        t_neg_time = time.perf_counter()
+                        x_neg_time = make_negative(
+                            x,
+                            batch.batch,
+                            mode="time_flip",
+                            noise_std=noise_std,
+                            window_len=returns_len,
+                            summary_dim=summary_dim,
+                        )
+                        timing_totals["neg_gen"] += time.perf_counter() - t_neg_time
 
                     t_fwd_neg = time.perf_counter()
-                    layers_neg_h = _forward_encoder(model, 
-                        x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
+                    layers_neg_h = _forward_encoder(
+                        model, x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
                     )
-                    layers_neg_t = _forward_encoder(model, 
-                        x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
+                    layers_neg_t = (
+                        _forward_encoder(
+                            model, x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
+                        )
+                        if use_dual_neg and x_neg_time is not None
+                        else None
                     )
                     timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
 
@@ -2881,49 +2751,69 @@ def main() -> int:
                     g_pos_last = 0.0
                     g_neg_h_last = 0.0
                     g_neg_t_last = 0.0
-                    for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
-                        g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
-                        g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp, critic=critic)
-                        g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp, critic=critic)
-                        g_pos_last = g_p.mean().item()
-                        g_neg_h_last = g_n_h.mean().item()
-                        g_neg_t_last = g_n_t.mean().item()
-                        batch_loss += ff_loss(
-                            g_p,
-                            g_n_h,
-                            target=goodness_target,
-                            margin=ff_margin,
-                            margin_weight=ff_margin_weight,
-                        )
-                        batch_loss += ff_loss(
-                            g_p,
-                            g_n_t,
-                            target=goodness_target,
-                            margin=ff_margin,
-                            margin_weight=ff_margin_weight,
-                        )
+                    if use_dual_neg and layers_neg_t is not None:
+                        for h_p, h_n_h, h_n_t in zip(layers_pos, layers_neg_h, layers_neg_t):
+                            g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
+                            g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp, critic=critic)
+                            g_n_t = goodness(h_n_t, batch.batch, temperature=goodness_temp, critic=critic)
+                            g_pos_last = g_p.mean().item()
+                            g_neg_h_last = g_n_h.mean().item()
+                            g_neg_t_last = g_n_t.mean().item()
+                            batch_loss += ff_loss(
+                                g_p,
+                                g_n_h,
+                                target=goodness_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
+                            )
+                            batch_loss += ff_loss(
+                                g_p,
+                                g_n_t,
+                                target=goodness_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
+                            )
+                    else:
+                        for h_p, h_n_h in zip(layers_pos, layers_neg_h):
+                            g_p = goodness(h_p, batch.batch, temperature=goodness_temp, critic=critic)
+                            g_n_h = goodness(h_n_h, batch.batch, temperature=goodness_temp, critic=critic)
+                            g_pos_last = g_p.mean().item()
+                            g_neg_h_last = g_n_h.mean().item()
+                            batch_loss += ff_loss(
+                                g_p,
+                                g_n_h,
+                                target=goodness_target,
+                                margin=ff_margin,
+                                margin_weight=ff_margin_weight,
+                            )
                     batch_loss = batch_loss / max(1, len(layers_pos))
 
                     if apply_distance:
                         z_pos = global_mean_pool(layers_pos[-1], batch.batch)
                         z_neg_h = global_mean_pool(layers_neg_h[-1], batch.batch)
-                        z_neg_t = global_mean_pool(layers_neg_t[-1], batch.batch)
                         dist_loss_h = pairwise_distance_forward_loss(
                             z_pos,
                             z_neg_h,
                             margin=distance_forward_margin,
                             max_graphs=distance_forward_max_graphs,
                         )
-                        dist_loss_t = pairwise_distance_forward_loss(
-                            z_pos,
-                            z_neg_t,
-                            margin=distance_forward_margin,
-                            max_graphs=distance_forward_max_graphs,
-                        )
-                        dist_loss_val = 0.5 * (dist_loss_h + dist_loss_t)
+                        if use_dual_neg and layers_neg_t is not None:
+                            z_neg_t = global_mean_pool(layers_neg_t[-1], batch.batch)
+                            dist_loss_t = pairwise_distance_forward_loss(
+                                z_pos,
+                                z_neg_t,
+                                margin=distance_forward_margin,
+                                max_graphs=distance_forward_max_graphs,
+                            )
+                            dist_loss_val = 0.5 * (dist_loss_h + dist_loss_t)
+                        else:
+                            dist_loss_val = dist_loss_h
                         batch_loss = batch_loss + distance_forward_weight * dist_loss_val
 
-                    g_neg_last = (g_neg_h_last + g_neg_t_last) / 2.0
+                    if use_dual_neg and layers_neg_t is not None:
+                        g_neg_last = 0.5 * (g_neg_h_last + g_neg_t_last)
+                    else:
+                        g_neg_last = g_neg_h_last
                     timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
 
                 energy_penalty_val = 0.0
@@ -2942,11 +2832,12 @@ def main() -> int:
                     batch_loss = batch_loss + energy_penalty_weight_eff * energy_penalty_val
 
                 risk_loss_val = None
+                pooled_embed = None
                 if risk_head is not None and risk_targets_by_horizon is not None:
-                    embed = global_mean_pool(layers_pos[-1], batch.batch)
+                    pooled_embed = global_mean_pool(layers_pos[-1], batch.batch)
                     risk_loss_val = _compute_multi_horizon_risk_loss(
                         risk_head=risk_head,
-                        embeddings=embed,
+                        embeddings=pooled_embed,
                         graph_idx=batch.graph_idx,
                         risk_targets_by_horizon=risk_targets_by_horizon,
                         device=device,
@@ -2956,10 +2847,11 @@ def main() -> int:
                         batch_loss = batch_loss + risk_loss_weight * risk_loss_val
                 portfolio_loss_val = None
                 if portfolio_head is not None and portfolio_targets is not None:
-                    embed = global_mean_pool(layers_pos[-1], batch.batch)
+                    if pooled_embed is None:
+                        pooled_embed = global_mean_pool(layers_pos[-1], batch.batch)
                     portfolio_loss_val = _compute_portfolio_head_loss(
                         portfolio_head=portfolio_head,
-                        embeddings=embed,
+                        embeddings=pooled_embed,
                         graph_idx=batch.graph_idx,
                         portfolio_targets=portfolio_targets,
                         device=device,
@@ -3434,7 +3326,7 @@ def main() -> int:
                                     window_len=returns_len,
                                     summary_dim=summary_dim,
                                 )
-                            hall_used += 1
+                        hall_used += 1
                     else:
                         t_neg_gen = time.perf_counter()
                         x_neg = _make_negatives(
@@ -3627,7 +3519,6 @@ def main() -> int:
         time_fwd_neg_epoch = timing_totals["forward_neg"] / batches if batches else 0.0
         time_loss_epoch = timing_totals["loss_terms"] / batches if batches else 0.0
         time_opt_epoch = timing_totals["optimizer"] / batches if batches else 0.0
-        time_econ_epoch = timing_totals["econ_eval"] / batches if batches else 0.0
         epoch_loss = total_loss / batches if batches else 0.0
         epoch_pos = total_pos / batches if batches else 0.0
         epoch_neg = total_neg / batches if batches else 0.0
@@ -3759,7 +3650,7 @@ def main() -> int:
                     f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f},"
                     f"{rank_aux_epoch:.6f},"
                     f"{time_neg_gen_epoch:.6f},{time_hall_epoch:.6f},{time_fwd_pos_epoch:.6f},{time_fwd_neg_epoch:.6f},"
-                    f"{time_loss_epoch:.6f},{time_opt_epoch:.6f},{time_econ_epoch:.6f}\n"
+                    f"{time_loss_epoch:.6f},{time_opt_epoch:.6f}\n"
                 )
 
     if save_encoder:

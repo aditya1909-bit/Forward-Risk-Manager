@@ -14,7 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.ff import goodness
-from frisk.models import EnergyCritic, GCNEncoder
+from frisk.models import (
+    CompositeEnergyCritic,
+    EnergyCritic,
+    EnergyCriticEnsemble,
+    GCNEncoder,
+    SequenceEnergyCritic,
+)
 
 
 def _load_config(path: str) -> dict:
@@ -43,6 +49,111 @@ def _load_state_dict_compat(path: str):
             out[kk] = v
         return out
     return state
+
+
+def _build_critic(config: dict, hidden_dim: int, device: torch.device):
+    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
+    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
+    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
+    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
+    if critic_positive not in {"softplus", "square"}:
+        critic_positive = "softplus"
+
+    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
+    seed_base = int(config.get("seed", 7))
+    seed_stride = max(1, int(config.get("critic_ensemble_seed_stride", 1009)))
+    critics = []
+    for i in range(ensemble_size):
+        if ensemble_size > 1:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed_base + i * seed_stride)
+                member = EnergyCritic(
+                    in_dim=hidden_dim,
+                    hidden_dim=critic_hidden_dim,
+                    num_layers=critic_num_layers,
+                    dropout=critic_dropout,
+                    positive_activation=critic_positive,
+                )
+        else:
+            member = EnergyCritic(
+                in_dim=hidden_dim,
+                hidden_dim=critic_hidden_dim,
+                num_layers=critic_num_layers,
+                dropout=critic_dropout,
+                positive_activation=critic_positive,
+            )
+        critics.append(member.to(device))
+
+    if len(critics) == 1:
+        base_critic = critics[0]
+    else:
+        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
+
+    seq_enabled = bool(config.get("sequence_critic_enabled", False))
+    if not seq_enabled:
+        return base_critic
+
+    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
+    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
+    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
+    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
+    if seq_positive not in {"softplus", "square"}:
+        seq_positive = "softplus"
+    seq_weight = float(config.get("sequence_critic_weight", 0.0))
+    seq_critic = SequenceEnergyCritic(
+        in_dim=hidden_dim,
+        hidden_dim=seq_hidden,
+        num_layers=seq_layers,
+        dropout=seq_dropout,
+        positive_activation=seq_positive,
+    ).to(device)
+    return CompositeEnergyCritic(
+        base_critic=base_critic,
+        sequence_critic=seq_critic,
+        sequence_weight=seq_weight,
+    ).to(device)
+
+
+def _critic_structure_summary(config: dict, hidden_dim: int) -> str:
+    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
+    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
+    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
+    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
+    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
+    seq_enabled = bool(config.get("sequence_critic_enabled", False))
+    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
+    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
+    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
+    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
+    seq_weight = float(config.get("sequence_critic_weight", 0.0))
+    return (
+        f"hidden_dim={hidden_dim}, critic_hidden_dim={critic_hidden_dim}, "
+        f"critic_num_layers={critic_num_layers}, critic_dropout={critic_dropout}, "
+        f"critic_positive_activation={critic_positive}, critic_ensemble_size={ensemble_size}, "
+        f"sequence_critic_enabled={int(seq_enabled)}, sequence_critic_hidden_dim={seq_hidden}, "
+        f"sequence_critic_num_layers={seq_layers}, sequence_critic_dropout={seq_dropout}, "
+        f"sequence_critic_positive_activation={seq_positive}, sequence_critic_weight={seq_weight}"
+    )
+
+
+def _load_critic_checkpoint_or_raise(
+    critic: torch.nn.Module,
+    checkpoint_path: str,
+    config: dict,
+    hidden_dim: int,
+) -> None:
+    state = _load_state_dict_compat(checkpoint_path)
+    try:
+        critic.load_state_dict(state)
+    except RuntimeError as exc:
+        expected = _critic_structure_summary(config, hidden_dim=hidden_dim)
+        raise RuntimeError(
+            "Critic checkpoint load mismatch in feature_attribution. "
+            f"checkpoint={checkpoint_path}. "
+            f"expected={expected}. "
+            "Check that train.critic_* and train.sequence_critic_* settings match the checkpoint. "
+            f"original_error={exc}"
+        ) from exc
 
 
 def main() -> int:
@@ -99,14 +210,18 @@ def main() -> int:
     critic = None
     critic_path = str(args.critic_model or train_cfg.get("save_critic", "")).strip()
     if critic_path and Path(critic_path).exists():
-        critic = EnergyCritic(
-            in_dim=int(train_cfg.get("hidden_dim", 64)),
-            hidden_dim=int(train_cfg.get("critic_hidden_dim", train_cfg.get("hidden_dim", 64))),
-            num_layers=int(train_cfg.get("critic_num_layers", 2)),
-            dropout=float(train_cfg.get("critic_dropout", train_cfg.get("dropout", 0.1))),
-            positive_activation=str(train_cfg.get("critic_positive_activation", "softplus")).strip().lower(),
+        critic_hidden_dim = int(train_cfg.get("hidden_dim", 64))
+        critic = _build_critic(
+            train_cfg,
+            hidden_dim=critic_hidden_dim,
+            device=torch.device("cpu"),
         )
-        critic.load_state_dict(_load_state_dict_compat(critic_path))
+        _load_critic_checkpoint_or_raise(
+            critic=critic,
+            checkpoint_path=critic_path,
+            config=train_cfg,
+            hidden_dim=critic_hidden_dim,
+        )
         critic.eval()
 
     rng = random.Random(args.seed)

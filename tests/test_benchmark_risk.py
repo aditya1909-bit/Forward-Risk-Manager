@@ -144,6 +144,79 @@ def test_ff_sweep_aggregate_fold_rows_preserves_objective_metadata():
     assert agg["risk_head_enabled_effective"] is True
 
 
+def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
+    mod = _load_script("ff_sweep.py")
+    eval_dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+    fwd = pd.Series(
+        [0.01, -0.02, 0.015, -0.005],
+        index=pd.to_datetime(eval_dates),
+    )
+
+    cfg = {
+        "econ_enabled": True,
+        "econ_fwd_ret_1": fwd,
+        "econ_signal_window": 63,
+        "econ_signal_quantile": 0.55,
+        "econ_regime_thresholding_enabled": True,
+        "econ_regime_threshold_window": 42,
+        "econ_regime_threshold_quantile": 0.6,
+        "econ_regime_vol_window": 11,
+        "econ_regime_low_quantile": 0.2,
+        "econ_regime_high_quantile": 0.8,
+        "econ_ticker": "AUTO",
+        "econ_ticker_effective": "SPY",
+        "econ_ticker_source": "auto",
+        "econ_ticker_rows": 1024,
+    }
+
+    captured: dict[str, object] = {}
+
+    def _fake_eval(dates, scores, fwd_ret_1, **kwargs):
+        captured.update(kwargs)
+        assert len(dates) == len(scores) == len(eval_dates)
+        assert fwd_ret_1 is fwd
+        return {
+            "econ_regime_thresholding_enabled": float(kwargs["regime_thresholding_enabled"]),
+            "econ_regime_threshold_window": float(kwargs["regime_threshold_window"]),
+            "econ_regime_threshold_quantile": float(kwargs["regime_threshold_quantile"]),
+            "econ_regime_vol_window": float(kwargs["regime_vol_window"]),
+            "econ_regime_low_count": 1.0,
+            "econ_regime_mid_count": 2.0,
+            "econ_regime_high_count": 1.0,
+        }
+
+    orig_eval = mod.evaluate_goodness_strategy
+    try:
+        mod.evaluate_goodness_strategy = _fake_eval
+        out = mod._compute_econ_metrics_for_eval(
+            None,
+            None,
+            [],
+            eval_dates,
+            cfg,
+            goodness_values=[0.2, 0.4, 0.6, 0.8],
+        )
+    finally:
+        mod.evaluate_goodness_strategy = orig_eval
+
+    assert captured["regime_thresholding_enabled"] is True
+    assert int(captured["regime_threshold_window"]) == 42
+    assert float(captured["regime_threshold_quantile"]) == 0.6
+    assert int(captured["regime_vol_window"]) == 11
+    assert float(captured["regime_low_quantile"]) == 0.2
+    assert float(captured["regime_high_quantile"]) == 0.8
+
+    # Metadata + thresholded econ outputs should both be present.
+    assert out["econ_ticker_requested"] == "AUTO"
+    assert out["econ_ticker_effective"] == "SPY"
+    assert out["econ_ticker_source"] == "auto"
+    assert float(out["econ_ticker_rows"]) == 1024.0
+    assert float(out["econ_regime_thresholding_enabled"]) == 1.0
+    assert float(out["econ_regime_threshold_window"]) == 42.0
+    assert float(out["econ_regime_threshold_quantile"]) == 0.6
+    assert float(out["econ_regime_vol_window"]) == 11.0
+
+
 def test_baseline_context_includes_seed_split_device_and_sizes():
     mod = _load_script("benchmark_training.py")
     cfg = {"seed": 11, "split_mode": "chronological", "batch_size": 32, "eval_frac": 0.2}

@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import contextlib
-import hashlib
-import math
 import random
 import time
 from pathlib import Path
@@ -59,6 +57,10 @@ from frisk.econ_eval import (
     infer_graph_goodness_with_uncertainty,
     load_forward_returns_from_prices,
     resolve_price_ticker,
+)
+from frisk.targets import (
+    compute_forward_return_targets_cached,
+    compute_risk_targets_cached,
 )
 
 _NEG_AUG_MODES = {
@@ -115,136 +117,16 @@ def _compute_risk_targets(
     max_abs_logret: float,
     cache_dir: str | None = "runs/cache",
 ) -> tuple[list[float | None], float, float]:
-    prices_file = Path(prices_path)
-    try:
-        st = prices_file.stat()
-        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
-    except OSError:
-        file_sig = "missing"
-    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
-    cache_key = hashlib.sha1(
-        "|".join(
-            [
-                str(prices_file.resolve()),
-                str(ticker).upper(),
-                str(horizon),
-                str(int(bool(standardize))),
-                f"{float(max_abs_logret):.8f}",
-                file_sig,
-                dates_hash,
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
-
-    cached = _RISK_TARGET_MEM_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    cache_path: Path | None = None
-    if cache_dir:
-        cache_path = Path(cache_dir) / f"risk_targets_{cache_key}.pt"
-        if cache_path.exists():
-            try:
-                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                targets = payload["targets"]
-                mean = float(payload["mean"])
-                std = float(payload["std"])
-                result = (targets, mean, std)
-                _RISK_TARGET_MEM_CACHE[cache_key] = result
-                return result
-            except Exception:
-                pass
-
-    prices_by_date: dict[str, list[float]] = {}
-    ticker_norm = str(ticker).upper()
-    with Path(prices_path).open() as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError("prices.csv missing header")
-        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
-        for row in r:
-            if str(row.get("ticker", "")).upper() != ticker_norm:
-                continue
-            date = row.get("date")
-            if not date:
-                continue
-            val = row.get(price_col, "")
-            if not val:
-                continue
-            try:
-                price = float(val)
-            except ValueError:
-                continue
-            if not math.isfinite(price) or price <= 0:
-                continue
-            prices_by_date.setdefault(date, []).append(price)
-    prices: list[tuple[str, float]] = []
-    for date, vals in prices_by_date.items():
-        if not vals:
-            continue
-        vals_sorted = sorted(vals)
-        mid = len(vals_sorted) // 2
-        if len(vals_sorted) % 2 == 1:
-            px = vals_sorted[mid]
-        else:
-            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
-        prices.append((date, float(px)))
-    if not prices:
-        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
-
-    prices.sort(key=lambda x: x[0])
-    date_list = [d for d, _ in prices]
-    price_list = [p for _, p in prices]
-    returns = []
-    clip = float(max_abs_logret)
-    for i in range(len(price_list) - 1):
-        if price_list[i] <= 0 or price_list[i + 1] <= 0:
-            returns.append(0.0)
-            continue
-        ret = math.log(price_list[i + 1] / price_list[i])
-        if clip > 0 and abs(ret) > clip:
-            ret = math.copysign(clip, ret)
-        returns.append(ret)
-    idx_map = {d: i for i, d in enumerate(date_list)}
-
-    targets: list[float | None] = []
-    for d in dates:
-        idx = idx_map.get(d)
-        if idx is None:
-            targets.append(None)
-            continue
-        if idx + horizon > len(returns):
-            targets.append(None)
-            continue
-        window = returns[idx : idx + horizon]
-        if not window:
-            targets.append(None)
-            continue
-        mean = sum(window) / len(window)
-        var = sum((x - mean) ** 2 for x in window) / len(window)
-        vol = math.sqrt(var)
-        targets.append(vol)
-
-    finite = [t for t in targets if t is not None]
-    if not finite:
-        result = (targets, 0.0, 1.0)
-        _RISK_TARGET_MEM_CACHE[cache_key] = result
-        return result
-    mean = sum(finite) / len(finite)
-    var = sum((x - mean) ** 2 for x in finite) / len(finite)
-    std = math.sqrt(var) if var > 0 else 1.0
-
-    if standardize:
-        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
-    result = (targets, mean, std)
-    _RISK_TARGET_MEM_CACHE[cache_key] = result
-    if cache_path is not None:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
-        except Exception:
-            pass
-    return result
+    return compute_risk_targets_cached(
+        prices_path=prices_path,
+        ticker=ticker,
+        dates=dates,
+        horizon=horizon,
+        standardize=standardize,
+        max_abs_logret=max_abs_logret,
+        cache_dir=cache_dir,
+        mem_cache=_RISK_TARGET_MEM_CACHE,
+    )
 
 
 def _compute_forward_return_targets(
@@ -256,136 +138,16 @@ def _compute_forward_return_targets(
     max_abs_logret: float,
     cache_dir: str | None = "runs/cache",
 ) -> tuple[list[float | None], float, float]:
-    prices_file = Path(prices_path)
-    try:
-        st = prices_file.stat()
-        file_sig = f"{st.st_mtime_ns}:{st.st_size}"
-    except OSError:
-        file_sig = "missing"
-    dates_hash = hashlib.sha1("\n".join(dates).encode("utf-8")).hexdigest()
-    cache_key = hashlib.sha1(
-        "|".join(
-            [
-                "portfolio_targets",
-                str(prices_file.resolve()),
-                str(ticker).upper(),
-                str(horizon),
-                str(int(bool(standardize))),
-                f"{float(max_abs_logret):.8f}",
-                file_sig,
-                dates_hash,
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
-
-    cached = _PORT_TARGET_MEM_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    cache_path: Path | None = None
-    if cache_dir:
-        cache_path = Path(cache_dir) / f"portfolio_targets_{cache_key}.pt"
-        if cache_path.exists():
-            try:
-                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                targets = payload["targets"]
-                mean = float(payload["mean"])
-                std = float(payload["std"])
-                result = (targets, mean, std)
-                _PORT_TARGET_MEM_CACHE[cache_key] = result
-                return result
-            except Exception:
-                pass
-
-    prices_by_date: dict[str, list[float]] = {}
-    ticker_norm = str(ticker).upper()
-    with Path(prices_path).open() as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError("prices.csv missing header")
-        price_col = "adj_close" if "adj_close" in r.fieldnames else "close"
-        for row in r:
-            if str(row.get("ticker", "")).upper() != ticker_norm:
-                continue
-            date = row.get("date")
-            if not date:
-                continue
-            val = row.get(price_col, "")
-            if not val:
-                continue
-            try:
-                price = float(val)
-            except ValueError:
-                continue
-            if not math.isfinite(price) or price <= 0:
-                continue
-            prices_by_date.setdefault(date, []).append(price)
-    prices: list[tuple[str, float]] = []
-    for date, vals in prices_by_date.items():
-        if not vals:
-            continue
-        vals_sorted = sorted(vals)
-        mid = len(vals_sorted) // 2
-        if len(vals_sorted) % 2 == 1:
-            px = vals_sorted[mid]
-        else:
-            px = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
-        prices.append((date, float(px)))
-    if not prices:
-        raise ValueError(f"No prices found for ticker {ticker} in {prices_path}")
-
-    prices.sort(key=lambda x: x[0])
-    date_list = [d for d, _ in prices]
-    price_list = [p for _, p in prices]
-    log_returns = []
-    clip = float(max_abs_logret)
-    for i in range(len(price_list) - 1):
-        if price_list[i] <= 0 or price_list[i + 1] <= 0:
-            log_returns.append(0.0)
-            continue
-        ret = math.log(price_list[i + 1] / price_list[i])
-        if clip > 0 and abs(ret) > clip:
-            ret = math.copysign(clip, ret)
-        log_returns.append(ret)
-    idx_map = {d: i for i, d in enumerate(date_list)}
-
-    targets: list[float | None] = []
-    horizon = max(1, int(horizon))
-    for d in dates:
-        idx = idx_map.get(d)
-        if idx is None:
-            targets.append(None)
-            continue
-        if idx + horizon > len(log_returns):
-            targets.append(None)
-            continue
-        window = log_returns[idx : idx + horizon]
-        if not window:
-            targets.append(None)
-            continue
-        cum_log = float(sum(window))
-        targets.append(float(math.exp(cum_log) - 1.0))
-
-    finite = [t for t in targets if t is not None]
-    if not finite:
-        result = (targets, 0.0, 1.0)
-        _PORT_TARGET_MEM_CACHE[cache_key] = result
-        return result
-    mean = sum(finite) / len(finite)
-    var = sum((x - mean) ** 2 for x in finite) / len(finite)
-    std = math.sqrt(var) if var > 0 else 1.0
-
-    if standardize:
-        targets = [((t - mean) / (std + 1e-6)) if t is not None else None for t in targets]
-    result = (targets, mean, std)
-    _PORT_TARGET_MEM_CACHE[cache_key] = result
-    if cache_path is not None:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"targets": targets, "mean": mean, "std": std}, cache_path)
-        except Exception:
-            pass
-    return result
+    return compute_forward_return_targets_cached(
+        prices_path=prices_path,
+        ticker=ticker,
+        dates=dates,
+        horizon=horizon,
+        standardize=standardize,
+        max_abs_logret=max_abs_logret,
+        cache_dir=cache_dir,
+        mem_cache=_PORT_TARGET_MEM_CACHE,
+    )
 
 
 def _compute_portfolio_head_loss(
@@ -993,17 +755,31 @@ def _make_negatives(
                 edge_index,
                 edge_weight=edge_weight,
             )
-        out_h = hallucinate_negative(
-            model,
-            x,
-            edge_index,
-            edge_attr,
-            batch,
-            hall_cfg,
-            edge_weight=edge_weight,
-            forward_fn=hall_forward,
-            critic=critic,
-        )
+        if x.device.type == "cuda":
+            with torch.autocast(device_type="cuda", enabled=False):
+                out_h = hallucinate_negative(
+                    model,
+                    x,
+                    edge_index,
+                    edge_attr,
+                    batch,
+                    hall_cfg,
+                    edge_weight=edge_weight,
+                    forward_fn=hall_forward,
+                    critic=critic,
+                )
+        else:
+            out_h = hallucinate_negative(
+                model,
+                x,
+                edge_index,
+                edge_attr,
+                batch,
+                hall_cfg,
+                edge_weight=edge_weight,
+                forward_fn=hall_forward,
+                critic=critic,
+            )
         return _finish(out_h)
     if window_len is not None and int(window_len) > 0:
         if summary_dim >= 10:
@@ -1053,6 +829,8 @@ def _make_self_contrastive_view(
         "block_bootstrap",
         "cross_asset_mix",
         "phase_randomize",
+        "sector_swap",
+        "factor_hard",
     }
     if mode not in valid_modes:
         raise ValueError(
@@ -1690,7 +1468,7 @@ def _benchmark_ff(
                 if epoch <= hall_warmup_epochs or (batch_idx % hall_every_n_batches) != 0:
                     use_mode = "shuffle+noise"
             apply_distance = dist_weight > 0 and (batch_idx % dist_interval == 0)
-            step_scaler = scaler if (amp_enabled and (use_mode == "self_contrastive" or layerwise)) else None
+            step_scaler = scaler if amp_enabled else None
             batch_t0 = time.perf_counter()
             comp_before = component_times.copy()
 
