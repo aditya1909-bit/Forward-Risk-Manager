@@ -209,3 +209,43 @@ def test_evaluate_goodness_strategy_regime_thresholding_outputs_stats():
     assert out_on["econ_regime_mid_count"] > 0
     assert out_on["econ_regime_high_count"] > 0
     assert np.isfinite(out_on["econ_strategy_ann_return"])
+
+
+def test_evaluate_goodness_strategy_signal_polarity_low_and_auto():
+    dates = pd.date_range("2022-01-01", periods=120, freq="D")
+    goodness = np.linspace(-1.0, 1.0, num=120)
+    # Goodness is intentionally anti-correlated with future returns.
+    fwd = pd.Series(np.where(goodness < 0.0, 0.01, -0.01), index=dates)
+
+    out_high = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=30,
+        signal_quantile=0.5,
+        signal_polarity="high",
+        turnover_cost_bps=0.0,
+    )
+    out_low = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=30,
+        signal_quantile=0.5,
+        signal_polarity="low",
+        turnover_cost_bps=0.0,
+    )
+    out_auto = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=30,
+        signal_quantile=0.5,
+        signal_polarity="auto",
+        turnover_cost_bps=0.0,
+    )
+
+    assert out_low["econ_strategy_sharpe"] > out_high["econ_strategy_sharpe"]
+    assert out_auto["econ_signal_polarity_requested"] == "auto"
+    assert out_auto["econ_signal_polarity_effective"] == "low"
+    assert out_auto["econ_strategy_sharpe"] >= out_low["econ_strategy_sharpe"] - 1e-9

@@ -157,6 +157,7 @@ def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
         "econ_fwd_ret_1": fwd,
         "econ_signal_window": 63,
         "econ_signal_quantile": 0.55,
+        "econ_signal_polarity": "low",
         "econ_regime_thresholding_enabled": True,
         "econ_regime_threshold_window": 42,
         "econ_regime_threshold_quantile": 0.6,
@@ -202,6 +203,7 @@ def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
     assert captured["regime_thresholding_enabled"] is True
     assert int(captured["regime_threshold_window"]) == 42
     assert float(captured["regime_threshold_quantile"]) == 0.6
+    assert str(captured["signal_polarity"]) == "low"
     assert int(captured["regime_vol_window"]) == 11
     assert float(captured["regime_low_quantile"]) == 0.2
     assert float(captured["regime_high_quantile"]) == 0.8

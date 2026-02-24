@@ -1113,6 +1113,7 @@ def _compute_econ_metrics_for_eval(
         fwd_ret_1=fwd_ret_1,
         signal_window=int(cfg.get("econ_signal_window", 126)),
         signal_quantile=float(cfg.get("econ_signal_quantile", 0.5)),
+        signal_polarity=str(cfg.get("econ_signal_polarity", "high")),
         turnover_cost_bps=float(cfg.get("econ_turnover_cost_bps", 0.0)),
         slippage_bps=float(cfg.get("econ_slippage_bps", 0.0)),
         slippage_vol_scale=float(cfg.get("econ_slippage_vol_scale", 0.0)),
@@ -2158,6 +2159,7 @@ def main() -> int:
         "econ_max_abs_logret": float(sweep_cfg.get("econ_max_abs_logret", 0.5)),
         "econ_signal_window": int(sweep_cfg.get("econ_signal_window", 126)),
         "econ_signal_quantile": float(sweep_cfg.get("econ_signal_quantile", 0.5)),
+        "econ_signal_polarity": str(sweep_cfg.get("econ_signal_polarity", "high")),
         "econ_turnover_cost_bps": float(sweep_cfg.get("econ_turnover_cost_bps", 0.0)),
         "econ_slippage_bps": float(sweep_cfg.get("econ_slippage_bps", 0.0)),
         "econ_slippage_vol_scale": float(sweep_cfg.get("econ_slippage_vol_scale", 0.0)),
@@ -2508,6 +2510,7 @@ def main() -> int:
         "econ_regime_vol_window",
         "econ_regime_low_quantile",
         "econ_regime_high_quantile",
+        "econ_signal_polarity",
         "residual_edge_weight_enabled",
         "residual_edge_hidden_dim",
         "residual_edge_max_delta",
@@ -2907,10 +2910,14 @@ def main() -> int:
 
             if finance_rank and np.isfinite(rank_gate_floor):
                 floor_metric = _to_float(r.get("econ_sharpe_uplift_min"), float("nan"))
+                floor_metric_name = "econ_sharpe_uplift_min"
+                if not np.isfinite(floor_metric):
+                    floor_metric = _to_float(r.get("econ_sharpe_uplift"), float("nan"))
+                    floor_metric_name = "econ_sharpe_uplift"
                 if np.isfinite(floor_metric) and floor_metric < rank_gate_floor:
                     gate_failed = True
-                    gate_reasons.append("econ_sharpe_uplift_min")
-                    r["rank_gate_metric"] = "econ_sharpe_uplift_min"
+                    gate_reasons.append(floor_metric_name)
+                    r["rank_gate_metric"] = floor_metric_name
                     r["rank_gate_floor"] = float(rank_gate_floor)
                     r["rank_gate_value"] = float(floor_metric)
             if finance_rank and np.isfinite(sep_gate_floor):

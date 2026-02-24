@@ -297,6 +297,7 @@ def evaluate_goodness_strategy(
     fwd_ret_1: pd.Series,
     signal_window: int = 126,
     signal_quantile: float = 0.5,
+    signal_polarity: str = "high",
     turnover_cost_bps: float = 0.0,
     slippage_bps: float = 0.0,
     slippage_vol_scale: float = 0.0,
@@ -317,7 +318,10 @@ def evaluate_goodness_strategy(
     regime_vol_window: int = 21,
     regime_low_quantile: float = 0.33,
     regime_high_quantile: float = 0.67,
-) -> dict[str, float]:
+) -> dict[str, float | str]:
+    polarity_requested = str(signal_polarity or "high").strip().lower()
+    if polarity_requested not in {"high", "low", "auto"}:
+        polarity_requested = "high"
     out = {
         "econ_num_days": 0.0,
         "econ_bh_total_return": float("nan"),
@@ -352,6 +356,8 @@ def evaluate_goodness_strategy(
         "econ_avg_cost_bps_applied": float("nan"),
         "econ_signal_window": float(signal_window),
         "econ_signal_quantile": float(signal_quantile),
+        "econ_signal_polarity_requested": polarity_requested,
+        "econ_signal_polarity_effective": "high",
         "econ_turnover_cost_bps": float(turnover_cost_bps),
         "econ_slippage_bps": float(slippage_bps),
         "econ_slippage_vol_scale": float(slippage_vol_scale),
@@ -441,9 +447,11 @@ def evaluate_goodness_strategy(
         out["econ_regime_mid_count"] = float(np.sum(regimes == 1))
         out["econ_regime_high_count"] = float(np.sum(regimes == 2))
 
-    signal = (df["goodness"].to_numpy(dtype=float) >= roll_q_eff).astype(float)
-    signal = pd.Series(signal).fillna(1.0)
-    exposure = signal.to_numpy(dtype=float)
+    signal_high = (df["goodness"].to_numpy(dtype=float) >= roll_q_eff).astype(float)
+    signal_high = pd.Series(signal_high).fillna(1.0).to_numpy(dtype=float)
+    signal_low = 1.0 - signal_high
+    exposure_high = np.asarray(signal_high, dtype=float)
+    exposure_low = np.asarray(signal_low, dtype=float)
 
     if bool(regime_gate_enabled):
         rgw = max(10, int(regime_gate_window))
@@ -477,13 +485,11 @@ def evaluate_goodness_strategy(
         if min_conf > 0:
             conf = np.where(conf >= min_conf, conf, 0.0)
         neutral = float(np.clip(regime_neutral_exposure, -1.0, 1.0))
-        exposure = conf * exposure + (1.0 - conf) * neutral
+        exposure_high = conf * exposure_high + (1.0 - conf) * neutral
+        exposure_low = conf * exposure_low + (1.0 - conf) * neutral
         out["econ_regime_confidence_mean"] = float(np.nanmean(conf)) if conf.size else float("nan")
-        out["econ_regime_exposure_mean"] = float(np.nanmean(exposure)) if exposure.size else float("nan")
 
     bench_ret_1 = df["fwd_ret_1"].to_numpy(dtype=float)
-    strat_ret_1 = exposure * bench_ret_1
-    turnover = pd.Series(exposure).diff().abs().fillna(0.0).to_numpy(dtype=float)
     base_cost_bps = max(0.0, float(turnover_cost_bps))
     slip_bps = max(0.0, float(slippage_bps))
     slip_scale = max(0.0, float(slippage_vol_scale))
@@ -498,11 +504,34 @@ def evaluate_goodness_strategy(
     # slippage_vol_scale is interpreted as additional bps per 1% daily rolling vol.
     slip_curve_bps = slip_bps + (slip_scale * (100.0 * np.maximum(0.0, roll_vol)))
     total_cost_rate = (base_cost_bps + slip_curve_bps) * 1e-4
-    if np.any(total_cost_rate > 0):
-        strat_ret_1 = strat_ret_1 - total_cost_rate * turnover
+
+    def _strategy_for_exposure(exposure: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        strat_ret_1 = exposure * bench_ret_1
+        turnover = pd.Series(exposure).diff().abs().fillna(0.0).to_numpy(dtype=float)
+        if np.any(total_cost_rate > 0):
+            strat_ret_1 = strat_ret_1 - total_cost_rate * turnover
+        st = strategy_stats("goodness_risk_on_off", strat_ret_1, trading_days=trading_days)
+        return exposure, strat_ret_1, turnover, st
 
     bh = strategy_stats("benchmark_buy_and_hold", bench_ret_1, trading_days=trading_days)
-    st = strategy_stats("goodness_risk_on_off", strat_ret_1, trading_days=trading_days)
+    candidates: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, dict]] = {
+        "high": _strategy_for_exposure(exposure_high),
+        "low": _strategy_for_exposure(exposure_low),
+    }
+    effective = polarity_requested
+    if polarity_requested == "auto":
+        high_sharpe = float(candidates["high"][3].get("sharpe", float("nan")))
+        low_sharpe = float(candidates["low"][3].get("sharpe", float("nan")))
+        if np.isfinite(low_sharpe) and (not np.isfinite(high_sharpe) or low_sharpe > high_sharpe):
+            effective = "low"
+        else:
+            effective = "high"
+    elif polarity_requested not in candidates:
+        effective = "high"
+
+    exposure, strat_ret_1, turnover, st = candidates[effective]
+    out["econ_signal_polarity_effective"] = effective
+    out["econ_regime_exposure_mean"] = float(np.nanmean(exposure)) if exposure.size else float("nan")
     out.update(
         {
             "econ_num_days": float(st["num_days"]),
