@@ -298,6 +298,8 @@ def evaluate_goodness_strategy(
     signal_window: int = 126,
     signal_quantile: float = 0.5,
     signal_polarity: str = "high",
+    oos_folds: int = 4,
+    oos_min_fold_days: int = 63,
     turnover_cost_bps: float = 0.0,
     slippage_bps: float = 0.0,
     slippage_vol_scale: float = 0.0,
@@ -358,6 +360,13 @@ def evaluate_goodness_strategy(
         "econ_signal_quantile": float(signal_quantile),
         "econ_signal_polarity_requested": polarity_requested,
         "econ_signal_polarity_effective": "high",
+        "econ_oos_folds_requested": float(max(1, int(oos_folds))),
+        "econ_oos_folds_used": 0.0,
+        "econ_oos_min_fold_days": float(max(10, int(oos_min_fold_days))),
+        "econ_oos_sharpe_uplift_mean": float("nan"),
+        "econ_oos_sharpe_uplift_min": float("nan"),
+        "econ_oos_ann_return_uplift_mean": float("nan"),
+        "econ_oos_ann_return_uplift_min": float("nan"),
         "econ_turnover_cost_bps": float(turnover_cost_bps),
         "econ_slippage_bps": float(slippage_bps),
         "econ_slippage_vol_scale": float(slippage_vol_scale),
@@ -578,4 +587,52 @@ def evaluate_goodness_strategy(
             "econ_slippage_vol_lookback": float(vol_lb),
         }
     )
+
+    valid_mask = np.isfinite(strat_ret_1) & np.isfinite(bench_ret_1)
+    strat_valid = np.asarray(strat_ret_1[valid_mask], dtype=float)
+    bench_valid = np.asarray(bench_ret_1[valid_mask], dtype=float)
+    requested_folds = max(1, int(oos_folds))
+    min_fold_days = max(10, int(oos_min_fold_days))
+    out["econ_oos_folds_requested"] = float(requested_folds)
+    out["econ_oos_min_fold_days"] = float(min_fold_days)
+    if requested_folds >= 2 and strat_valid.size >= 2 * min_fold_days:
+        max_folds = int(strat_valid.size // min_fold_days)
+        use_folds = max(2, min(requested_folds, max_folds))
+        base_fold_size = int(strat_valid.size // use_folds)
+        remainder = int(strat_valid.size % use_folds)
+        start = 0
+        used_folds = 0
+        sharpe_uplifts: list[float] = []
+        ann_uplifts: list[float] = []
+        for fold_idx in range(use_folds):
+            fold_size = base_fold_size + (1 if fold_idx < remainder else 0)
+            end = start + fold_size
+            if fold_size < min_fold_days:
+                start = end
+                continue
+            st_fold = strategy_stats(
+                f"goodness_risk_on_off_fold_{fold_idx}",
+                strat_valid[start:end],
+                trading_days=trading_days,
+            )
+            bh_fold = strategy_stats(
+                f"benchmark_buy_and_hold_fold_{fold_idx}",
+                bench_valid[start:end],
+                trading_days=trading_days,
+            )
+            sharpe_u = _nan_sub(float(st_fold["sharpe"]), float(bh_fold["sharpe"]))
+            ann_u = _nan_sub(float(st_fold["ann_return"]), float(bh_fold["ann_return"]))
+            if np.isfinite(sharpe_u):
+                sharpe_uplifts.append(float(sharpe_u))
+            if np.isfinite(ann_u):
+                ann_uplifts.append(float(ann_u))
+            used_folds += 1
+            start = end
+        out["econ_oos_folds_used"] = float(used_folds)
+        if sharpe_uplifts:
+            out["econ_oos_sharpe_uplift_mean"] = float(np.mean(sharpe_uplifts))
+            out["econ_oos_sharpe_uplift_min"] = float(np.min(sharpe_uplifts))
+        if ann_uplifts:
+            out["econ_oos_ann_return_uplift_mean"] = float(np.mean(ann_uplifts))
+            out["econ_oos_ann_return_uplift_min"] = float(np.min(ann_uplifts))
     return out

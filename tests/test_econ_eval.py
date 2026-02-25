@@ -249,3 +249,28 @@ def test_evaluate_goodness_strategy_signal_polarity_low_and_auto():
     assert out_auto["econ_signal_polarity_requested"] == "auto"
     assert out_auto["econ_signal_polarity_effective"] == "low"
     assert out_auto["econ_strategy_sharpe"] >= out_low["econ_strategy_sharpe"] - 1e-9
+
+
+def test_evaluate_goodness_strategy_reports_oos_fold_uplifts():
+    dates = pd.date_range("2021-01-01", periods=240, freq="D")
+    goodness = np.sin(np.linspace(0, 20, num=240))
+    fwd = pd.Series(np.where(goodness >= 0.0, 0.012, -0.006), index=dates)
+
+    out = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=40,
+        signal_quantile=0.5,
+        signal_polarity="high",
+        oos_folds=4,
+        oos_min_fold_days=40,
+        turnover_cost_bps=0.0,
+    )
+
+    assert int(out["econ_oos_folds_requested"]) == 4
+    assert int(out["econ_oos_min_fold_days"]) == 40
+    assert out["econ_oos_folds_used"] >= 2
+    assert np.isfinite(out["econ_oos_sharpe_uplift_mean"])
+    assert np.isfinite(out["econ_oos_sharpe_uplift_min"])
+    assert out["econ_oos_sharpe_uplift_min"] <= out["econ_oos_sharpe_uplift_mean"] + 1e-9

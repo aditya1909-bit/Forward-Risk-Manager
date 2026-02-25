@@ -236,6 +236,8 @@ def main() -> int:
             f"{best_econ['mode']} (econ_sharpe_uplift={_fmt(best_econ['econ_sharpe_uplift'], 3)}, "
             f"econ_ann_return_uplift={_fmt_pct(best_econ['econ_ann_return_uplift'])})"
         )
+    else:
+        print("best_econ_mode: unavailable (econ metrics are missing or NaN)")
 
     if fold_summary:
         print("")
@@ -246,16 +248,25 @@ def main() -> int:
         out_md = Path(args.out_md)
         out_md.parent.mkdir(parents=True, exist_ok=True)
         lines = ["# Paper Benchmark Summary", "", f"Source: `{benchmark_path}`", "", md]
+        key_points = []
         if fastest:
-            lines.extend(
-                [
-                    "",
-                    "## Key Points",
-                    f"- Fastest: `{fastest['mode']}` ({_fmt(fastest['graphs_per_s'], 1)} graphs/s).",
-                    f"- Best quality: `{best_quality['mode']}` ({best_quality['quality_metric']}={_fmt(best_quality['quality_value'])}).",
-                    f"- Best economics: `{best_econ['mode']}` (Sharpe uplift={_fmt(best_econ['econ_sharpe_uplift'], 3)}, ann return uplift={_fmt_pct(best_econ['econ_ann_return_uplift'])}).",
-                ]
+            key_points.append(
+                f"- Fastest: `{fastest['mode']}` ({_fmt(fastest['graphs_per_s'], 1)} graphs/s)."
             )
+        if best_quality:
+            key_points.append(
+                f"- Best quality: `{best_quality['mode']}` ({best_quality['quality_metric']}={_fmt(best_quality['quality_value'])})."
+            )
+        if best_econ:
+            key_points.append(
+                f"- Best economics: `{best_econ['mode']}` (Sharpe uplift={_fmt(best_econ['econ_sharpe_uplift'], 3)}, ann return uplift={_fmt_pct(best_econ['econ_ann_return_uplift'])})."
+            )
+        else:
+            key_points.append(
+                "- Best economics: unavailable (econ metrics are missing or NaN)."
+            )
+        if key_points:
+            lines.extend(["", "## Key Points", *key_points])
         out_md.write_text("\n".join(lines) + "\n")
 
     if args.out_csv:

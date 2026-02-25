@@ -158,6 +158,8 @@ def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
         "econ_signal_window": 63,
         "econ_signal_quantile": 0.55,
         "econ_signal_polarity": "low",
+        "econ_oos_folds": 5,
+        "econ_oos_min_fold_days": 21,
         "econ_regime_thresholding_enabled": True,
         "econ_regime_threshold_window": 42,
         "econ_regime_threshold_quantile": 0.6,
@@ -204,6 +206,8 @@ def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
     assert int(captured["regime_threshold_window"]) == 42
     assert float(captured["regime_threshold_quantile"]) == 0.6
     assert str(captured["signal_polarity"]) == "low"
+    assert int(captured["oos_folds"]) == 5
+    assert int(captured["oos_min_fold_days"]) == 21
     assert int(captured["regime_vol_window"]) == 11
     assert float(captured["regime_low_quantile"]) == 0.2
     assert float(captured["regime_high_quantile"]) == 0.8
@@ -217,6 +221,40 @@ def test_ff_sweep_econ_metrics_passes_regime_threshold_controls():
     assert float(out["econ_regime_threshold_window"]) == 42.0
     assert float(out["econ_regime_threshold_quantile"]) == 0.6
     assert float(out["econ_regime_vol_window"]) == 11.0
+
+
+def test_ff_sweep_finance_rank_prefers_oos_metrics():
+    mod = _load_script("ff_sweep.py")
+    row = {
+        "eval_objective": "ff",
+        "econ_sharpe_uplift": 0.42,
+        "econ_oos_sharpe_uplift_min": 0.11,
+        "econ_oos_sharpe_uplift_mean": 0.2,
+    }
+    metric, value = mod._objective_rank_metric(row, rank_mode="finance_first")
+    assert metric == "econ_oos_sharpe_uplift_min"
+    assert float(value) == 0.11
+
+
+def test_ff_sweep_finance_floor_metric_falls_back_from_oos_to_in_sample():
+    mod = _load_script("ff_sweep.py")
+    metric_1, value_1 = mod._finance_floor_metric(
+        {
+            "econ_oos_sharpe_uplift_min": 0.15,
+            "econ_sharpe_uplift_min": 0.25,
+        }
+    )
+    assert metric_1 == "econ_oos_sharpe_uplift_min"
+    assert float(value_1) == 0.15
+
+    metric_2, value_2 = mod._finance_floor_metric(
+        {
+            "econ_sharpe_uplift_min": 0.25,
+            "econ_sharpe_uplift": 0.3,
+        }
+    )
+    assert metric_2 == "econ_sharpe_uplift_min"
+    assert float(value_2) == 0.25
 
 
 def test_ff_sweep_build_econ_payload_falls_back_to_inference(monkeypatch):

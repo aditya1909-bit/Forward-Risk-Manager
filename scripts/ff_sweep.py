@@ -340,6 +340,10 @@ def _objective_rank_metric(result: dict, rank_mode: str = "objective") -> tuple[
     mode = str(rank_mode).strip().lower()
     if mode in {"finance_first", "economic", "econ"}:
         for key in (
+            "econ_oos_sharpe_uplift_min",
+            "econ_oos_sharpe_uplift_mean",
+            "econ_oos_ann_return_uplift_min",
+            "econ_oos_ann_return_uplift_mean",
             "econ_sharpe_uplift",
             "econ_ann_return_uplift",
             "econ_strategy_sharpe",
@@ -373,6 +377,19 @@ def _objective_rank_metric(result: dict, rank_mode: str = "objective") -> tuple[
     if np.isfinite(_to_float(result.get("eval_auroc"))):
         return "eval_auroc", _to_float(result.get("eval_auroc"), 0.0)
     return "eval_acc", _to_float(result.get("eval_acc"), 0.0)
+
+
+def _finance_floor_metric(result: dict) -> tuple[str, float]:
+    for key in (
+        "econ_oos_sharpe_uplift_min",
+        "econ_oos_sharpe_uplift_mean",
+        "econ_sharpe_uplift_min",
+        "econ_sharpe_uplift",
+    ):
+        val = _to_float(result.get(key))
+        if np.isfinite(val):
+            return key, val
+    return "econ_oos_sharpe_uplift_min", float("nan")
 
 
 def _objective_track(objective: str) -> str:
@@ -1114,6 +1131,8 @@ def _compute_econ_metrics_for_eval(
         signal_window=int(cfg.get("econ_signal_window", 126)),
         signal_quantile=float(cfg.get("econ_signal_quantile", 0.5)),
         signal_polarity=str(cfg.get("econ_signal_polarity", "high")),
+        oos_folds=int(cfg.get("econ_oos_folds", 4)),
+        oos_min_fold_days=int(cfg.get("econ_oos_min_fold_days", 63)),
         turnover_cost_bps=float(cfg.get("econ_turnover_cost_bps", 0.0)),
         slippage_bps=float(cfg.get("econ_slippage_bps", 0.0)),
         slippage_vol_scale=float(cfg.get("econ_slippage_vol_scale", 0.0)),
@@ -2160,6 +2179,8 @@ def main() -> int:
         "econ_signal_window": int(sweep_cfg.get("econ_signal_window", 126)),
         "econ_signal_quantile": float(sweep_cfg.get("econ_signal_quantile", 0.5)),
         "econ_signal_polarity": str(sweep_cfg.get("econ_signal_polarity", "high")),
+        "econ_oos_folds": int(sweep_cfg.get("econ_oos_folds", 4)),
+        "econ_oos_min_fold_days": int(sweep_cfg.get("econ_oos_min_fold_days", 63)),
         "econ_turnover_cost_bps": float(sweep_cfg.get("econ_turnover_cost_bps", 0.0)),
         "econ_slippage_bps": float(sweep_cfg.get("econ_slippage_bps", 0.0)),
         "econ_slippage_vol_scale": float(sweep_cfg.get("econ_slippage_vol_scale", 0.0)),
@@ -2275,6 +2296,7 @@ def main() -> int:
         "rank_mode",
         "stability_penalty",
         "stability_penalty_lambda",
+        "econ_oos_sharpe_uplift_min_floor",
         "econ_sharpe_uplift_min_floor",
         "finance_sep_gate_metric",
         "finance_sep_gate_floor",
@@ -2289,6 +2311,8 @@ def main() -> int:
         "econ_max_abs_logret",
         "econ_signal_window",
         "econ_signal_quantile",
+        "econ_oos_folds",
+        "econ_oos_min_fold_days",
         "econ_turnover_cost_bps",
         "econ_slippage_bps",
         "econ_slippage_vol_scale",
@@ -2510,6 +2534,8 @@ def main() -> int:
         "econ_regime_vol_window",
         "econ_regime_low_quantile",
         "econ_regime_high_quantile",
+        "econ_oos_folds",
+        "econ_oos_min_fold_days",
         "econ_signal_polarity",
         "residual_edge_weight_enabled",
         "residual_edge_hidden_dim",
@@ -2858,7 +2884,13 @@ def main() -> int:
         finance_rank = rank_mode_norm in {"finance_first", "economic", "econ"}
         stability_penalty = bool(sweep_cfg.get("stability_penalty", finance_rank))
         stability_lambda = max(0.0, float(sweep_cfg.get("stability_penalty_lambda", 0.5)))
-        rank_gate_floor = _to_float(sweep_cfg.get("econ_sharpe_uplift_min_floor"), float("nan"))
+        rank_gate_floor = _to_float(
+            sweep_cfg.get(
+                "econ_oos_sharpe_uplift_min_floor",
+                sweep_cfg.get("econ_sharpe_uplift_min_floor"),
+            ),
+            float("nan"),
+        )
         sep_gate_metric = str(
             sweep_cfg.get("finance_sep_gate_metric", "eval_sep_agg_min")
         ).strip() or "eval_sep_agg_min"
@@ -2909,11 +2941,7 @@ def main() -> int:
                     r["econ_sharpe_uplift_stability_lambda"] = stability_lambda
 
             if finance_rank and np.isfinite(rank_gate_floor):
-                floor_metric = _to_float(r.get("econ_sharpe_uplift_min"), float("nan"))
-                floor_metric_name = "econ_sharpe_uplift_min"
-                if not np.isfinite(floor_metric):
-                    floor_metric = _to_float(r.get("econ_sharpe_uplift"), float("nan"))
-                    floor_metric_name = "econ_sharpe_uplift"
+                floor_metric_name, floor_metric = _finance_floor_metric(r)
                 if np.isfinite(floor_metric) and floor_metric < rank_gate_floor:
                     gate_failed = True
                     gate_reasons.append(floor_metric_name)
@@ -2963,14 +2991,27 @@ def main() -> int:
         speed_weight /= wsum
 
         def _metric_or_fallback(row: dict, key: str, fallback: str | None = None) -> float:
-            val = _to_float(row.get(key), float("nan"))
-            if np.isfinite(val):
-                return val
+            candidates = [str(key)]
+            # OOS econ metrics can be absent for short windows; use sensible econ fallbacks.
+            if key == "econ_oos_sharpe_uplift_min":
+                candidates.extend(["econ_oos_sharpe_uplift_mean", "econ_sharpe_uplift"])
+            elif key == "econ_oos_sharpe_uplift_mean":
+                candidates.extend(["econ_oos_sharpe_uplift_min", "econ_sharpe_uplift"])
+            elif key == "econ_oos_ann_return_uplift_min":
+                candidates.extend(["econ_oos_ann_return_uplift_mean", "econ_ann_return_uplift"])
+            elif key == "econ_oos_ann_return_uplift_mean":
+                candidates.extend(["econ_oos_ann_return_uplift_min", "econ_ann_return_uplift"])
             if fallback:
-                v2 = _to_float(row.get(fallback), float("nan"))
-                if np.isfinite(v2):
-                    return v2
-            return _to_float(row.get("rank_value"), 0.0)
+                candidates.append(str(fallback))
+            if "econ_ann_return_uplift" not in candidates and str(key).startswith("econ_"):
+                candidates.append("econ_ann_return_uplift")
+
+            for cand in candidates:
+                val = _to_float(row.get(cand), float("nan"))
+                if np.isfinite(val):
+                    return val
+            # Avoid using penalized rank_value here; keep composite normalization stable.
+            return 0.0
 
         econ_vals = [
             _metric_or_fallback(r, econ_metric_name, fallback="econ_ann_return_uplift")
