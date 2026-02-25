@@ -32,34 +32,40 @@ Publish curated artifacts from a run:
 python scripts/publish_run.py --run-id <run_id>
 ```
 
-## Current Results Snapshot (as of 2026-02-18)
+## Current Results Snapshot (as of 2026-02-25)
 Latest notebook run IDs:
-- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260218_024603/`
+- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260225_002036/`
 - Latest full end-to-end run (sweep/scenario/calibration/backtest): `runs/experiments/e2e_runbook_20260215_143702/`
 - Recovery ablation outputs: `runs/experiments/recovery_ablation/`
 
 Published index status (`reports/index.csv`):
-- Published benchmark/scenario/sweep/hallucination/train snapshots currently point to `long_constituents` (timestamp `2026-02-13T00:40:52Z`).
+- Published benchmark/scenario/sweep/hallucination/train snapshots currently point to `long_constituents` (timestamp `2026-02-24T22:19:12Z`).
+- Paper benchmark artifacts are now tracked for GitHub under `reports/published/benchmark/`:
+  - `paper_final_500_latest_summary.csv`
+  - `paper_final_500_latest_summary.md`
+  - `paper_final_500_latest_summary.json`
+  - `paper_final_500_latest_benchmark.csv`
+  - `paper_final_500_latest_walk_forward_folds.csv`
 - `sweep/latest_tune.csv` still points to `legacy-20260211-colab`.
-- Notebook runbook artifacts (`e2e_runbook_*` and `paper_final_500_*`) are local run artifacts until promoted/published.
+- Notebook runbook artifacts (`e2e_runbook_*` and `paper_final_500_*`) remain local run artifacts under `runs/`; use `reports/published/` for tracked snapshots.
 
-Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260218_024603/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
+Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260225_002036/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
 
 | mode | quality metric | quality value | eval_auroc | eval_auprc | avg_epoch_s | graphs_per_s | econ_ann_return_uplift | econ_sharpe_uplift |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| `ff_layerwise` | `eval_sep` | `6.28991` | `0.74806` | `0.79869` | `1.767` | `817.6` | `-29.78%` | `-0.396` |
-| `ff_e2e` | `eval_sep` | `14.64823` | `1.00000` | `1.00000` | `0.808` | `1786.6` | `-30.05%` | `-0.274` |
-| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.532` | `2713.4` | `-26.89%` | `+0.193` |
+| `ff_layerwise` | `eval_sep` | `6.51199` | `0.62829` | `0.67070` | `1.349` | `1070.2` | `-26.70%` | `-0.223` |
+| `ff_e2e` | `eval_sep` | `14.23771` | `1.00000` | `1.00000` | `0.706` | `2045.5` | `-27.76%` | `-0.338` |
+| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.340` | `4253.3` | `-29.28%` | `-0.448` |
 
 Latest completed benchmark status:
-- Best quality: `ff_e2e` (`eval_sep=14.64823`, `eval_auroc=1.00000`).
-- Fastest mode: `backprop` (`2713.4` graphs/s).
-- Best economics in this run (Sharpe-based): `backprop` (`econ_sharpe_uplift=+0.193`, `econ_ann_return_uplift=-26.89%`).
+- Best quality: `ff_e2e` (`eval_sep=14.23771`, `eval_auroc=1.00000`).
+- Fastest mode: `backprop` (`4253.3` graphs/s).
+- Best economics in this run (Sharpe-based): `ff_layerwise` (`econ_sharpe_uplift=-0.223`, `econ_ann_return_uplift=-26.70%`).
 
 How to read this latest paper result:
 - Quality and economics are still not aligned: `ff_e2e` has the strongest separation objective (`eval_sep`) but does not win economics.
-- `backprop` is best on speed and Sharpe uplift, but all three modes still have negative annual return uplift versus buy-and-hold in this window.
-- Fold-level economics remain unstable (`runs/experiments/paper_final_500_20260218_024603/metrics/benchmark_walk_forward_folds.csv`), with Sharpe uplift changing sign across folds for every mode.
+- `backprop` is best on speed and classifier metrics, but all three modes are negative on both annual return uplift and Sharpe uplift versus buy-and-hold in this run.
+- Fold-level economics remain unstable for FF modes (`runs/experiments/paper_final_500_20260225_002036/metrics/benchmark_walk_forward_folds.csv`): `ff_layerwise` and `ff_e2e` switch Sharpe-uplift sign across folds, while `backprop` stays negative across all folds.
 - `objective_track` matters when reading rows: `ff_*` rows are critic/separation-tracked; `backprop` is classifier/`eval_auroc`-tracked.
 
 Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, focused `risk_head` rerun generated 2026-02-14 21:32):

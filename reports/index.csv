@@ -4,6 +4,11 @@ benchmark,dual_score_latest.txt,reports/published/benchmark/dual_score_latest.tx
 benchmark,latest.csv,reports/published/benchmark/latest.csv,long_constituents,metric,2026-02-24T22:19:12Z
 benchmark,latest_bar.png,reports/published/benchmark/latest_bar.png,long_constituents,plot,2026-02-24T22:19:12Z
 benchmark,latest_speed_sep.png,reports/published/benchmark/latest_speed_sep.png,long_constituents,plot,2026-02-24T22:19:12Z
+benchmark,paper_final_500_latest_benchmark.csv,reports/published/benchmark/paper_final_500_latest_benchmark.csv,paper_final_500_20260225_002036,metric,2026-02-25T01:31:05Z
+benchmark,paper_final_500_latest_summary.csv,reports/published/benchmark/paper_final_500_latest_summary.csv,paper_final_500_20260225_002036,metric,2026-02-25T01:31:05Z
+benchmark,paper_final_500_latest_summary.json,reports/published/benchmark/paper_final_500_latest_summary.json,paper_final_500_20260225_002036,summary,2026-02-25T01:31:05Z
+benchmark,paper_final_500_latest_summary.md,reports/published/benchmark/paper_final_500_latest_summary.md,paper_final_500_20260225_002036,summary,2026-02-25T01:31:05Z
+benchmark,paper_final_500_latest_walk_forward_folds.csv,reports/published/benchmark/paper_final_500_latest_walk_forward_folds.csv,paper_final_500_20260225_002036,metric,2026-02-25T01:31:05Z
 hallucination,calibration_by_ticker_latest.csv,reports/published/hallucination/calibration_by_ticker_latest.csv,long_constituents,diagnostic,2026-02-24T22:19:12Z
 hallucination,calibration_latest.json,reports/published/hallucination/calibration_latest.json,long_constituents,diagnostic,2026-02-24T22:19:12Z
 hallucination,diagnostics_latest.png,reports/published/hallucination/diagnostics_latest.png,long_constituents,diagnostic,2026-02-24T22:19:12Z

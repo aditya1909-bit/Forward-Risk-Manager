@@ -14,7 +14,9 @@ src/frisk/graph_builder.py
 src/frisk/hallucinate.py
 src/frisk/models.py
 src/frisk/splits.py
+src/frisk/targets.py
 tests/test_benchmark_risk.py
+tests/test_critic_checkpoint_compat.py
 tests/test_data.py
 tests/test_econ_eval.py
 tests/test_eval_metrics.py
@@ -25,3 +27,4 @@ tests/test_models.py
 tests/test_recovery_ablation.py
 tests/test_reporting_scripts.py
 tests/test_splits.py
+tests/test_targets_cache.py
