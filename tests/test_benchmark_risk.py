@@ -609,3 +609,22 @@ def test_aggregate_fold_results_skips_failed_folds_in_metrics():
     assert abs(float(agg["eval_sep"]) - 0.25) < 1e-8
     assert int(agg["walk_forward_num_folds"]) == 1
     assert int(agg["walk_forward_num_failed_folds"]) == 1
+
+
+def test_aggregate_seed_results_reports_bootstrap_ci():
+    mod = _load_script("benchmark_training.py")
+    agg = mod._aggregate_seed_results(
+        [
+            {"mode": "ff_e2e", "status": "ok", "eval_sep": 0.2, "graphs_per_s": 10.0},
+            {"mode": "ff_e2e", "status": "ok", "eval_sep": 0.4, "graphs_per_s": 12.0},
+            {"mode": "ff_e2e", "status": "failed", "error_type": "RuntimeError"},
+        ],
+        bootstrap_samples=200,
+        bootstrap_alpha=0.1,
+        bootstrap_seed=13,
+    )
+    assert agg["status"] == "ok"
+    assert int(agg["seed_num_runs"]) == 2
+    assert int(agg["seed_num_failed_runs"]) == 1
+    assert abs(float(agg["eval_sep"]) - 0.3) < 1e-8
+    assert float(agg["eval_sep_ci_lo"]) <= float(agg["eval_sep"]) <= float(agg["eval_sep_ci_hi"])

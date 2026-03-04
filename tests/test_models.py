@@ -13,7 +13,7 @@ def _toy_graph():
     return x, edge_index
 
 
-@pytest.mark.parametrize("conv_type", ["gcn", "sage", "gat"])
+@pytest.mark.parametrize("conv_type", ["gcn", "sage", "gat", "rgcn"])
 def test_encoder_supports_multiple_conv_types(conv_type: str):
     x, edge_index = _toy_graph()
     model = GCNEncoder(
@@ -23,8 +23,12 @@ def test_encoder_supports_multiple_conv_types(conv_type: str):
         dropout=0.0,
         conv_type=conv_type,
         gat_heads=2,
+        rgcn_num_relations=8,
     )
-    out = model(x, edge_index)
+    edge_type = None
+    if conv_type == "rgcn":
+        edge_type = torch.randint(0, 4, (edge_index.size(1),), dtype=torch.long)
+    out = model(x, edge_index, edge_type=edge_type)
     assert out.shape == (5, 8)
     assert torch.isfinite(out).all()
 

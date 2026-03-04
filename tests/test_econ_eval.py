@@ -30,6 +30,8 @@ def test_evaluate_goodness_strategy_reports_uplift():
     assert np.isfinite(out["econ_bh_ann_return"])
     assert np.isfinite(out["econ_strategy_sortino"])
     assert np.isfinite(out["econ_bh_calmar"])
+    assert np.isfinite(out["econ_strategy_var_95_daily"])
+    assert np.isfinite(out["econ_bh_var_95_daily"])
     assert np.isfinite(out["econ_strategy_max_drawdown_duration_days"])
     assert out["econ_ann_return_uplift"] > -1e-6
 
@@ -274,3 +276,35 @@ def test_evaluate_goodness_strategy_reports_oos_fold_uplifts():
     assert np.isfinite(out["econ_oos_sharpe_uplift_mean"])
     assert np.isfinite(out["econ_oos_sharpe_uplift_min"])
     assert out["econ_oos_sharpe_uplift_min"] <= out["econ_oos_sharpe_uplift_mean"] + 1e-9
+
+
+def test_evaluate_goodness_strategy_short_borrow_fee_reduces_short_returns():
+    dates = pd.date_range("2023-01-01", periods=120, freq="D")
+    goodness = np.linspace(-0.5, 0.5, num=120)
+    fwd = pd.Series(np.full(120, 0.01, dtype=float), index=dates)
+
+    no_borrow = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=30,
+        signal_quantile=0.5,
+        regime_gate_enabled=True,
+        regime_min_confidence=1.0,
+        regime_neutral_exposure=-1.0,
+        short_borrow_bps=0.0,
+    )
+    with_borrow = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=30,
+        signal_quantile=0.5,
+        regime_gate_enabled=True,
+        regime_min_confidence=1.0,
+        regime_neutral_exposure=-1.0,
+        short_borrow_bps=50.0,
+    )
+
+    assert with_borrow["econ_avg_borrow_bps_applied"] > 0.0
+    assert with_borrow["econ_strategy_total_return"] < no_borrow["econ_strategy_total_return"] - 1e-9

@@ -1189,10 +1189,11 @@ def main() -> int:
     parser.add_argument("--dropout", type=float, default=argparse.SUPPRESS)
     parser.add_argument(
         "--encoder-conv-type",
-        choices=["gcn", "sage", "gat"],
+        choices=["gcn", "sage", "gat", "rgcn"],
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--encoder-gat-heads", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--encoder-rgcn-num-relations", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--goodness-target", type=float, default=argparse.SUPPRESS)
     parser.add_argument(
         "--neg-mode",
@@ -1296,6 +1297,9 @@ def main() -> int:
     dropout = _get_setting(args, section, "dropout", 0.1)
     encoder_conv_type = str(_get_setting(args, section, "encoder_conv_type", "gcn")).strip().lower()
     encoder_gat_heads = int(_get_setting(args, section, "encoder_gat_heads", 2))
+    encoder_rgcn_num_relations = int(
+        _get_setting(args, section, "encoder_rgcn_num_relations", 8)
+    )
     goodness_target = _get_setting(args, section, "goodness_target", 1.0)
     goodness_temp = _get_setting(args, section, "goodness_temp", 1.0)
     ff_margin = float(_get_setting(args, section, "ff_margin", 0.0))
@@ -1651,9 +1655,10 @@ def main() -> int:
     layerwise_neg_mode = str(layerwise_neg_mode).strip().lower()
     if layerwise_neg_mode not in _NEG_AUG_MODES:
         layerwise_neg_mode = "shuffle"
-    if encoder_conv_type not in {"gcn", "sage", "gat"}:
+    if encoder_conv_type not in {"gcn", "sage", "gat", "rgcn"}:
         encoder_conv_type = "gcn"
     encoder_gat_heads = max(1, int(encoder_gat_heads))
+    encoder_rgcn_num_relations = max(2, int(encoder_rgcn_num_relations))
 
     if strict_component_split and neg_mode == "self_contrastive":
         if "time_flip" in self_contrastive_view_mode:
@@ -1980,6 +1985,7 @@ def main() -> int:
         dropout=dropout,
         conv_type=encoder_conv_type,
         gat_heads=encoder_gat_heads,
+        rgcn_num_relations=encoder_rgcn_num_relations,
         residual_edge_enabled=bool(residual_edge_weight_enabled),
         residual_edge_hidden_dim=int(residual_edge_hidden_dim),
         residual_edge_max_delta=float(residual_edge_max_delta),
@@ -2275,6 +2281,7 @@ def main() -> int:
                     "num_layers": int(num_layers),
                     "encoder_conv_type": str(encoder_conv_type),
                     "encoder_gat_heads": int(encoder_gat_heads),
+                    "encoder_rgcn_num_relations": int(encoder_rgcn_num_relations),
                     "neg_mode": str(neg_mode),
                     "ff_layerwise": bool(ff_layerwise),
                     "ff_multiscale": bool(ff_multiscale),

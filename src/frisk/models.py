@@ -5,7 +5,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GCNConv, SAGEConv, global_mean_pool
+from torch_geometric.nn import GATConv, GCNConv, RGCNConv, SAGEConv, global_mean_pool
 
 
 def _segment_logsumexp(
@@ -77,8 +77,9 @@ class GraphEncoder(nn.Module):
         hidden_dim: int,
         num_layers: int = 2,
         dropout: float = 0.1,
-        conv_type: Literal["gcn", "sage", "gat"] = "gcn",
+        conv_type: Literal["gcn", "sage", "gat", "rgcn"] = "gcn",
         gat_heads: int = 2,
+        rgcn_num_relations: int = 8,
         residual_edge_enabled: bool = False,
         residual_edge_hidden_dim: int = 32,
         residual_edge_max_delta: float = 0.25,
@@ -88,13 +89,18 @@ class GraphEncoder(nn.Module):
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         conv_mode = str(conv_type).strip().lower()
-        if conv_mode not in {"gcn", "sage", "gat"}:
-            raise ValueError("conv_type must be one of: gcn, sage, gat")
+        if conv_mode not in {"gcn", "sage", "gat", "rgcn"}:
+            raise ValueError("conv_type must be one of: gcn, sage, gat, rgcn")
         heads = max(1, int(gat_heads))
+        num_relations = max(2, int(rgcn_num_relations))
+        self.conv_mode = conv_mode
+        self.rgcn_num_relations = int(num_relations)
 
         def _make_layer(in_channels: int, out_channels: int):
             if conv_mode == "sage":
                 return SAGEConv(in_channels, out_channels)
+            if conv_mode == "rgcn":
+                return RGCNConv(in_channels, out_channels, num_relations=int(num_relations))
             if conv_mode == "gat":
                 return GATConv(
                     in_channels,
@@ -136,19 +142,50 @@ class GraphEncoder(nn.Module):
             return edge_weight
         return self.residual_edge_adapter(x, edge_index, edge_weight=edge_weight)
 
+    def _effective_edge_type(
+        self,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor | None,
+        edge_type: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if self.conv_mode != "rgcn":
+            return None
+        num_edges = int(edge_index.size(1))
+        if edge_type is None:
+            if edge_weight is not None:
+                ew = edge_weight
+                if ew.ndim == 2 and ew.size(1) == 1:
+                    ew = ew.squeeze(1)
+                if ew.ndim == 1 and int(ew.numel()) == num_edges:
+                    # Fallback relation typing: signed edges.
+                    sign_type = (ew.to(device=edge_index.device) < 0).to(torch.long) + 1
+                    return sign_type.clamp_min(0).clamp_max(self.rgcn_num_relations - 1)
+            return torch.zeros(num_edges, dtype=torch.long, device=edge_index.device)
+        et = edge_type
+        if et.ndim == 2 and et.size(1) == 1:
+            et = et.squeeze(1)
+        if et.ndim != 1 or int(et.numel()) != num_edges:
+            return torch.zeros(num_edges, dtype=torch.long, device=edge_index.device)
+        et = et.to(device=edge_index.device, dtype=torch.long)
+        return et.clamp_min(0).clamp_max(self.rgcn_num_relations - 1)
+
     def forward(
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor | None = None,
+        edge_type: torch.Tensor | None = None,
         return_all: bool = False,
     ) -> torch.Tensor:
         h = x
         edge_weight_eff = self._effective_edge_weight(x, edge_index, edge_weight)
+        edge_type_eff = self._effective_edge_type(edge_index, edge_weight_eff, edge_type)
         outputs: list[torch.Tensor] = []
         for layer in self.layers:
             if isinstance(layer, GCNConv):
                 h = layer(h, edge_index, edge_weight=edge_weight_eff)
+            elif isinstance(layer, RGCNConv):
+                h = layer(h, edge_index, edge_type_eff)
             else:
                 h = layer(h, edge_index)
             h = F.relu(h)
@@ -164,11 +201,15 @@ class GraphEncoder(nn.Module):
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor | None,
         layer_idx: int,
+        edge_type: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = self.layers[layer_idx]
         edge_weight_eff = self._effective_edge_weight(x, edge_index, edge_weight)
+        edge_type_eff = self._effective_edge_type(edge_index, edge_weight_eff, edge_type)
         if isinstance(layer, GCNConv):
             h = layer(x, edge_index, edge_weight=edge_weight_eff)
+        elif isinstance(layer, RGCNConv):
+            h = layer(x, edge_index, edge_type_eff)
         else:
             h = layer(x, edge_index)
         h = F.relu(h)

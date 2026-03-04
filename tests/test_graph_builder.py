@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 
 from frisk.graph_builder import (
+    EDGE_REL_LEAD_LAG,
     GraphBuildConfig,
     _build_node_features,
     _select_edges,
@@ -467,6 +468,12 @@ def test_build_rolling_corr_graphs_can_build_with_lead_lag_edges_only():
         progress=False,
     )
     assert stats["built"] >= 1
+    assert hasattr(graphs[0], "edge_relation_mask")
+    assert hasattr(graphs[0], "edge_lag_days")
+    assert hasattr(graphs[0], "edge_type")
+    lead_mask = (graphs[0].edge_relation_mask & EDGE_REL_LEAD_LAG) > 0
+    assert bool(torch.any(lead_mask))
+    assert bool(torch.any(graphs[0].edge_lag_days[lead_mask] >= 1.0))
     found_a_to_b = False
     for g, ts in zip(graphs, tickers):
         idx = {t: i for i, t in enumerate(ts)}

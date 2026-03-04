@@ -136,6 +136,31 @@ python scripts/qc_export_to_tidy.py \
 
 Note: If you pass a directory to `--prices`, every CSV in that directory is treated as price data. Keep constituents/coarse in separate directories or pass explicit files.
 
+## Local `Data FF` Consolidation
+If your raw dataset lives outside Drive (for example `/Users/<you>/Desktop/Data FF`), consolidate it into a few CSVs first:
+
+```bash
+python scripts/consolidate_data_ff.py \
+  --data-ff-root "/Users/<you>/Desktop/Data FF" \
+  --out-dir "data/consolidated_ff_local"
+```
+
+This writes:
+- `data/consolidated_ff_local/prices.csv`
+- `data/consolidated_ff_local/macro.csv`
+- `data/consolidated_ff_local/sec_submissions_entities.csv`
+- `data/consolidated_ff_local/sec_companyfacts_selected.csv`
+
+For a fast smoke run:
+
+```bash
+python scripts/consolidate_data_ff.py \
+  --data-ff-root "/Users/<you>/Desktop/Data FF" \
+  --out-dir "data/consolidated_ff_local_smoke" \
+  --max-sec-files 1000 \
+  --skip-companyfacts
+```
+
 ## Rolling Correlation Graphs
 Build rolling correlation graphs using a window size (in trading days). The correlation matrix for each graph is computed from the last `window` days ending at each date.
 
@@ -166,6 +191,11 @@ python scripts/build_graphs.py \
 Tip: Use `--include-tickers <TICKER>` only if that ticker also exists in your prices data and you want it forced into membership.
 You can disable the progress bar with `--no-progress` or `progress = false` in config.
 
+Each graph now carries relation metadata in addition to edge weights:
+- `edge_relation_mask`: bitmask over edge sources (`corr_pos`, `corr_neg`, `lead_lag`, `sector_static`, `static_overlay`)
+- `edge_lag_days`: lag depth for temporal lead-lag edges
+- `edge_type`: compact primary relation id for relation-aware encoders
+
 ## Optional: joblib Parallel Backend
 If you want `joblib` parallelism for graph building on macOS, set:
 ```
@@ -182,6 +212,13 @@ Train a simple Forward-Forward GNN that uses graph topology during message passi
 
 ```bash
 python scripts/train_ff_gnn.py --config configs/default.toml
+```
+
+To use relation-aware message passing, set:
+```toml
+[train]
+encoder_conv_type = "rgcn"
+encoder_rgcn_num_relations = 8
 ```
 
 ### Encoder/Critic Split (Recommended)
@@ -407,6 +444,9 @@ Customize via `configs/default.toml`:
 epochs = 5
 batch_size = 32
 eval_frac = 0.2
+seeds = [7, 17, 29]
+seed_bootstrap_samples = 2000
+seed_bootstrap_alpha = 0.05
 neg_mode = "mix"
 eval_neg_mode = "auto"
 eval_neg_modes = ["time_flip", "block_bootstrap", "cross_asset_mix", "phase_randomize"]
@@ -419,6 +459,8 @@ econ_ticker = "AUTO"
 econ_signal_window = 126
 econ_signal_quantile = 0.5
 econ_turnover_cost_bps = 0.0
+econ_short_borrow_bps = 0.0
+econ_max_abs_exposure = 1.0
 out_csv = "runs/experiments/default/metrics/benchmark.csv"
 ```
 When `train.risk_head_enabled = true`, benchmark FF/backprop runs now include the same auxiliary risk loss path used in training and report `risk_loss_train`/`risk_head_enabled_effective`.
@@ -436,6 +478,7 @@ walk_forward_max_folds = 0
 walk_forward_out_csv = "runs/experiments/default/metrics/benchmark_walk_forward_folds.csv"
 ```
 This writes aggregate metrics (mean/std across folds) to `out_csv` and fold-level metrics with date ranges to `walk_forward_out_csv`.
+If you set multiple `benchmark.seeds`, the CSV includes per-seed rows plus an aggregate row with bootstrap confidence intervals (`*_ci_lo`, `*_ci_hi`).
 
 The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_sep`, `eval_auroc`, `eval_auprc`, `eval_brier`, `eval_ece`, plus thresholded `eval_acc`.
 It also appends economic columns (`econ_strategy_*`, `econ_bh_*`, `econ_ann_return_uplift`, `econ_sharpe_uplift`) computed from goodness-driven risk-on/off signals on the eval window.

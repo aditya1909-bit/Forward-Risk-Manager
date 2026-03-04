@@ -1,0 +1,34 @@
+[build_graphs]
+# Consolidated local inputs from scripts/consolidate_data_ff.py
+prices = "data/consolidated_ff_local/prices.csv"
+macro = "data/consolidated_ff_local/macro.csv"
+fundamentals = ""
+constituents = ""
+
+# Write the final graph artifact into Drive-backed repo storage.
+out = "data/processed_long/graphs_data_ff_local.pt"
+
+window = 20
+step = 1
+top_k = 8
+min_nodes = 300
+
+# Use all available tickers (no constituents file required).
+membership_mode = "all"
+membership_fill = "none"
+
+feature_mode = "window_plus_summary"
+macro_lag_days = 1
+corr_lag_days = 1
+feature_lag_days = 1
+membership_lag_days = 1
+
+edge_weight_mode = "raw"
+corr_method = "pearson"
+edge_select_mode = "top_k"
+normalize = true
+symmetric = true
+
+workers = 8
+parallel_backend = "threadpool"
+progress = true

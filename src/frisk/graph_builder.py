@@ -11,6 +11,12 @@ from torch_geometric.data import Data
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 
 FUND_COLS = ["sector_code", "market_cap", "pe_ratio", "debt_equity", "pb_ratio"]
+EDGE_REL_CORR_POS = 1
+EDGE_REL_CORR_NEG = 2
+EDGE_REL_LEAD_LAG = 4
+EDGE_REL_SECTOR_STATIC = 8
+EDGE_REL_STATIC_OVERLAY = 16
+EDGE_REL_UNKNOWN = 0
 
 
 @dataclass
@@ -296,36 +302,68 @@ def _merge_edges(
     src: np.ndarray,
     dst: np.ndarray,
     w: np.ndarray,
-    extra_edges: list[tuple[int, int, float]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rel_mask: np.ndarray,
+    rel_lag: np.ndarray,
+    extra_edges: list[tuple[int, int, float, int, float]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not extra_edges:
-        return src, dst, w
-    edge_map: dict[tuple[int, int], float] = {}
-    for si, di, wi in zip(src.tolist(), dst.tolist(), w.tolist()):
-        edge_map[(int(si), int(di))] = edge_map.get((int(si), int(di)), 0.0) + float(wi)
-    for si, di, wi in extra_edges:
+        return src, dst, w, rel_mask, rel_lag
+    edge_map: dict[tuple[int, int], tuple[float, int, float]] = {}
+    for si, di, wi, rmi, rli in zip(
+        src.tolist(),
+        dst.tolist(),
+        w.tolist(),
+        rel_mask.tolist(),
+        rel_lag.tolist(),
+    ):
+        edge_map[(int(si), int(di))] = (float(wi), int(rmi), float(rli))
+    for si, di, wi, rel_i, lag_i in extra_edges:
         key = (int(si), int(di))
-        edge_map[key] = edge_map.get(key, 0.0) + float(wi)
+        if key in edge_map:
+            prev_w, prev_rel, prev_lag = edge_map[key]
+            edge_map[key] = (
+                float(prev_w + float(wi)),
+                int(prev_rel | int(rel_i)),
+                float(max(prev_lag, float(lag_i))),
+            )
+        else:
+            edge_map[key] = (float(wi), int(rel_i), float(lag_i))
     keys = sorted(edge_map.keys())
     if not keys:
-        return np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=float)
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=float),
+        )
     src_out = []
     dst_out = []
     w_out = []
+    rel_out = []
+    lag_out = []
     for key in keys:
-        val = float(edge_map[key])
+        val, rel_i, lag_i = edge_map[key]
         if not np.isfinite(val) or abs(val) < 1e-12:
             continue
         src_out.append(key[0])
         dst_out.append(key[1])
         w_out.append(val)
-    return np.array(src_out, dtype=int), np.array(dst_out, dtype=int), np.array(w_out, dtype=float)
+        rel_out.append(int(rel_i))
+        lag_out.append(float(max(0.0, lag_i)))
+    return (
+        np.array(src_out, dtype=int),
+        np.array(dst_out, dtype=int),
+        np.array(w_out, dtype=float),
+        np.array(rel_out, dtype=np.int64),
+        np.array(lag_out, dtype=float),
+    )
 
 
 def _build_lead_lag_edges(
     corr_window_df: pd.DataFrame,
     config: GraphBuildConfig,
-) -> list[tuple[int, int, float]]:
+) -> list[tuple[int, int, float, int, float]]:
     if not bool(config.lead_lag_enabled):
         return []
     max_lag = max(1, int(config.lead_lag_max_lag))
@@ -339,7 +377,7 @@ def _build_lead_lag_edges(
     if mode == "threshold" and config.lead_lag_threshold is None and config.lead_lag_top_k is not None:
         mode = "top_k"
 
-    lag_edge_map: dict[tuple[int, int], float] = {}
+    lag_edge_map: dict[tuple[int, int], tuple[float, int]] = {}
     for lag in range(1, max_lag + 1):
         if corr_window_df.shape[0] <= lag + 1:
             break
@@ -356,15 +394,45 @@ def _build_lead_lag_edges(
         for si, di, wi in zip(src_l.tolist(), dst_l.tolist(), w_l.tolist()):
             key = (int(si), int(di))
             val = float(wi)
-            if key not in lag_edge_map or abs(val) > abs(lag_edge_map[key]):
-                lag_edge_map[key] = val
+            if key not in lag_edge_map or abs(val) > abs(lag_edge_map[key][0]):
+                lag_edge_map[key] = (val, int(lag))
 
     scale = float(max(0.0, config.lead_lag_weight))
     if scale == 0.0:
         return []
-    out: list[tuple[int, int, float]] = []
-    for (si, di), wi in lag_edge_map.items():
-        out.append((si, di, scale * float(wi)))
+    out: list[tuple[int, int, float, int, float]] = []
+    for (si, di), (wi, lag_i) in lag_edge_map.items():
+        out.append(
+            (
+                si,
+                di,
+                scale * float(wi),
+                EDGE_REL_LEAD_LAG,
+                float(max(0, int(lag_i))),
+            )
+        )
+    return out
+
+
+def _edge_primary_type_from_mask(rel_mask: np.ndarray) -> np.ndarray:
+    out = np.zeros(rel_mask.shape, dtype=np.int64)
+    for i, raw in enumerate(rel_mask.tolist()):
+        mask = int(raw)
+        if mask == 0:
+            out[i] = 0
+        elif (mask & EDGE_REL_LEAD_LAG) and (mask & (mask - 1)) == 0:
+            out[i] = 3
+        elif (mask & EDGE_REL_STATIC_OVERLAY) and (mask & (mask - 1)) == 0:
+            out[i] = 5
+        elif (mask & EDGE_REL_SECTOR_STATIC) and (mask & (mask - 1)) == 0:
+            out[i] = 4
+        elif (mask & EDGE_REL_CORR_NEG) and (mask & (mask - 1)) == 0:
+            out[i] = 2
+        elif (mask & EDGE_REL_CORR_POS) and (mask & (mask - 1)) == 0:
+            out[i] = 1
+        else:
+            # Multi-source overlap: keep a dedicated relation id.
+            out[i] = 6
     return out
 
 
@@ -595,8 +663,10 @@ def _window_to_graph_data(
         significance_alpha=float(config.significance_alpha),
         n_obs=int(corr_window_df.shape[0]),
     )
+    rel_mask = np.where(w >= 0.0, EDGE_REL_CORR_POS, EDGE_REL_CORR_NEG).astype(np.int64)
+    rel_lag = np.zeros_like(w, dtype=float)
 
-    extra_edges: list[tuple[int, int, float]] = []
+    extra_edges: list[tuple[int, int, float, int, float]] = []
     lead_lag_edges = _build_lead_lag_edges(corr_window_df, config)
     if lead_lag_edges:
         extra_edges.extend(lead_lag_edges)
@@ -654,7 +724,9 @@ def _window_to_graph_data(
                         order = np.argsort(-peer_strength)[:per_node]
                         peers = [peers[k] for k in order.tolist()]
                     for j in peers:
-                        extra_edges.append((int(i), int(j), sector_weight))
+                        extra_edges.append(
+                            (int(i), int(j), sector_weight, EDGE_REL_SECTOR_STATIC, 0.0)
+                        )
 
     if static_edge_map:
         ticker_to_idx = {t: i for i, t in enumerate(cols)}
@@ -668,14 +740,30 @@ def _window_to_graph_data(
                     ew = static_scale * float(edge_weight_raw)
                     if not np.isfinite(ew) or ew == 0.0:
                         continue
-                    extra_edges.append((int(src_i), int(dst_i), ew))
+                    extra_edges.append(
+                        (
+                            int(src_i),
+                            int(dst_i),
+                            ew,
+                            EDGE_REL_STATIC_OVERLAY,
+                            0.0,
+                        )
+                    )
                     if not directed:
-                        extra_edges.append((int(dst_i), int(src_i), ew))
+                        extra_edges.append(
+                            (
+                                int(dst_i),
+                                int(src_i),
+                                ew,
+                                EDGE_REL_STATIC_OVERLAY,
+                                0.0,
+                            )
+                        )
 
     if extra_edges:
-        src, dst, w = _merge_edges(src, dst, w, extra_edges)
-        if len(src) == 0:
-            return None, "no_edges"
+        src, dst, w, rel_mask, rel_lag = _merge_edges(src, dst, w, rel_mask, rel_lag, extra_edges)
+    if len(src) == 0:
+        return None, "no_edges"
 
     macro_features = None
     if macro_panel is not None and macro_cols:
@@ -722,7 +810,18 @@ def _window_to_graph_data(
         macro_features,
         fund_features,
     )
-    return (end_date, list(window_df.columns), src, dst, w, x, ret_mean, ret_std), "ok"
+    return (
+        end_date,
+        list(window_df.columns),
+        src,
+        dst,
+        w,
+        rel_mask,
+        rel_lag,
+        x,
+        ret_mean,
+        ret_std,
+    ), "ok"
 
 
 def build_rolling_corr_graphs(
@@ -884,10 +983,13 @@ def build_rolling_corr_graphs(
             elif reason == "no_edges":
                 stats["skipped_no_edges"] += 1
             continue
-        end_date, tickers, src, dst, w, x, ret_mean, ret_std = result
+        end_date, tickers, src, dst, w, rel_mask, rel_lag, x, ret_mean, ret_std = result
         edge_index = torch.from_numpy(np.stack([src, dst], axis=0)).long()
         edge_attr = torch.from_numpy(w).float().unsqueeze(-1)
         edge_weight = edge_attr.squeeze(-1)
+        edge_relation_mask = torch.from_numpy(np.array(rel_mask, copy=True)).long()
+        edge_lag_days = torch.from_numpy(np.array(rel_lag, copy=True)).float()
+        edge_type_primary = torch.from_numpy(_edge_primary_type_from_mask(rel_mask)).long()
         if config.edge_weight_mode == "abs":
             edge_weight = edge_weight.abs()
         elif config.edge_weight_mode == "ones":
@@ -906,6 +1008,9 @@ def build_rolling_corr_graphs(
         x_tensor = torch.from_numpy(np.array(x, copy=True)).float()
         data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(tickers))
         data.edge_weight = edge_weight
+        data.edge_relation_mask = edge_relation_mask
+        data.edge_lag_days = edge_lag_days
+        data.edge_type = edge_type_primary
         if ret_mean is not None and ret_std is not None:
             data.ret_mean = torch.tensor(ret_mean.squeeze(1), dtype=torch.float32)
             data.ret_std = torch.tensor(ret_std.squeeze(1), dtype=torch.float32)

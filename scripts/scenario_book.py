@@ -763,6 +763,7 @@ def main() -> int:
         dropout=float(train_cfg.get("dropout", 0.1)),
         conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
+        rgcn_num_relations=max(2, int(train_cfg.get("encoder_rgcn_num_relations", 8))),
         residual_edge_enabled=bool(train_cfg.get("residual_edge_weight_enabled", False)),
         residual_edge_hidden_dim=int(train_cfg.get("residual_edge_hidden_dim", 32)),
         residual_edge_max_delta=float(train_cfg.get("residual_edge_max_delta", 0.25)),

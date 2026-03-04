@@ -37,6 +37,7 @@ def strategy_stats(
             "calmar": float("nan"),
             "max_drawdown": float("nan"),
             "max_drawdown_duration_days": float("nan"),
+            "var_95_daily": float("nan"),
             "cvar_95_daily": float("nan"),
             "hit_rate_daily": float("nan"),
         }
@@ -66,8 +67,8 @@ def strategy_stats(
             run = 0
     mdd = max_drawdown(equity)
     calmar = float(ann_return / abs(mdd)) if abs(mdd) > 1e-12 else float("nan")
-    cvar_cut = np.quantile(r, 0.05)
-    cvar_95 = float(r[r <= cvar_cut].mean()) if np.any(r <= cvar_cut) else float(cvar_cut)
+    var_95 = float(np.quantile(r, 0.05))
+    cvar_95 = float(r[r <= var_95].mean()) if np.any(r <= var_95) else float(var_95)
     return {
         "strategy": name,
         "num_days": int(r.size),
@@ -79,6 +80,7 @@ def strategy_stats(
         "calmar": calmar,
         "max_drawdown": mdd,
         "max_drawdown_duration_days": float(max_dd_duration),
+        "var_95_daily": var_95,
         "cvar_95_daily": cvar_95,
         "hit_rate_daily": float(np.mean(r > 0)),
     }
@@ -210,7 +212,8 @@ def infer_graph_goodness(
         for batch in loader:
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
-            h = model(batch.x, batch.edge_index, edge_weight=edge_weight)
+            edge_type = getattr(batch, "edge_type", None)
+            h = model(batch.x, batch.edge_index, edge_weight=edge_weight, edge_type=edge_type)
             g = goodness(h, batch.batch, temperature=float(goodness_temp), critic=critic)
             vals.extend(g.detach().cpu().tolist())
     return np.asarray(vals, dtype=float)
@@ -244,7 +247,8 @@ def infer_graph_goodness_with_uncertainty(
         for batch in loader:
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
-            h = model(batch.x, batch.edge_index, edge_weight=edge_weight)
+            edge_type = getattr(batch, "edge_type", None)
+            h = model(batch.x, batch.edge_index, edge_weight=edge_weight, edge_type=edge_type)
             g = goodness(h, batch.batch, temperature=float(goodness_temp), critic=critic)
             vals.extend(g.detach().cpu().tolist())
             if callable(member_graph_energy):
@@ -304,6 +308,8 @@ def evaluate_goodness_strategy(
     slippage_bps: float = 0.0,
     slippage_vol_scale: float = 0.0,
     slippage_vol_lookback: int = 21,
+    short_borrow_bps: float = 0.0,
+    max_abs_exposure: float = 1.0,
     trading_days: int = 252,
     regime_gate_enabled: bool = False,
     regime_gate_window: int = 63,
@@ -334,6 +340,7 @@ def evaluate_goodness_strategy(
         "econ_bh_calmar": float("nan"),
         "econ_bh_max_drawdown": float("nan"),
         "econ_bh_max_drawdown_duration_days": float("nan"),
+        "econ_bh_var_95_daily": float("nan"),
         "econ_bh_cvar_95_daily": float("nan"),
         "econ_bh_hit_rate_daily": float("nan"),
         "econ_strategy_total_return": float("nan"),
@@ -344,6 +351,7 @@ def evaluate_goodness_strategy(
         "econ_strategy_calmar": float("nan"),
         "econ_strategy_max_drawdown": float("nan"),
         "econ_strategy_max_drawdown_duration_days": float("nan"),
+        "econ_strategy_var_95_daily": float("nan"),
         "econ_strategy_cvar_95_daily": float("nan"),
         "econ_strategy_hit_rate_daily": float("nan"),
         "econ_ann_return_uplift": float("nan"),
@@ -352,10 +360,12 @@ def evaluate_goodness_strategy(
         "econ_calmar_uplift": float("nan"),
         "econ_max_drawdown_delta": float("nan"),
         "econ_max_drawdown_duration_delta": float("nan"),
+        "econ_var_95_daily_delta": float("nan"),
         "econ_cvar_95_daily_delta": float("nan"),
         "econ_hit_rate_delta": float("nan"),
         "econ_turnover_mean_daily": float("nan"),
         "econ_avg_cost_bps_applied": float("nan"),
+        "econ_avg_borrow_bps_applied": float("nan"),
         "econ_signal_window": float(signal_window),
         "econ_signal_quantile": float(signal_quantile),
         "econ_signal_polarity_requested": polarity_requested,
@@ -371,6 +381,8 @@ def evaluate_goodness_strategy(
         "econ_slippage_bps": float(slippage_bps),
         "econ_slippage_vol_scale": float(slippage_vol_scale),
         "econ_slippage_vol_lookback": float(slippage_vol_lookback),
+        "econ_short_borrow_bps": float(short_borrow_bps),
+        "econ_max_abs_exposure": float(max_abs_exposure),
         "econ_regime_gate_enabled": float(bool(regime_gate_enabled)),
         "econ_regime_confidence_mean": float("nan"),
         "econ_regime_exposure_mean": float("nan"),
@@ -502,6 +514,8 @@ def evaluate_goodness_strategy(
     base_cost_bps = max(0.0, float(turnover_cost_bps))
     slip_bps = max(0.0, float(slippage_bps))
     slip_scale = max(0.0, float(slippage_vol_scale))
+    borrow_bps = max(0.0, float(short_borrow_bps))
+    max_exposure = max(0.0, float(max_abs_exposure))
     vol_lb = max(2, int(slippage_vol_lookback))
     roll_vol = (
         pd.Series(bench_ret_1)
@@ -514,23 +528,33 @@ def evaluate_goodness_strategy(
     slip_curve_bps = slip_bps + (slip_scale * (100.0 * np.maximum(0.0, roll_vol)))
     total_cost_rate = (base_cost_bps + slip_curve_bps) * 1e-4
 
-    def _strategy_for_exposure(exposure: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    def _strategy_for_exposure(
+        exposure: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+        exposure = np.asarray(exposure, dtype=float)
+        if max_exposure > 0:
+            exposure = np.clip(exposure, -max_exposure, max_exposure)
+        else:
+            exposure = np.zeros_like(exposure)
         strat_ret_1 = exposure * bench_ret_1
         turnover = pd.Series(exposure).diff().abs().fillna(0.0).to_numpy(dtype=float)
+        borrow_cost_rate = borrow_bps * 1e-4 * np.maximum(0.0, -exposure)
+        if np.any(borrow_cost_rate > 0):
+            strat_ret_1 = strat_ret_1 - borrow_cost_rate
         if np.any(total_cost_rate > 0):
             strat_ret_1 = strat_ret_1 - total_cost_rate * turnover
         st = strategy_stats("goodness_risk_on_off", strat_ret_1, trading_days=trading_days)
-        return exposure, strat_ret_1, turnover, st
+        return exposure, strat_ret_1, turnover, borrow_cost_rate, st
 
     bh = strategy_stats("benchmark_buy_and_hold", bench_ret_1, trading_days=trading_days)
-    candidates: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, dict]] = {
+    candidates: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]] = {
         "high": _strategy_for_exposure(exposure_high),
         "low": _strategy_for_exposure(exposure_low),
     }
     effective = polarity_requested
     if polarity_requested == "auto":
-        high_sharpe = float(candidates["high"][3].get("sharpe", float("nan")))
-        low_sharpe = float(candidates["low"][3].get("sharpe", float("nan")))
+        high_sharpe = float(candidates["high"][4].get("sharpe", float("nan")))
+        low_sharpe = float(candidates["low"][4].get("sharpe", float("nan")))
         if np.isfinite(low_sharpe) and (not np.isfinite(high_sharpe) or low_sharpe > high_sharpe):
             effective = "low"
         else:
@@ -538,7 +562,7 @@ def evaluate_goodness_strategy(
     elif polarity_requested not in candidates:
         effective = "high"
 
-    exposure, strat_ret_1, turnover, st = candidates[effective]
+    exposure, strat_ret_1, turnover, borrow_cost_rate, st = candidates[effective]
     out["econ_signal_polarity_effective"] = effective
     out["econ_regime_exposure_mean"] = float(np.nanmean(exposure)) if exposure.size else float("nan")
     out.update(
@@ -552,6 +576,7 @@ def evaluate_goodness_strategy(
             "econ_bh_calmar": float(bh["calmar"]),
             "econ_bh_max_drawdown": float(bh["max_drawdown"]),
             "econ_bh_max_drawdown_duration_days": float(bh["max_drawdown_duration_days"]),
+            "econ_bh_var_95_daily": float(bh["var_95_daily"]),
             "econ_bh_cvar_95_daily": float(bh["cvar_95_daily"]),
             "econ_bh_hit_rate_daily": float(bh["hit_rate_daily"]),
             "econ_strategy_total_return": float(st["total_return"]),
@@ -562,6 +587,7 @@ def evaluate_goodness_strategy(
             "econ_strategy_calmar": float(st["calmar"]),
             "econ_strategy_max_drawdown": float(st["max_drawdown"]),
             "econ_strategy_max_drawdown_duration_days": float(st["max_drawdown_duration_days"]),
+            "econ_strategy_var_95_daily": float(st["var_95_daily"]),
             "econ_strategy_cvar_95_daily": float(st["cvar_95_daily"]),
             "econ_strategy_hit_rate_daily": float(st["hit_rate_daily"]),
             "econ_ann_return_uplift": _nan_sub(float(st["ann_return"]), float(bh["ann_return"])),
@@ -573,11 +599,15 @@ def evaluate_goodness_strategy(
                 float(st["max_drawdown_duration_days"]),
                 float(bh["max_drawdown_duration_days"]),
             ),
+            "econ_var_95_daily_delta": _nan_sub(float(st["var_95_daily"]), float(bh["var_95_daily"])),
             "econ_cvar_95_daily_delta": _nan_sub(float(st["cvar_95_daily"]), float(bh["cvar_95_daily"])),
             "econ_hit_rate_delta": _nan_sub(float(st["hit_rate_daily"]), float(bh["hit_rate_daily"])),
             "econ_turnover_mean_daily": float(np.nanmean(turnover)) if turnover.size else 0.0,
             "econ_avg_cost_bps_applied": float(np.nanmean((base_cost_bps + slip_curve_bps) * turnover))
             if turnover.size
+            else 0.0,
+            "econ_avg_borrow_bps_applied": float(np.nanmean(1e4 * borrow_cost_rate))
+            if borrow_cost_rate.size
             else 0.0,
             "econ_signal_window": float(sw),
             "econ_signal_quantile": float(sq),
@@ -585,6 +615,8 @@ def evaluate_goodness_strategy(
             "econ_slippage_bps": float(slippage_bps),
             "econ_slippage_vol_scale": float(slippage_vol_scale),
             "econ_slippage_vol_lookback": float(vol_lb),
+            "econ_short_borrow_bps": float(short_borrow_bps),
+            "econ_max_abs_exposure": float(max_exposure),
         }
     )
 

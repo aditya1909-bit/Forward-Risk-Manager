@@ -504,6 +504,116 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
     return out
 
 
+def _bootstrap_mean_ci(
+    values: list[float],
+    alpha: float = 0.05,
+    samples: int = 2000,
+    seed: int = 7,
+) -> tuple[float, float]:
+    if len(values) < 2 or int(samples) < 10:
+        return float("nan"), float("nan")
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, arr.size, size=(int(samples), arr.size))
+    means = arr[idx].mean(axis=1)
+    q_lo = float(np.quantile(means, float(np.clip(alpha, 1e-4, 0.5)) / 2.0))
+    q_hi = float(np.quantile(means, 1.0 - float(np.clip(alpha, 1e-4, 0.5)) / 2.0))
+    return q_lo, q_hi
+
+
+def _aggregate_seed_results(
+    seed_rows: list[dict],
+    bootstrap_samples: int = 2000,
+    bootstrap_alpha: float = 0.05,
+    bootstrap_seed: int = 7,
+) -> dict:
+    if not seed_rows:
+        return {}
+    successful_rows = [r for r in seed_rows if str(r.get("status", "ok")).strip().lower() == "ok"]
+    failed_rows = [r for r in seed_rows if str(r.get("status", "ok")).strip().lower() != "ok"]
+    if not successful_rows:
+        first_fail = failed_rows[0] if failed_rows else seed_rows[0]
+        return {
+            "status": "failed",
+            "error_type": str(first_fail.get("error_type", "RuntimeError")),
+            "error_message": str(first_fail.get("error_message", "all seeds failed")),
+            "retry_applied": bool(any(bool(r.get("retry_applied", False)) for r in seed_rows)),
+            "safe_mode_applied": bool(any(bool(r.get("safe_mode_applied", False)) for r in seed_rows)),
+            "seed_num_runs": len(seed_rows),
+            "seed_num_failed_runs": len(seed_rows),
+        }
+
+    out: dict[str, object] = {}
+    key_union = sorted({k for r in successful_rows for k in r.keys()})
+    skip_keys = {
+        "mode",
+        "row_type",
+        "status",
+        "error_type",
+        "error_message",
+        "retry_applied",
+        "safe_mode_applied",
+        "seed_run",
+        "seed_num_runs",
+        "seed_num_failed_runs",
+    }
+    for key in key_union:
+        if key in skip_keys:
+            continue
+        if key.endswith("_std") or key.endswith("_min") or key.endswith("_max"):
+            continue
+        vals: list[float] = []
+        for row in successful_rows:
+            value = row.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.number)):
+                fv = float(value)
+                if np.isfinite(fv):
+                    vals.append(fv)
+        if not vals:
+            continue
+        mean_val, std_val = _mean_std(vals)
+        out[key] = mean_val
+        out[f"{key}_std"] = std_val
+        out[f"{key}_min"] = float(np.min(vals))
+        out[f"{key}_max"] = float(np.max(vals))
+        ci_lo, ci_hi = _bootstrap_mean_ci(
+            vals,
+            alpha=float(bootstrap_alpha),
+            samples=int(bootstrap_samples),
+            seed=int(bootstrap_seed + sum(ord(ch) for ch in str(key)) % 100_000),
+        )
+        out[f"{key}_ci_lo"] = ci_lo
+        out[f"{key}_ci_hi"] = ci_hi
+
+    first = successful_rows[0]
+    for key in (
+        "eval_objective",
+        "objective_track",
+        "primary_eval_metric_name",
+        "primary_eval_metric_robust_name",
+        "neg_mode_effective",
+        "eval_neg_mode_effective",
+        "risk_head_enabled_effective",
+        "portfolio_head_enabled_effective",
+        "split_mode_effective",
+    ):
+        if key in first:
+            out[key] = first[key]
+    out["seed_num_runs"] = len(successful_rows)
+    out["seed_num_failed_runs"] = len(failed_rows)
+    out["status"] = "ok"
+    out["error_type"] = ""
+    out["error_message"] = ""
+    out["retry_applied"] = bool(any(bool(r.get("retry_applied", False)) for r in successful_rows))
+    out["safe_mode_applied"] = bool(any(bool(r.get("safe_mode_applied", False)) for r in successful_rows))
+    return out
+
+
 def _compute_econ_metrics_for_eval(
     model,
     critic,
@@ -564,6 +674,8 @@ def _compute_econ_metrics_for_eval(
         slippage_bps=float(config.get("econ_slippage_bps", 0.0)),
         slippage_vol_scale=float(config.get("econ_slippage_vol_scale", 0.0)),
         slippage_vol_lookback=int(config.get("econ_slippage_vol_lookback", 21)),
+        short_borrow_bps=float(config.get("econ_short_borrow_bps", 0.0)),
+        max_abs_exposure=float(config.get("econ_max_abs_exposure", 1.0)),
         trading_days=int(config.get("econ_trading_days", 252)),
         regime_gate_enabled=bool(config.get("econ_regime_gate_enabled", False)),
         regime_gate_window=int(config.get("econ_regime_gate_window", 63)),
@@ -1305,6 +1417,7 @@ def _benchmark_ff(
         dropout=config["dropout"],
         conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(config.get("encoder_gat_heads", 2)),
+        rgcn_num_relations=max(2, int(config.get("encoder_rgcn_num_relations", 8))),
         residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
         residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
         residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
@@ -2000,6 +2113,7 @@ def _benchmark_backprop(
         dropout=config["dropout"],
         conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(config.get("encoder_gat_heads", 2)),
+        rgcn_num_relations=max(2, int(config.get("encoder_rgcn_num_relations", 8))),
         residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
         residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
         residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
@@ -2459,6 +2573,7 @@ def main() -> int:
         "residual_edge_detach_features": bool(train_cfg.get("residual_edge_detach_features", True)),
         "encoder_conv_type": str(train_cfg.get("encoder_conv_type", "gcn")),
         "encoder_gat_heads": int(train_cfg.get("encoder_gat_heads", 2)),
+        "encoder_rgcn_num_relations": int(train_cfg.get("encoder_rgcn_num_relations", 8)),
         "lr": float(train_cfg.get("lr", 1e-3)),
         "neg_mode": str(bench_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))),
         "eval_neg_mode": str(bench_cfg.get("eval_neg_mode", "auto")),
@@ -2557,6 +2672,13 @@ def main() -> int:
         "walk_forward_min_eval_graphs": int(bench_cfg.get("walk_forward_min_eval_graphs", 16)),
         "walk_forward_max_folds": int(bench_cfg.get("walk_forward_max_folds", 0)),
         "seed": int(train_cfg.get("seed", 7)),
+        "benchmark_seeds": _parse_positive_int_list(
+            bench_cfg.get("seeds", train_cfg.get("seed", 7)),
+            fallback=int(train_cfg.get("seed", 7)),
+        ),
+        "seed_bootstrap_samples": int(bench_cfg.get("seed_bootstrap_samples", 2000)),
+        "seed_bootstrap_alpha": float(bench_cfg.get("seed_bootstrap_alpha", 0.05)),
+        "seed_bootstrap_seed": int(bench_cfg.get("seed_bootstrap_seed", train_cfg.get("seed", 7))),
         "hall_steps": int(train_cfg.get("ff_hall_steps", train_cfg.get("hallucinate_steps", 3))),
         "hall_lr": float(train_cfg.get("hallucinate_lr", 0.03)),
         "hall_l2": float(train_cfg.get("hallucinate_l2", 0.05)),
@@ -2648,6 +2770,8 @@ def main() -> int:
         "econ_slippage_bps": float(bench_cfg.get("econ_slippage_bps", 0.0)),
         "econ_slippage_vol_scale": float(bench_cfg.get("econ_slippage_vol_scale", 0.0)),
         "econ_slippage_vol_lookback": int(bench_cfg.get("econ_slippage_vol_lookback", 21)),
+        "econ_short_borrow_bps": float(bench_cfg.get("econ_short_borrow_bps", 0.0)),
+        "econ_max_abs_exposure": float(bench_cfg.get("econ_max_abs_exposure", 1.0)),
         "econ_regime_gate_enabled": bool(bench_cfg.get("econ_regime_gate_enabled", False)),
         "econ_regime_gate_window": int(bench_cfg.get("econ_regime_gate_window", 63)),
         "econ_regime_confidence_temp": float(bench_cfg.get("econ_regime_confidence_temp", 1.0)),
@@ -2854,191 +2978,238 @@ def main() -> int:
 
     mode_success_map: dict[str, bool] = {m: False for m in modes}
     abort_after_write = False
+    benchmark_seeds = [int(s) for s in config.get("benchmark_seeds", [int(config.get("seed", 7))])]
+    if not benchmark_seeds:
+        benchmark_seeds = [int(config.get("seed", 7))]
+    benchmark_seeds = list(dict.fromkeys(benchmark_seeds))
+    multi_seed = len(benchmark_seeds) > 1
+    print(f"benchmark seeds: {benchmark_seeds}")
 
     for mode in modes:
-        cfg_mode = config.copy()
+        cfg_mode_base = config.copy()
         mode_override = mode_overrides.get(mode, {})
         if isinstance(mode_override, dict):
-            cfg_mode.update(mode_override)
-        _warn_self_contrastive_eval_view(cfg_mode, mode)
-        if use_walk_forward:
-            fold_rows = []
-            if not walk_forward:
-                fold_rows.append(
-                    {
+            cfg_mode_base.update(mode_override)
+        _warn_self_contrastive_eval_view(cfg_mode_base, mode)
+        mode_seed_rows: list[dict] = []
+
+        for seed_run in benchmark_seeds:
+            cfg_mode = cfg_mode_base.copy()
+            cfg_mode["seed"] = int(seed_run)
+
+            if use_walk_forward:
+                fold_rows = []
+                if not walk_forward:
+                    fold_rows.append(
+                        {
+                            "mode": mode,
+                            "row_type": "fold",
+                            "split_mode_effective": "walk_forward",
+                            "status": "failed",
+                            "error_type": "ValueError",
+                            "error_message": "no walk-forward folds available",
+                            "retry_applied": False,
+                            "safe_mode_applied": False,
+                            "seed_run": int(seed_run),
+                            **base_ctx,
+                        }
+                    )
+                for fold in walk_forward:
+                    train_fold = fold["train_items"]
+                    eval_fold = fold["eval_items"]
+                    eval_dates_fold = []
+                    if graph_dates:
+                        s = int(fold["eval_start"])
+                        e = int(fold["eval_end"])
+                        eval_dates_fold = list(graph_dates[s:e])
+                    fold_meta = {
                         "mode": mode,
                         "row_type": "fold",
                         "split_mode_effective": "walk_forward",
-                        "status": "failed",
-                        "error_type": "ValueError",
-                        "error_message": "no walk-forward folds available",
-                        "retry_applied": False,
-                        "safe_mode_applied": False,
+                        "seed_run": int(seed_run),
                         **base_ctx,
+                        "fold_id": int(fold["fold_id"]),
+                        "fold_train_start_idx": int(fold["train_start"]),
+                        "fold_train_end_idx": int(fold["train_end"]) - 1,
+                        "fold_eval_start_idx": int(fold["eval_start"]),
+                        "fold_eval_end_idx": int(fold["eval_end"]) - 1,
                     }
+                    if graph_dates:
+                        fold_meta["fold_eval_start_date"] = str(graph_dates[int(fold["eval_start"])])
+                        fold_meta["fold_eval_end_date"] = str(graph_dates[int(fold["eval_end"]) - 1])
+
+                    cfg_fold = cfg_mode.copy()
+                    cfg_fold["split_mode"] = "chronological"
+                    attempts: list[tuple[dict, bool, bool]] = [(cfg_fold, False, False)]
+                    if retry_safe_on_error:
+                        attempts.append((_safe_retry_config(cfg_fold), True, True))
+
+                    fold_res = None
+                    last_error: tuple[str, str] | None = None
+                    for attempt_idx, (cfg_attempt, retry_applied, safe_mode_applied) in enumerate(
+                        attempts,
+                        start=1,
+                    ):
+                        try:
+                            fold_res = _run_mode_impl(
+                                mode,
+                                cfg_attempt,
+                                train_fold,
+                                eval_fold,
+                                eval_dates_fold,
+                            )
+                            fold_res.update(fold_meta)
+                            fold_res["status"] = "ok"
+                            fold_res["error_type"] = ""
+                            fold_res["error_message"] = ""
+                            fold_res["retry_applied"] = retry_applied
+                            fold_res["safe_mode_applied"] = safe_mode_applied
+                            break
+                        except Exception as exc:
+                            err_type, err_msg = _error_metadata(exc)
+                            last_error = (err_type, err_msg)
+                            print(
+                                f"warning: mode={mode} seed={seed_run} fold={fold.get('fold_id')} "
+                                f"attempt={attempt_idx}/{len(attempts)} failed: {err_type}: {err_msg}"
+                            )
+
+                    if fold_res is None:
+                        err_type, err_msg = last_error if last_error is not None else ("RuntimeError", "")
+                        fold_res = {
+                            **fold_meta,
+                            "status": "failed",
+                            "error_type": err_type,
+                            "error_message": err_msg,
+                            "retry_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                            "safe_mode_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                        }
+                        if not continue_on_mode_error:
+                            abort_after_write = True
+
+                    if isinstance(mode_override, dict):
+                        for key, value in mode_override.items():
+                            if key not in fold_res:
+                                fold_res[key] = value
+                    fold_rows.append(fold_res)
+                    fold_results.append(fold_res)
+                    if str(fold_res.get("status", "")).strip().lower() == "ok":
+                        mode_success_map[mode] = True
+                    if abort_after_write and not continue_on_mode_error:
+                        break
+
+                agg = _aggregate_fold_results(fold_rows)
+                agg["mode"] = mode
+                agg["seed_run"] = int(seed_run)
+                agg["row_type"] = "aggregate_seed" if multi_seed else "aggregate"
+                agg.update(base_ctx)
+                if isinstance(mode_override, dict):
+                    for key, value in mode_override.items():
+                        if key not in agg:
+                            agg[key] = value
+                results.append(agg)
+                mode_seed_rows.append(agg)
+                if str(agg.get("status", "")).strip().lower() == "ok":
+                    mode_success_map[mode] = True
+                if abort_after_write and not continue_on_mode_error:
+                    break
+            else:
+                split_mode_mode = str(cfg_mode.get("split_mode", config.get("split_mode", "chronological")))
+                eval_frac_mode = float(cfg_mode.get("eval_frac", config.get("eval_frac", 0.2)))
+                seed_mode = int(cfg_mode.get("seed", config.get("seed", 7)))
+                tr_idx, ev_idx = simple_split_indices(
+                    len(graphs),
+                    eval_frac=eval_frac_mode,
+                    seed=seed_mode,
+                    split_mode=split_mode_mode,
                 )
-            for fold in walk_forward:
-                train_fold = fold["train_items"]
-                eval_fold = fold["eval_items"]
-                eval_dates_fold = []
-                if graph_dates:
-                    s = int(fold["eval_start"])
-                    e = int(fold["eval_end"])
-                    eval_dates_fold = list(graph_dates[s:e])
-                fold_meta = {
-                    "mode": mode,
-                    "row_type": "fold",
-                    "split_mode_effective": "walk_forward",
-                    **base_ctx,
-                    "fold_id": int(fold["fold_id"]),
-                    "fold_train_start_idx": int(fold["train_start"]),
-                    "fold_train_end_idx": int(fold["train_end"]) - 1,
-                    "fold_eval_start_idx": int(fold["eval_start"]),
-                    "fold_eval_end_idx": int(fold["eval_end"]) - 1,
-                }
-                if graph_dates:
-                    fold_meta["fold_eval_start_date"] = str(graph_dates[int(fold["eval_start"])])
-                    fold_meta["fold_eval_end_date"] = str(graph_dates[int(fold["eval_end"]) - 1])
+                train_graphs_mode = [graphs[i] for i in tr_idx]
+                eval_graphs_mode = [graphs[i] for i in ev_idx]
+                eval_dates_mode = [graph_dates[i] for i in ev_idx] if graph_dates else []
 
-                cfg_fold = cfg_mode.copy()
-                cfg_fold["split_mode"] = "chronological"
-                attempts: list[tuple[dict, bool, bool]] = [(cfg_fold, False, False)]
+                attempts = [(cfg_mode, False, False)]
                 if retry_safe_on_error:
-                    attempts.append((_safe_retry_config(cfg_fold), True, True))
+                    attempts.append((_safe_retry_config(cfg_mode), True, True))
 
-                fold_res = None
+                mode_row = None
                 last_error: tuple[str, str] | None = None
                 for attempt_idx, (cfg_attempt, retry_applied, safe_mode_applied) in enumerate(
                     attempts,
                     start=1,
                 ):
                     try:
-                        fold_res = _run_mode_impl(
+                        mode_row = _run_mode_impl(
                             mode,
                             cfg_attempt,
-                            train_fold,
-                            eval_fold,
-                            eval_dates_fold,
+                            train_graphs_mode,
+                            eval_graphs_mode,
+                            eval_dates_mode,
                         )
-                        fold_res.update(fold_meta)
-                        fold_res["status"] = "ok"
-                        fold_res["error_type"] = ""
-                        fold_res["error_message"] = ""
-                        fold_res["retry_applied"] = retry_applied
-                        fold_res["safe_mode_applied"] = safe_mode_applied
+                        mode_row.update(base_ctx)
+                        mode_row["mode"] = mode
+                        mode_row["seed_run"] = int(seed_run)
+                        if multi_seed:
+                            mode_row["row_type"] = "seed"
+                        mode_row["status"] = "ok"
+                        mode_row["error_type"] = ""
+                        mode_row["error_message"] = ""
+                        mode_row["retry_applied"] = retry_applied
+                        mode_row["safe_mode_applied"] = safe_mode_applied
                         break
                     except Exception as exc:
                         err_type, err_msg = _error_metadata(exc)
                         last_error = (err_type, err_msg)
                         print(
-                            f"warning: mode={mode} fold={fold.get('fold_id')} "
-                            f"attempt={attempt_idx}/{len(attempts)} failed: {err_type}: {err_msg}"
+                            f"warning: mode={mode} seed={seed_run} attempt={attempt_idx}/{len(attempts)} "
+                            f"failed: {err_type}: {err_msg}"
                         )
-
-                if fold_res is None:
+                if mode_row is None:
                     err_type, err_msg = last_error if last_error is not None else ("RuntimeError", "")
-                    fold_res = {
-                        **fold_meta,
+                    mode_row = {
+                        **base_ctx,
+                        "mode": mode,
+                        "seed_run": int(seed_run),
+                        "row_type": "seed" if multi_seed else "",
                         "status": "failed",
                         "error_type": err_type,
                         "error_message": err_msg,
                         "retry_applied": bool(retry_safe_on_error and len(attempts) > 1),
                         "safe_mode_applied": bool(retry_safe_on_error and len(attempts) > 1),
+                        "split_mode_effective": split_mode_mode,
                     }
                     if not continue_on_mode_error:
                         abort_after_write = True
-
+                else:
+                    mode_success_map[mode] = True
                 if isinstance(mode_override, dict):
                     for key, value in mode_override.items():
-                        if key not in fold_res:
-                            fold_res[key] = value
-                fold_rows.append(fold_res)
-                fold_results.append(fold_res)
-                if str(fold_res.get("status", "")).strip().lower() == "ok":
-                    mode_success_map[mode] = True
+                        if key not in mode_row:
+                            mode_row[key] = value
+                results.append(mode_row)
+                mode_seed_rows.append(mode_row)
                 if abort_after_write and not continue_on_mode_error:
                     break
 
-            agg = _aggregate_fold_results(fold_rows)
-            agg["mode"] = mode
-            agg["row_type"] = "aggregate"
-            agg.update(base_ctx)
-            if isinstance(mode_override, dict):
-                for key, value in mode_override.items():
-                    if key not in agg:
-                        agg[key] = value
-            results.append(agg)
-            if str(agg.get("status", "")).strip().lower() == "ok":
-                mode_success_map[mode] = True
-            if abort_after_write and not continue_on_mode_error:
-                break
-        else:
-            split_mode_mode = str(cfg_mode.get("split_mode", config.get("split_mode", "chronological")))
-            eval_frac_mode = float(cfg_mode.get("eval_frac", config.get("eval_frac", 0.2)))
-            seed_mode = int(cfg_mode.get("seed", config.get("seed", 7)))
-            tr_idx, ev_idx = simple_split_indices(
-                len(graphs),
-                eval_frac=eval_frac_mode,
-                seed=seed_mode,
-                split_mode=split_mode_mode,
+        if multi_seed and mode_seed_rows:
+            seed_agg = _aggregate_seed_results(
+                mode_seed_rows,
+                bootstrap_samples=int(config.get("seed_bootstrap_samples", 2000)),
+                bootstrap_alpha=float(config.get("seed_bootstrap_alpha", 0.05)),
+                bootstrap_seed=int(config.get("seed_bootstrap_seed", 7)),
             )
-            train_graphs_mode = [graphs[i] for i in tr_idx]
-            eval_graphs_mode = [graphs[i] for i in ev_idx]
-            eval_dates_mode = [graph_dates[i] for i in ev_idx] if graph_dates else []
-
-            attempts = [(cfg_mode, False, False)]
-            if retry_safe_on_error:
-                attempts.append((_safe_retry_config(cfg_mode), True, True))
-
-            mode_row = None
-            last_error: tuple[str, str] | None = None
-            for attempt_idx, (cfg_attempt, retry_applied, safe_mode_applied) in enumerate(attempts, start=1):
-                try:
-                    mode_row = _run_mode_impl(
-                        mode,
-                        cfg_attempt,
-                        train_graphs_mode,
-                        eval_graphs_mode,
-                        eval_dates_mode,
-                    )
-                    mode_row.update(base_ctx)
-                    mode_row["mode"] = mode
-                    mode_row["status"] = "ok"
-                    mode_row["error_type"] = ""
-                    mode_row["error_message"] = ""
-                    mode_row["retry_applied"] = retry_applied
-                    mode_row["safe_mode_applied"] = safe_mode_applied
-                    break
-                except Exception as exc:
-                    err_type, err_msg = _error_metadata(exc)
-                    last_error = (err_type, err_msg)
-                    print(
-                        f"warning: mode={mode} attempt={attempt_idx}/{len(attempts)} "
-                        f"failed: {err_type}: {err_msg}"
-                    )
-            if mode_row is None:
-                err_type, err_msg = last_error if last_error is not None else ("RuntimeError", "")
-                mode_row = {
-                    **base_ctx,
-                    "mode": mode,
-                    "status": "failed",
-                    "error_type": err_type,
-                    "error_message": err_msg,
-                    "retry_applied": bool(retry_safe_on_error and len(attempts) > 1),
-                    "safe_mode_applied": bool(retry_safe_on_error and len(attempts) > 1),
-                    "split_mode_effective": split_mode_mode,
-                }
-                if not continue_on_mode_error:
-                    abort_after_write = True
-            else:
-                mode_success_map[mode] = True
+            seed_agg["mode"] = mode
+            seed_agg["row_type"] = "aggregate"
+            seed_agg["seed_run"] = "ALL"
+            seed_agg.update(base_ctx)
             if isinstance(mode_override, dict):
                 for key, value in mode_override.items():
-                    if key not in mode_row:
-                        mode_row[key] = value
-            results.append(mode_row)
-            if abort_after_write and not continue_on_mode_error:
-                break
+                    if key not in seed_agg:
+                        seed_agg[key] = value
+            results.append(seed_agg)
+            if str(seed_agg.get("status", "")).strip().lower() == "ok":
+                mode_success_map[mode] = True
+
+        if abort_after_write and not continue_on_mode_error:
+            break
 
     all_modes_failed = bool(modes) and not any(mode_success_map.values())
 
@@ -3101,8 +3272,13 @@ def main() -> int:
         if baseline_out
         else out_path.with_name(f"{out_path.stem}_baseline.csv")
     )
+    baseline_source_rows = results
+    if multi_seed:
+        baseline_source_rows = [
+            r for r in results if str(r.get("row_type", "")).strip().lower() == "aggregate"
+        ] or list(results)
     baseline_rows = []
-    for r in results:
+    for r in baseline_source_rows:
         baseline_rows.append(
             {
                 "mode": r.get("mode"),

@@ -199,6 +199,7 @@ def main() -> int:
         dropout=float(train_cfg.get("dropout", 0.1)),
         conv_type=str(train_cfg.get("encoder_conv_type", "gcn")).strip().lower(),
         gat_heads=int(train_cfg.get("encoder_gat_heads", 2)),
+        rgcn_num_relations=max(2, int(train_cfg.get("encoder_rgcn_num_relations", 8))),
         residual_edge_enabled=bool(train_cfg.get("residual_edge_weight_enabled", False)),
         residual_edge_hidden_dim=int(train_cfg.get("residual_edge_hidden_dim", 32)),
         residual_edge_max_delta=float(train_cfg.get("residual_edge_max_delta", 0.25)),
@@ -236,7 +237,8 @@ def main() -> int:
         x = g.x.detach().clone().requires_grad_(True)
         batch = torch.zeros(g.num_nodes, dtype=torch.long)
         edge_weight = getattr(g, "edge_weight", None)
-        h = model(x, g.edge_index, edge_weight=edge_weight)
+        edge_type = getattr(g, "edge_type", None)
+        h = model(x, g.edge_index, edge_weight=edge_weight, edge_type=edge_type)
         energy = goodness(
             h,
             batch,
