@@ -339,6 +339,11 @@ def main() -> int:
         action="store_true",
         help="Delete source subfolders after successful consolidation.",
     )
+    parser.add_argument(
+        "--submissions-dir",
+        default="SEC_XBRL_submissions",
+        help="Subfolder name under data-ff-root for SEC submissions JSONs (default: SEC_XBRL_submissions).",
+    )
     args = parser.parse_args()
 
     data_ff_root = Path(args.data_ff_root).expanduser()
@@ -347,7 +352,7 @@ def main() -> int:
 
     stooq_root = data_ff_root / "Stooq_data"
     fred_root = data_ff_root / "FRED"
-    submissions_root = data_ff_root / "SEC_XBRL_submissions"
+    submissions_root = data_ff_root / args.submissions_dir
     companyfacts_root = data_ff_root / "SEC_XBRL_companyfacts"
 
     stats = ConsolidationStats()

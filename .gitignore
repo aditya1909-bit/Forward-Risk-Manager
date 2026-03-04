@@ -3,6 +3,7 @@
 /data/processed/
 /data/raw_merged/
 /data/processed_long/
+/data/consolidated_ff_local/
 /runs/cache/
 /runs/experiments/
 /runs/registry/

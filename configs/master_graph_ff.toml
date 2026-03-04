@@ -1,0 +1,29 @@
+[build_graphs]
+# Master graph from DATA FF: consolidated CSVs -> data/processed/graphs.pt
+prices = "data/consolidated_ff_local/prices.csv"
+macro = "data/consolidated_ff_local/macro.csv"
+fundamentals = ""
+constituents = ""
+out = "data/processed/graphs.pt"
+
+window = 20
+step = 1
+top_k = 8
+min_nodes = 300
+membership_mode = "all"
+membership_fill = "none"
+feature_mode = "window_plus_summary"
+corr_lag_days = 1
+feature_lag_days = 1
+membership_lag_days = 1
+macro_lag_days = 1
+
+edge_weight_mode = "raw"
+corr_method = "pearson"
+edge_select_mode = "top_k"
+normalize = true
+symmetric = true
+
+workers = 8
+parallel_backend = "threadpool"
+progress = true
