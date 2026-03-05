@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import pandas as pd
 import torch
 import tomllib
 
@@ -18,6 +19,7 @@ from frisk.data import (
     build_membership_map_ffill,
     build_membership_map_all,
     load_fundamentals,
+    load_sec_fundamentals,
     load_macro_features,
     load_static_edges,
     build_macro_features_from_market_data,
@@ -68,6 +70,22 @@ def main() -> int:
     )
     parser.add_argument(
         "--fundamentals", help="Optional fundamentals CSV", default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--sec-companyfacts",
+        help="Optional SEC companyfacts CSV (consolidated_ff_local/sec_companyfacts_selected.csv).",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--sec-submissions",
+        help="Optional SEC submissions CSV (consolidated_ff_local/sec_submissions_entities.csv).",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--sec-as-fundamentals",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Append SEC-derived fundamentals features from sec_companyfacts/submissions CSVs.",
     )
     parser.add_argument(
         "--macro", help="Optional macro feature CSV (date + feature columns)", default=argparse.SUPPRESS
@@ -312,6 +330,9 @@ def main() -> int:
     prices_path = _get_setting(args, section, "prices", None)
     constituents_path = _get_setting(args, section, "constituents", None)
     fundamentals_path = _get_setting(args, section, "fundamentals", None)
+    sec_companyfacts_path = _get_setting(args, section, "sec_companyfacts", None)
+    sec_submissions_path = _get_setting(args, section, "sec_submissions", None)
+    sec_as_fundamentals = bool(_get_setting(args, section, "sec_as_fundamentals", True))
     macro_path = _get_setting(args, section, "macro", None)
     macro_auto = bool(_get_setting(args, section, "macro_auto", False))
     macro_auto_short_window = int(_get_setting(args, section, "macro_auto_short_window", 21))
@@ -432,6 +453,41 @@ def main() -> int:
             fundamentals = fundamentals[fundamentals["date"] >= start_date]
         if end_date:
             fundamentals = fundamentals[fundamentals["date"] <= end_date]
+
+    prices_parent = Path(prices_path).expanduser().resolve().parent
+    if not sec_companyfacts_path:
+        auto_sec_companyfacts = prices_parent / "sec_companyfacts_selected.csv"
+        if auto_sec_companyfacts.exists():
+            sec_companyfacts_path = str(auto_sec_companyfacts)
+    if not sec_submissions_path:
+        auto_sec_submissions = prices_parent / "sec_submissions_entities.csv"
+        if auto_sec_submissions.exists():
+            sec_submissions_path = str(auto_sec_submissions)
+
+    if sec_as_fundamentals and sec_companyfacts_path:
+        sec_fund = load_sec_fundamentals(
+            Path(sec_companyfacts_path),
+            submissions_path=Path(sec_submissions_path) if sec_submissions_path else None,
+        )
+        if start_date:
+            sec_fund = sec_fund[sec_fund["date"] >= start_date]
+        if end_date:
+            sec_fund = sec_fund[sec_fund["date"] <= end_date]
+        fundamentals = (
+            sec_fund
+            if fundamentals is None or fundamentals.empty
+            else pd.concat([fundamentals, sec_fund], ignore_index=True, sort=False)
+        )
+        if fundamentals is not None and not fundamentals.empty:
+            fundamentals = (
+                fundamentals.sort_values(["date", "ticker"]).drop_duplicates(["date", "ticker"], keep="last")
+            )
+        print(
+            "SEC fundamentals:",
+            f"companyfacts={sec_companyfacts_path}",
+            f"submissions={sec_submissions_path or 'none'}",
+            f"rows={0 if fundamentals is None else len(fundamentals)}",
+        )
 
     macro = None
     macro_source = "none"

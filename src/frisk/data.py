@@ -177,6 +177,119 @@ def load_fundamentals(path: Path) -> pd.DataFrame:
     return df
 
 
+def _safe_divide_num(a: pd.Series, b: pd.Series) -> pd.Series:
+    denom = pd.to_numeric(b, errors="coerce").replace(0.0, np.nan)
+    return pd.to_numeric(a, errors="coerce") / denom
+
+
+def load_sec_fundamentals(
+    companyfacts_path: Path,
+    submissions_path: Path | None = None,
+) -> pd.DataFrame:
+    if not companyfacts_path.exists():
+        raise FileNotFoundError(f"SEC companyfacts CSV not found: {companyfacts_path}")
+
+    usecols = ["cik", "ticker", "tag", "end", "filed", "val"]
+    cf = pd.read_csv(companyfacts_path, usecols=usecols, low_memory=False)
+    cf = cf.copy()
+    cf["ticker"] = cf["ticker"].astype(str).str.upper().str.strip()
+    cf["cik"] = cf["cik"].astype(str).str.strip()
+    cf["tag"] = cf["tag"].astype(str).str.strip()
+    cf["val"] = pd.to_numeric(cf["val"], errors="coerce")
+    cf["date"] = pd.to_datetime(cf["filed"], errors="coerce")
+    missing = cf["date"].isna()
+    if missing.any():
+        cf.loc[missing, "date"] = pd.to_datetime(cf.loc[missing, "end"], errors="coerce")
+    cf["date"] = cf["date"].dt.strftime("%Y-%m-%d")
+    cf = cf.dropna(subset=["date", "tag", "val"])
+
+    sub = None
+    if submissions_path is not None and submissions_path.exists():
+        sub_usecols = ["cik", "ticker", "sic", "recent_filings_count"]
+        sub = pd.read_csv(submissions_path, usecols=sub_usecols, low_memory=False)
+        sub = sub.copy()
+        sub["ticker"] = sub["ticker"].astype(str).str.upper().str.strip()
+        sub["cik"] = sub["cik"].astype(str).str.strip()
+        sub["sic"] = pd.to_numeric(sub["sic"], errors="coerce")
+        sub["recent_filings_count"] = pd.to_numeric(sub["recent_filings_count"], errors="coerce")
+        cik_to_ticker = (
+            sub.dropna(subset=["cik", "ticker"])
+            .drop_duplicates(subset=["cik"], keep="last")
+            .set_index("cik")["ticker"]
+            .to_dict()
+        )
+        missing_ticker = cf["ticker"].eq("") | cf["ticker"].isna()
+        if missing_ticker.any():
+            cf.loc[missing_ticker, "ticker"] = cf.loc[missing_ticker, "cik"].map(cik_to_ticker).fillna("")
+
+    cf = cf[cf["ticker"] != ""]
+    if cf.empty:
+        return pd.DataFrame(columns=["date", "ticker"])
+
+    pivot = (
+        cf.pivot_table(index=["date", "ticker"], columns="tag", values="val", aggfunc="last")
+        .sort_index()
+    )
+    pivot.columns = [str(c) for c in pivot.columns]
+    out = pivot.reset_index()
+
+    tag_map = {
+        "Assets": "sec_assets",
+        "Liabilities": "sec_liabilities",
+        "StockholdersEquity": "sec_stockholders_equity",
+        "Revenues": "sec_revenues",
+        "NetIncomeLoss": "sec_net_income",
+        "OperatingIncomeLoss": "sec_operating_income",
+        "GrossProfit": "sec_gross_profit",
+        "LongTermDebtNoncurrent": "sec_long_term_debt",
+        "CashAndCashEquivalentsAtCarryingValue": "sec_cash",
+        "EntityCommonStockSharesOutstanding": "sec_shares_outstanding",
+        "CommonStockSharesOutstanding": "sec_common_shares_outstanding",
+        "EarningsPerShareBasic": "sec_eps_basic",
+        "EarningsPerShareDiluted": "sec_eps_diluted",
+    }
+    rename_cols = {c: tag_map[c] for c in out.columns if c in tag_map}
+    out = out.rename(columns=rename_cols)
+    if "sec_shares_outstanding" not in out.columns and "sec_common_shares_outstanding" in out.columns:
+        out["sec_shares_outstanding"] = out["sec_common_shares_outstanding"]
+
+    if "sec_long_term_debt" in out.columns and "sec_stockholders_equity" in out.columns:
+        out["sec_debt_to_equity"] = _safe_divide_num(out["sec_long_term_debt"], out["sec_stockholders_equity"])
+    if "sec_net_income" in out.columns and "sec_revenues" in out.columns:
+        out["sec_net_margin"] = _safe_divide_num(out["sec_net_income"], out["sec_revenues"])
+    if "sec_operating_income" in out.columns and "sec_revenues" in out.columns:
+        out["sec_operating_margin"] = _safe_divide_num(out["sec_operating_income"], out["sec_revenues"])
+    if "sec_gross_profit" in out.columns and "sec_revenues" in out.columns:
+        out["sec_gross_margin"] = _safe_divide_num(out["sec_gross_profit"], out["sec_revenues"])
+    if "sec_cash" in out.columns and "sec_assets" in out.columns:
+        out["sec_cash_to_assets"] = _safe_divide_num(out["sec_cash"], out["sec_assets"])
+    if "sec_stockholders_equity" in out.columns and "sec_shares_outstanding" in out.columns:
+        out["sec_book_value_per_share"] = _safe_divide_num(
+            out["sec_stockholders_equity"], out["sec_shares_outstanding"]
+        )
+
+    if sub is not None:
+        sub_ticker = (
+            sub[sub["ticker"] != ""]
+            .drop_duplicates(subset=["ticker"], keep="last")[["ticker", "sic", "recent_filings_count"]]
+            .rename(
+                columns={
+                    "sic": "sec_sic",
+                    "recent_filings_count": "sec_recent_filings_count",
+                }
+            )
+        )
+        out = out.merge(sub_ticker, on="ticker", how="left")
+
+    for col in out.columns:
+        if col in {"date", "ticker"}:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.dropna(subset=["date", "ticker"]).sort_values(["date", "ticker"])
+    return out
+
+
 def load_macro_features(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df = df.copy()

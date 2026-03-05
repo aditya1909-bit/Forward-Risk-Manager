@@ -471,10 +471,18 @@ def _prepare_fundamentals_panel(
 ) -> tuple[pd.DataFrame | None, List[str]]:
     if fundamentals is None or fundamentals.empty:
         return None, []
-    cols = [c for c in FUND_COLS if c in fundamentals.columns]
+    cols: List[str] = []
+    for c in fundamentals.columns:
+        if c in {"date", "ticker"}:
+            continue
+        s = pd.to_numeric(fundamentals[c], errors="coerce")
+        if s.notna().any():
+            cols.append(c)
     if not cols:
         return None, []
     df = fundamentals[["date", "ticker"] + cols].dropna(subset=["date", "ticker"]).copy()
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.sort_values(["ticker", "date"])
     frames = []
     for ticker, g in df.groupby("ticker"):

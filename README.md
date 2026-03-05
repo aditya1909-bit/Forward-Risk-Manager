@@ -161,6 +161,10 @@ python scripts/consolidate_data_ff.py \
   --skip-companyfacts
 ```
 
+If your DATA FF folder uses a `submissions` subfolder (not `SEC_XBRL_submissions`), pass `--submissions-dir submissions`.
+
+After consolidation, you can build the **master graph** once (locally or on Colab) and use it for all runs. Sync `data/consolidated_ff_local/` to Drive, then on Colab open `notebooks/colab_setup.ipynb` or run `build_graphs.py` with `configs/master_graph_ff.toml`; the notebooks auto-detect consolidated data and use it for graph build and economic-profit–focused train/benchmark.
+
 ## Rolling Correlation Graphs
 Build rolling correlation graphs using a window size (in trading days). The correlation matrix for each graph is computed from the last `window` days ending at each date.
 
