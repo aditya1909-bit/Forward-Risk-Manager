@@ -5,6 +5,7 @@ from frisk.data import (
     load_macro_features,
     build_macro_features_from_market_data,
     load_static_edges,
+    load_sec_fundamentals,
 )
 
 
@@ -131,3 +132,47 @@ def test_load_static_edges_normalizes_source_target_columns(tmp_path):
     assert edges["dst"].tolist() == ["CCC", "DDD"]
     assert edges["weight"].tolist() == [0.8, 1.2]
     assert edges["directed"].tolist() == [True, False]
+
+
+def test_load_sec_fundamentals_builds_expected_features(tmp_path):
+    companyfacts_csv = tmp_path / "sec_companyfacts_selected.csv"
+    submissions_csv = tmp_path / "sec_submissions_entities.csv"
+
+    pd.DataFrame(
+        {
+            "cik": ["1", "1", "1", "2"],
+            "ticker": ["AAA", "AAA", "AAA", ""],
+            "entity_name": ["A", "A", "A", "B"],
+            "taxonomy": ["us-gaap", "us-gaap", "us-gaap", "us-gaap"],
+            "tag": ["Revenues", "NetIncomeLoss", "Assets", "Liabilities"],
+            "unit": ["USD", "USD", "USD", "USD"],
+            "end": ["2020-03-31", "2020-03-31", "2020-03-31", "2020-03-31"],
+            "val": [100.0, 10.0, 200.0, 50.0],
+            "filed": ["2020-04-20", "2020-04-20", "2020-04-20", "2020-04-21"],
+            "form": ["10-Q", "10-Q", "10-Q", "10-Q"],
+            "fy": [2020, 2020, 2020, 2020],
+            "fp": ["Q1", "Q1", "Q1", "Q1"],
+            "accn": ["x", "x", "x", "y"],
+            "frame": ["f", "f", "f", "f"],
+            "source_file": ["a", "a", "a", "b"],
+        }
+    ).to_csv(companyfacts_csv, index=False)
+
+    pd.DataFrame(
+        {
+            "cik": ["1", "2"],
+            "ticker": ["AAA", "BBB"],
+            "sic": [1234, 5678],
+            "recent_filings_count": [9, 5],
+        }
+    ).to_csv(submissions_csv, index=False)
+
+    out = load_sec_fundamentals(companyfacts_csv, submissions_path=submissions_csv)
+    assert not out.empty
+    assert {"date", "ticker", "sec_revenues", "sec_net_income", "sec_assets", "sec_net_margin"}.issubset(
+        out.columns
+    )
+    aaa = out[out["ticker"] == "AAA"].iloc[-1]
+    assert aaa["sec_net_margin"] == 0.1
+    assert aaa["sec_sic"] == 1234
+    assert aaa["sec_recent_filings_count"] == 9

@@ -88,6 +88,11 @@ def main() -> int:
         help="Append SEC-derived fundamentals features from sec_companyfacts/submissions CSVs.",
     )
     parser.add_argument(
+        "--no-sec-as-fundamentals",
+        action="store_true",
+        help="Disable SEC-derived fundamentals even if enabled in config.",
+    )
+    parser.add_argument(
         "--macro", help="Optional macro feature CSV (date + feature columns)", default=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -322,6 +327,18 @@ def main() -> int:
         action="store_true",
         help="Disable progress bar output",
     )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable progress bar output (overrides config).",
+    )
+    parser.add_argument(
+        "--volume-complete-required",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Require complete volume history per window/ticker (stricter; may drop more windows).",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -333,6 +350,8 @@ def main() -> int:
     sec_companyfacts_path = _get_setting(args, section, "sec_companyfacts", None)
     sec_submissions_path = _get_setting(args, section, "sec_submissions", None)
     sec_as_fundamentals = bool(_get_setting(args, section, "sec_as_fundamentals", True))
+    if getattr(args, "no_sec_as_fundamentals", False):
+        sec_as_fundamentals = False
     macro_path = _get_setting(args, section, "macro", None)
     macro_auto = bool(_get_setting(args, section, "macro_auto", False))
     macro_auto_short_window = int(_get_setting(args, section, "macro_auto_short_window", 21))
@@ -387,12 +406,15 @@ def main() -> int:
     joblib_prefer = _get_setting(args, section, "joblib_prefer", "threads")
     joblib_n_jobs = _get_setting(args, section, "joblib_n_jobs", None)
     progress = _get_setting(args, section, "progress", True)
+    volume_complete_required = bool(_get_setting(args, section, "volume_complete_required", False))
     if isinstance(joblib_n_jobs, str) and joblib_n_jobs.lower() in ("", "none", "null"):
         joblib_n_jobs = None
     if isinstance(joblib_n_jobs, int) and joblib_n_jobs <= 0:
         joblib_n_jobs = None
     if getattr(args, "no_progress", False):
         progress = False
+    elif getattr(args, "progress", False):
+        progress = True
 
     if isinstance(include_tickers, str):
         include_tickers = [t.strip() for t in include_tickers.split(",") if t.strip()]
@@ -480,7 +502,9 @@ def main() -> int:
         )
         if fundamentals is not None and not fundamentals.empty:
             fundamentals = (
-                fundamentals.sort_values(["date", "ticker"]).drop_duplicates(["date", "ticker"], keep="last")
+                fundamentals.sort_values(["date", "ticker"])
+                .groupby(["date", "ticker"], as_index=False)
+                .last()
             )
         print(
             "SEC fundamentals:",
@@ -562,6 +586,7 @@ def main() -> int:
         sector_static_weight=float(sector_static_weight),
         sector_static_top_k=_optional_int(sector_static_top_k),
         static_edge_weight=float(static_edge_weight),
+        volume_complete_required=bool(volume_complete_required),
     )
 
     graphs, dates, tickers, stats = build_rolling_corr_graphs(

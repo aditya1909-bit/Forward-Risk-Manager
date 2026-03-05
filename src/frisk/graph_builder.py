@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import time
 
 import numpy as np
 import torch
@@ -55,6 +56,9 @@ class GraphBuildConfig:
     feature_lag_days: int = 0
     membership_lag_days: int = 0
     macro_lag_days: int = 0
+    # When true, require complete (non-NaN) volume history per window for each ticker.
+    # Default false to avoid over-pruning windows when volume coverage is sparse.
+    volume_complete_required: bool = False
 
 
 def _select_edges(
@@ -211,9 +215,14 @@ def _compute_summary_features(
 
     if window_volume is not None:
         vols = window_volume.to_numpy(dtype=float).T
-        last = vols[:, -1].astype(float, copy=False)
+        last_raw = vols[:, -1].astype(float, copy=False)
         mean = np.nanmean(vols, axis=1)
-        vol_shock = np.divide(last, mean, out=np.ones(last.shape, dtype=float), where=mean > 0)
+        # If last volume is missing, fall back to window mean; if still missing use neutral 1.0.
+        last = np.where(np.isfinite(last_raw), last_raw, mean)
+        last = np.where(np.isfinite(last), last, 1.0)
+        mean_safe = np.where(np.isfinite(mean) & (mean > 0), mean, 1.0)
+        vol_shock = np.divide(last, mean_safe, out=np.ones(last.shape, dtype=float), where=mean_safe > 0)
+        vol_shock = np.nan_to_num(vol_shock, nan=1.0, posinf=1.0, neginf=1.0)
     else:
         vol_shock = np.ones(n)
 
@@ -572,8 +581,11 @@ def _build_node_features(
     if feature_mode == "window_plus_summary_fund" and fund_features is not None:
         fund = fund_features.copy()
         # Fill missing fundamentals with per-column median (or zero if all missing)
-        med = np.nanmedian(fund, axis=0)
-        med = np.where(np.isnan(med), 0.0, med)
+        med = np.zeros(fund.shape[1], dtype=float)
+        for j in range(fund.shape[1]):
+            col = fund[:, j]
+            col = col[np.isfinite(col)]
+            med[j] = float(np.median(col)) if col.size else 0.0
         inds = np.where(np.isnan(fund))
         if inds[0].size:
             fund[inds] = np.take(med, inds[1])
@@ -638,13 +650,17 @@ def _window_to_graph_data(
 
     if window_volume is not None:
         window_volume = window_volume[cols]
-        vol_cols = window_volume.notna().all(axis=0)
-        cols = [c for c in cols if bool(vol_cols.get(c, False))]
-        if not cols:
-            return None, "no_cols"
-        corr_window_df = corr_window_df[cols]
-        window_df = window_df[cols]
-        window_volume = window_volume[cols]
+        if bool(getattr(config, "volume_complete_required", False)):
+            vol_cols = window_volume.notna().all(axis=0)
+            cols = [c for c in cols if bool(vol_cols.get(c, False))]
+            if not cols:
+                return None, "no_cols"
+            corr_window_df = corr_window_df[cols]
+            window_df = window_df[cols]
+            window_volume = window_volume[cols]
+        else:
+            # Keep ticker coverage broad and impute sparse volume locally per window.
+            window_volume = window_volume.ffill().bfill().fillna(1.0)
     # Use the post-dropna columns for all downstream alignment
     cols = list(window_df.columns)
     if window_df.shape[1] < config.min_nodes:
@@ -899,86 +915,33 @@ def build_rolling_corr_graphs(
             static_edge_map,
         )
 
-    backend = (parallel_backend or "threadpool").lower()
-    use_parallel = num_workers is not None and num_workers > 1 and backend not in ("none", "serial")
+    progress_total = len(eligible_end_indices)
+    progress_done = 0
+    progress_t0 = time.perf_counter()
+    progress_last_log = progress_t0
 
-    if use_parallel and backend in ("joblib", "loky"):
-        try:
-            from joblib import Parallel, delayed  # type: ignore
+    def _log_progress(force: bool = False) -> None:
+        nonlocal progress_last_log
+        if not progress or progress_total <= 0:
+            return
+        now = time.perf_counter()
+        if not force and (now - progress_last_log) < 10.0 and progress_done < progress_total:
+            return
+        elapsed = max(1e-9, now - progress_t0)
+        rate = progress_done / elapsed
+        remaining = max(0, progress_total - progress_done)
+        eta_s = remaining / max(rate, 1e-9)
+        pct = 100.0 * (progress_done / progress_total)
+        print(
+            f"Build progress: {progress_done}/{progress_total} ({pct:.1f}%) | "
+            f"{rate:.2f} win/s | ETA {eta_s/60.0:.1f} min",
+            flush=True,
+        )
+        progress_last_log = now
 
-            n_jobs = joblib_n_jobs if joblib_n_jobs is not None else num_workers
-            if progress and joblib_prefer == "threads":
-                pbar = tqdm(
-                    total=len(eligible_end_indices),
-                    desc="Building graphs",
-                    unit="win",
-                    dynamic_ncols=True,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                )
-
-                def _task_pbar(end_idx: int):
-                    res = _task(end_idx)
-                    pbar.update(1)
-                    return res
-
-                results = Parallel(
-                    n_jobs=n_jobs,
-                    prefer=joblib_prefer,
-                    batch_size="auto",
-                )(delayed(_task_pbar)(end_idx) for end_idx in eligible_end_indices)
-                pbar.close()
-            else:
-                results = Parallel(
-                    n_jobs=n_jobs,
-                    prefer=joblib_prefer,
-                    batch_size="auto",
-                )(delayed(_task)(end_idx) for end_idx in eligible_end_indices)
-        except Exception as exc:
-            print(f"joblib parallel failed ({exc}); falling back to ThreadPoolExecutor")
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                it = executor.map(_task, eligible_end_indices)
-                if progress:
-                    it = tqdm(
-                        it,
-                        total=len(eligible_end_indices),
-                        desc="Building graphs",
-                        unit="win",
-                        dynamic_ncols=True,
-                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                    )
-                results = list(it)
-    elif use_parallel:
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            it = executor.map(_task, eligible_end_indices)
-            if progress:
-                it = tqdm(
-                    it,
-                    total=len(eligible_end_indices),
-                    desc="Building graphs",
-                    unit="win",
-                    dynamic_ncols=True,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                )
-            results = list(it)
-    else:
-        it = eligible_end_indices
-        if progress:
-            it = tqdm(
-                it,
-                total=len(eligible_end_indices),
-                desc="Building graphs",
-                unit="win",
-                dynamic_ncols=True,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-            )
-        results = [_task(end_idx) for end_idx in it]
-
-    stats["total_windows"] = len(raw_end_indices)
-    for result, reason in results:
+    def _consume_result(result, reason: str) -> None:
+        nonlocal progress_done
+        progress_done += 1
         if result is None:
             if reason == "lag_history":
                 stats["skipped_lag_history"] += 1
@@ -990,7 +953,8 @@ def build_rolling_corr_graphs(
                 stats["skipped_min_nodes"] += 1
             elif reason == "no_edges":
                 stats["skipped_no_edges"] += 1
-            continue
+            _log_progress(force=False)
+            return
         end_date, tickers, src, dst, w, rel_mask, rel_lag, x, ret_mean, ret_std = result
         edge_index = torch.from_numpy(np.stack([src, dst], axis=0)).long()
         edge_attr = torch.from_numpy(w).float().unsqueeze(-1)
@@ -1027,5 +991,93 @@ def build_rolling_corr_graphs(
         graph_dates.append(end_date)
         node_tickers.append(tickers)
         stats["built"] += 1
+        _log_progress(force=False)
+
+    backend = (parallel_backend or "threadpool").lower()
+    use_parallel = num_workers is not None and num_workers > 1 and backend not in ("none", "serial")
+
+    if use_parallel and backend in ("joblib", "loky"):
+        try:
+            from joblib import Parallel, delayed  # type: ignore
+
+            n_jobs = joblib_n_jobs if joblib_n_jobs is not None else num_workers
+            if progress and joblib_prefer == "threads":
+                pbar = tqdm(
+                    total=len(eligible_end_indices),
+                    desc="Building graphs",
+                    unit="win",
+                    dynamic_ncols=True,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                )
+
+                def _task_pbar(end_idx: int):
+                    res = _task(end_idx)
+                    pbar.update(1)
+                    return res
+
+                results = Parallel(
+                    n_jobs=n_jobs,
+                    prefer=joblib_prefer,
+                    batch_size="auto",
+                )(delayed(_task_pbar)(end_idx) for end_idx in eligible_end_indices)
+                pbar.close()
+            else:
+                results = Parallel(
+                    n_jobs=n_jobs,
+                    prefer=joblib_prefer,
+                    batch_size="auto",
+                )(delayed(_task)(end_idx) for end_idx in eligible_end_indices)
+            for result, reason in results:
+                _consume_result(result, reason)
+        except Exception as exc:
+            print(f"joblib parallel failed ({exc}); falling back to ThreadPoolExecutor")
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                it = executor.map(_task, eligible_end_indices)
+                if progress:
+                    it = tqdm(
+                        it,
+                        total=len(eligible_end_indices),
+                        desc="Building graphs",
+                        unit="win",
+                        dynamic_ncols=True,
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                    )
+                for result, reason in it:
+                    _consume_result(result, reason)
+    elif use_parallel:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            it = executor.map(_task, eligible_end_indices)
+            if progress:
+                it = tqdm(
+                    it,
+                    total=len(eligible_end_indices),
+                    desc="Building graphs",
+                    unit="win",
+                    dynamic_ncols=True,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                )
+            for result, reason in it:
+                _consume_result(result, reason)
+    else:
+        it = eligible_end_indices
+        if progress:
+            it = tqdm(
+                it,
+                total=len(eligible_end_indices),
+                desc="Building graphs",
+                unit="win",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+        for end_idx in it:
+            result, reason = _task(end_idx)
+            _consume_result(result, reason)
+
+    stats["total_windows"] = len(raw_end_indices)
+    _log_progress(force=True)
 
     return graphs, graph_dates, node_tickers, stats

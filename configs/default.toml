@@ -133,6 +133,7 @@ ff_neg_mix = ["time_flip", "sector_swap", "factor_hard", "noise"]
 ff_neg_mix_weights = [0.35, 0.25, 0.25, 0.15]
 ff_curriculum_epochs = [0.33, 0.34, 0.33]
 ff_rank_aux_weight = 0.02
+ff_rank_corr_weight = 0.01
 ff_rank_use_portfolio_targets = true
 ff_hall_every_n_batches = 3
 ff_hall_warmup_epochs = 3

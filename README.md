@@ -165,6 +165,13 @@ If your DATA FF folder uses a `submissions` subfolder (not `SEC_XBRL_submissions
 
 After consolidation, you can build the **master graph** once (locally or on Colab) and use it for all runs. Sync `data/consolidated_ff_local/` to Drive, then on Colab open `notebooks/colab_setup.ipynb` or run `build_graphs.py` with `configs/master_graph_ff.toml`; the notebooks auto-detect consolidated data and use it for graph build and economic-profit–focused train/benchmark.
 
+For a dedicated build-only Colab workflow, use `notebooks/graph_factory_colab.ipynb`. It creates a reusable graph artifact (`data/processed/graphs_master_ff_rich.pt`) plus a fingerprint manifest so unchanged inputs/config can skip rebuilds.
+
+`build_graphs.py` now also supports SEC-derived node features directly from consolidation outputs:
+- `sec_companyfacts` -> parsed into per-ticker, per-date features and accounting ratios
+- `sec_submissions` -> optional ticker-level metadata features (e.g. `sec_sic`, `sec_recent_filings_count`)
+- use `feature_mode = "window_plus_summary_fund"` to append these SEC fundamentals to node features
+
 ## Rolling Correlation Graphs
 Build rolling correlation graphs using a window size (in trading days). The correlation matrix for each graph is computed from the last `window` days ending at each date.
 
@@ -385,6 +392,7 @@ Stability add-ons:
 - `neg_gate_margin`: if hallucinated negatives are too strong (`g_neg > g_pos + margin`), fall back to shuffle for that batch.
 - `grad_clip`: gradient norm clipping to reduce instability.
 - `ff_rank_aux_weight`: rank-spread auxiliary on goodness.
+- `ff_rank_corr_weight`: correlation auxiliary between graph goodness and forward-return targets (economics alignment).
 - `ff_rank_use_portfolio_targets = true`: when graph dates are available, rank aux is aligned to forward-return targets (`portfolio_ticker`/`portfolio_horizon`) instead of pure unsupervised spread.
 
 Distance-forward auxiliary loss (graph-level pairwise margin):
@@ -400,6 +408,7 @@ Recommended run location: `runs/experiments/<run_id>/metrics/ff_train.csv` and `
 Published snapshots should live under `reports/published/`.
 The CSV now includes `hall_hardness` (avg `g_neg - g_pos` for hallucinated batches).
 It also includes `dist_forward_loss` when distance-forward auxiliary training is enabled.
+When enabled, it also reports `rank_aux_loss` and `rank_corr_loss`.
 
 ## Baseline Config
 The current tuned baseline is stored at `configs/baseline.toml`.

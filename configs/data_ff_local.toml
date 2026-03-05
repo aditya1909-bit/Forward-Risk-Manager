@@ -3,6 +3,9 @@
 prices = "data/consolidated_ff_local/prices.csv"
 macro = "data/consolidated_ff_local/macro.csv"
 fundamentals = ""
+sec_companyfacts = "data/consolidated_ff_local/sec_companyfacts_selected.csv"
+sec_submissions = "data/consolidated_ff_local/sec_submissions_entities.csv"
+sec_as_fundamentals = true
 constituents = ""
 
 # Write the final graph artifact into Drive-backed repo storage.
@@ -17,7 +20,7 @@ min_nodes = 300
 membership_mode = "all"
 membership_fill = "none"
 
-feature_mode = "window_plus_summary"
+feature_mode = "window_plus_summary_fund"
 macro_lag_days = 1
 corr_lag_days = 1
 feature_lag_days = 1
@@ -29,6 +32,7 @@ edge_select_mode = "top_k"
 normalize = true
 symmetric = true
 
-workers = 8
-parallel_backend = "threadpool"
+# Colab-safe defaults; override via CLI for larger local machines.
+workers = 1
+parallel_backend = "serial"
 progress = true

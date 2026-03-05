@@ -34,6 +34,7 @@ from frisk.ff import (
     make_negative,
     pairwise_distance_forward_loss,
     permute_graph_embeddings,
+    rank_spread_loss,
     self_contrastive_loss,
     self_contrastive_retrieval_accuracy,
 )
@@ -243,6 +244,73 @@ def _compute_multi_horizon_risk_loss(
     if risk_loss_type == "mse":
         return torch.nn.functional.mse_loss(pred[mask], target[mask])
     return torch.nn.functional.smooth_l1_loss(pred[mask], target[mask])
+
+
+def _goodness_rank_alignment_loss(
+    g_scores: torch.Tensor,
+    graph_idx,
+    portfolio_targets: list[float | None] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if portfolio_targets is None:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+    target_vals = []
+    for gi in idx_list:
+        if 0 <= int(gi) < len(portfolio_targets):
+            tv = portfolio_targets[int(gi)]
+        else:
+            tv = None
+        target_vals.append(float(tv) if tv is not None else float("nan"))
+    t = torch.tensor(target_vals, dtype=g_scores.dtype, device=device)
+    mask = torch.isfinite(t)
+    if int(mask.sum().item()) < 4:
+        return None
+    g = g_scores[mask]
+    t = t[mask]
+    k = max(1, min(int(g.numel() // 2), int(round(0.2 * g.numel()))))
+    hi = torch.topk(t, k=k, largest=True).indices
+    lo = torch.topk(t, k=k, largest=False).indices
+    spread = g.index_select(0, hi).mean() - g.index_select(0, lo).mean()
+    return torch.nn.functional.softplus(0.1 - spread)
+
+
+def _goodness_return_correlation_loss(
+    g_scores: torch.Tensor,
+    graph_idx,
+    portfolio_targets: list[float | None] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if portfolio_targets is None:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+    target_vals = []
+    for gi in idx_list:
+        if 0 <= int(gi) < len(portfolio_targets):
+            tv = portfolio_targets[int(gi)]
+        else:
+            tv = None
+        target_vals.append(float(tv) if tv is not None else float("nan"))
+    t = torch.tensor(target_vals, dtype=g_scores.dtype, device=device)
+    mask = torch.isfinite(t)
+    if int(mask.sum().item()) < 4:
+        return None
+    g = g_scores[mask]
+    t = t[mask]
+    g = (g - g.mean()) / (g.std(unbiased=False) + 1e-6)
+    t = (t - t.mean()) / (t.std(unbiased=False) + 1e-6)
+    corr = (g * t).mean()
+    return 1.0 - corr
 
 
 def _load_config(path: str) -> dict:
@@ -1439,6 +1507,10 @@ def _benchmark_ff(
         ).to(device)
     portfolio_targets = config.get("portfolio_targets")
     portfolio_head_active = bool(config.get("portfolio_head_enabled", False)) and bool(portfolio_targets)
+    ff_rank_aux_weight = max(0.0, float(config.get("ff_rank_aux_weight", 0.0)))
+    ff_rank_corr_weight = max(0.0, float(config.get("ff_rank_corr_weight", 0.0)))
+    ff_rank_use_portfolio_targets = bool(config.get("ff_rank_use_portfolio_targets", True))
+    ff_rank_targets = portfolio_targets if ff_rank_use_portfolio_targets else None
     if layerwise and portfolio_head_active:
         print("portfolio_head disabled for ff_layerwise benchmarking.")
         portfolio_head_active = False
@@ -1555,6 +1627,10 @@ def _benchmark_ff(
     risk_batches = 0
     portfolio_loss_sum = 0.0
     portfolio_batches = 0
+    rank_aux_sum = 0.0
+    rank_aux_batches = 0
+    rank_corr_sum = 0.0
+    rank_corr_batches = 0
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -1912,6 +1988,35 @@ def _benchmark_ff(
                         )
                         if portfolio_loss_val is not None:
                             loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
+                rank_aux_val = None
+                rank_corr_val = None
+                if ff_rank_aux_weight > 0 or ff_rank_corr_weight > 0:
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        g_rank = goodness(
+                            h_pos,
+                            batch.batch,
+                            temperature=config["goodness_temp"],
+                            critic=critic,
+                        )
+                    if ff_rank_aux_weight > 0:
+                        rank_aux_val = _goodness_rank_alignment_loss(
+                            g_rank,
+                            graph_idx=batch.graph_idx,
+                            portfolio_targets=ff_rank_targets,
+                            device=device,
+                        )
+                        if rank_aux_val is None:
+                            rank_aux_val = rank_spread_loss(g_rank)
+                        loss = loss + ff_rank_aux_weight * rank_aux_val
+                    if ff_rank_corr_weight > 0:
+                        rank_corr_val = _goodness_return_correlation_loss(
+                            g_rank,
+                            graph_idx=batch.graph_idx,
+                            portfolio_targets=ff_rank_targets,
+                            device=device,
+                        )
+                        if rank_corr_val is not None:
+                            loss = loss + ff_rank_corr_weight * rank_corr_val
                 t_opt = time.perf_counter()
                 _optimizer_step(
                     optim=optim,
@@ -1928,6 +2033,12 @@ def _benchmark_ff(
                 if portfolio_loss_val is not None:
                     portfolio_loss_sum += float(portfolio_loss_val.detach())
                     portfolio_batches += 1
+                if rank_aux_val is not None:
+                    rank_aux_sum += float(rank_aux_val.detach())
+                    rank_aux_batches += 1
+                if rank_corr_val is not None:
+                    rank_corr_sum += float(rank_corr_val.detach())
+                    rank_corr_batches += 1
 
             batch_elapsed = time.perf_counter() - batch_t0
             known_elapsed = sum(
@@ -1990,6 +2101,8 @@ def _benchmark_ff(
     avg_gps = float(np.mean([g / t for t, g in usable]))
     risk_loss_train = risk_loss_sum / risk_batches if risk_batches else 0.0
     portfolio_loss_train = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
+    rank_aux_train = rank_aux_sum / rank_aux_batches if rank_aux_batches else 0.0
+    rank_corr_train = rank_corr_sum / rank_corr_batches if rank_corr_batches else 0.0
     steps_denom = max(1, int(steps_total))
     out = {
         "avg_epoch_s": avg_time,
@@ -2009,6 +2122,8 @@ def _benchmark_ff(
         "risk_loss_train": risk_loss_train,
         "portfolio_head_enabled_effective": bool(portfolio_head is not None),
         "portfolio_loss_train": portfolio_loss_train,
+        "rank_aux_loss_train": rank_aux_train,
+        "rank_corr_loss_train": rank_corr_train,
     }
     if risk_head is not None:
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
@@ -2581,6 +2696,10 @@ def main() -> int:
         "ff_neg_mix_weights": train_cfg.get("ff_neg_mix_weights", []),
         "ff_curriculum_epochs": train_cfg.get("ff_curriculum_epochs", []),
         "ff_rank_aux_weight": float(train_cfg.get("ff_rank_aux_weight", 0.0)),
+        "ff_rank_corr_weight": float(train_cfg.get("ff_rank_corr_weight", 0.0)),
+        "ff_rank_use_portfolio_targets": bool(
+            train_cfg.get("ff_rank_use_portfolio_targets", True)
+        ),
         "ff_hall_every_n_batches": int(train_cfg.get("ff_hall_every_n_batches", 1)),
         "ff_hall_warmup_epochs": int(train_cfg.get("ff_hall_warmup_epochs", 0)),
         "ff_hall_steps": int(train_cfg.get("ff_hall_steps", train_cfg.get("hallucinate_steps", 3))),
@@ -2871,10 +2990,18 @@ def main() -> int:
 
     config["portfolio_targets"] = None
     config["portfolio_ticker_effective"] = str(config.get("portfolio_ticker", "AUTO"))
-    if bool(config.get("portfolio_head_enabled", False)):
+    rank_needs_portfolio_targets = bool(config.get("ff_rank_use_portfolio_targets", True)) and (
+        float(config.get("ff_rank_aux_weight", 0.0)) > 0.0
+        or float(config.get("ff_rank_corr_weight", 0.0)) > 0.0
+    )
+    load_portfolio_targets = bool(config.get("portfolio_head_enabled", False)) or rank_needs_portfolio_targets
+    if load_portfolio_targets:
         if not graph_dates:
             config["portfolio_head_enabled"] = False
-            print("warning: disabled portfolio_head in benchmark: graphs payload missing dates.")
+            if rank_needs_portfolio_targets:
+                print("warning: rank auxiliary portfolio targets unavailable: graphs payload missing dates.")
+            else:
+                print("warning: disabled portfolio_head in benchmark: graphs payload missing dates.")
         else:
             prices_path = str(build_cfg.get("prices", "data/processed/prices.csv"))
             try:
@@ -2903,7 +3030,10 @@ def main() -> int:
                 )
             except Exception as exc:
                 config["portfolio_head_enabled"] = False
-                print(f"warning: disabled portfolio_head in benchmark: {exc}")
+                if rank_needs_portfolio_targets:
+                    print(f"warning: rank auxiliary portfolio targets unavailable: {exc}")
+                else:
+                    print(f"warning: disabled portfolio_head in benchmark: {exc}")
 
     mode_overrides = bench_cfg.get("mode_overrides", {})
     if not isinstance(mode_overrides, dict):

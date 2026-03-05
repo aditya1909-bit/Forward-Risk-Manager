@@ -492,6 +492,40 @@ def _goodness_rank_alignment_loss(
     return F.softplus(0.1 - spread)
 
 
+def _goodness_return_correlation_loss(
+    g_scores: torch.Tensor,
+    graph_idx,
+    portfolio_targets: list[float | None] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if portfolio_targets is None:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx_list = graph_idx.detach().cpu().tolist()
+    elif isinstance(graph_idx, (list, tuple)):
+        idx_list = list(graph_idx)
+    else:
+        idx_list = [int(graph_idx)]
+    target_vals = []
+    for gi in idx_list:
+        if 0 <= int(gi) < len(portfolio_targets):
+            tv = portfolio_targets[int(gi)]
+        else:
+            tv = None
+        target_vals.append(float(tv) if tv is not None else float("nan"))
+    t = torch.tensor(target_vals, dtype=g_scores.dtype, device=device)
+    mask = torch.isfinite(t)
+    if int(mask.sum().item()) < 4:
+        return None
+    g = g_scores[mask]
+    t = t[mask]
+    g = (g - g.mean()) / (g.std(unbiased=False) + 1e-6)
+    t = (t - t.mean()) / (t.std(unbiased=False) + 1e-6)
+    corr = (g * t).mean()
+    # Maximize correlation between graph goodness and forward-return targets.
+    return 1.0 - corr
+
+
 def _compute_risk_targets(
     prices_path: str,
     ticker: str,
@@ -1233,6 +1267,7 @@ def main() -> int:
     parser.add_argument("--ff-neg-mix-weights", default=argparse.SUPPRESS)
     parser.add_argument("--ff-curriculum-epochs", default=argparse.SUPPRESS)
     parser.add_argument("--ff-rank-aux-weight", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--ff-rank-corr-weight", type=float, default=argparse.SUPPRESS)
     parser.add_argument(
         "--ff-rank-use-portfolio-targets",
         action="store_true",
@@ -1382,6 +1417,7 @@ def main() -> int:
     ff_neg_mix_weights_raw = _get_setting(args, section, "ff_neg_mix_weights", [])
     ff_curriculum_epochs_raw = _get_setting(args, section, "ff_curriculum_epochs", [])
     ff_rank_aux_weight = float(_get_setting(args, section, "ff_rank_aux_weight", 0.0))
+    ff_rank_corr_weight = float(_get_setting(args, section, "ff_rank_corr_weight", 0.0))
     ff_rank_use_portfolio_targets = _to_bool(
         _get_setting(args, section, "ff_rank_use_portfolio_targets", True)
     )
@@ -1690,6 +1726,7 @@ def main() -> int:
     ff_neg_mix_weights = _normalize_mode_weights(ff_neg_mix, _parse_float_list(ff_neg_mix_weights_raw))
     ff_curriculum_epochs = _parse_float_list(ff_curriculum_epochs_raw)
     ff_rank_aux_weight = max(0.0, float(ff_rank_aux_weight))
+    ff_rank_corr_weight = max(0.0, float(ff_rank_corr_weight))
     ff_rank_use_portfolio_targets = bool(ff_rank_use_portfolio_targets)
     ff_hall_every_n_batches = max(1, int(ff_hall_every_n_batches))
     ff_hall_warmup_epochs = max(0, int(ff_hall_warmup_epochs))
@@ -1859,9 +1896,9 @@ def main() -> int:
             f"weight={portfolio_loss_weight} type={portfolio_loss_type} std={portfolio_standardize} "
             f"max_abs_logret={portfolio_max_abs_logret}"
         )
-    if ff_rank_aux_weight > 0:
+    if ff_rank_aux_weight > 0 or ff_rank_corr_weight > 0:
         print(
-            f"ff_rank_aux: weight={ff_rank_aux_weight} "
+            f"ff_rank_aux: weight={ff_rank_aux_weight} corr_weight={ff_rank_corr_weight} "
             f"portfolio_targets={ff_rank_use_portfolio_targets and not ff_layerwise}"
         )
     print(
@@ -2369,6 +2406,7 @@ def main() -> int:
                 "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
                 "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
                 "hall_node_fraction_used,rank_aux_loss,"
+                "rank_corr_loss,"
                 "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
                 "time_loss_terms_s,time_optimizer_s\n"
             )
@@ -2419,6 +2457,7 @@ def main() -> int:
         portfolio_batches = 0
         dist_forward_sum = 0.0
         rank_aux_sum = 0.0
+        rank_corr_sum = 0.0
         timing_totals = {
             "neg_gen": 0.0,
             "hallucinate": 0.0,
@@ -2867,10 +2906,12 @@ def main() -> int:
                     if portfolio_loss_val is not None:
                         batch_loss = batch_loss + portfolio_loss_weight * portfolio_loss_val
                 rank_aux_val = None
-                if ff_rank_aux_weight > 0:
+                rank_corr_val = None
+                if ff_rank_aux_weight > 0 or ff_rank_corr_weight > 0:
                     g_rank = goodness(
                         layers_pos[-1], batch.batch, temperature=goodness_temp, critic=critic
                     )
+                if ff_rank_aux_weight > 0:
                     rank_aux_val = _goodness_rank_alignment_loss(
                         g_rank,
                         graph_idx=batch.graph_idx,
@@ -2880,6 +2921,15 @@ def main() -> int:
                     if rank_aux_val is None:
                         rank_aux_val = rank_spread_loss(g_rank)
                     batch_loss = batch_loss + ff_rank_aux_weight * rank_aux_val
+                if ff_rank_corr_weight > 0:
+                    rank_corr_val = _goodness_return_correlation_loss(
+                        g_rank,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                    )
+                    if rank_corr_val is not None:
+                        batch_loss = batch_loss + ff_rank_corr_weight * rank_corr_val
 
                 t_opt = time.perf_counter()
                 _optimizer_step(
@@ -2907,6 +2957,8 @@ def main() -> int:
                     portfolio_batches += 1
                 if rank_aux_val is not None:
                     rank_aux_sum += float(rank_aux_val.detach())
+                if rank_corr_val is not None:
+                    rank_corr_sum += float(rank_corr_val.detach())
                 if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
                     dist_forward_sum += float(dist_loss_val.detach())
             elif ff_layerwise:
@@ -3463,8 +3515,10 @@ def main() -> int:
                     if portfolio_loss_val is not None:
                         loss = loss + portfolio_loss_weight * portfolio_loss_val
                 rank_aux_val = None
-                if ff_rank_aux_weight > 0:
+                rank_corr_val = None
+                if ff_rank_aux_weight > 0 or ff_rank_corr_weight > 0:
                     g_rank = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+                if ff_rank_aux_weight > 0:
                     rank_aux_val = _goodness_rank_alignment_loss(
                         g_rank,
                         graph_idx=batch.graph_idx,
@@ -3474,6 +3528,15 @@ def main() -> int:
                     if rank_aux_val is None:
                         rank_aux_val = rank_spread_loss(g_rank)
                     loss = loss + ff_rank_aux_weight * rank_aux_val
+                if ff_rank_corr_weight > 0:
+                    rank_corr_val = _goodness_return_correlation_loss(
+                        g_rank,
+                        graph_idx=batch.graph_idx,
+                        portfolio_targets=portfolio_targets,
+                        device=device,
+                    )
+                    if rank_corr_val is not None:
+                        loss = loss + ff_rank_corr_weight * rank_corr_val
                 t_opt = time.perf_counter()
                 _optimizer_step(
                     optim=optim,
@@ -3500,6 +3563,8 @@ def main() -> int:
                     portfolio_batches += 1
                 if rank_aux_val is not None:
                     rank_aux_sum += float(rank_aux_val.detach())
+                if rank_corr_val is not None:
+                    rank_corr_sum += float(rank_corr_val.detach())
                 if distance_forward_weight > 0 and isinstance(dist_loss_val, torch.Tensor):
                     dist_forward_sum += float(dist_loss_val.detach())
             batch_elapsed = time.perf_counter() - batch_t0
@@ -3520,6 +3585,7 @@ def main() -> int:
         portfolio_loss_epoch = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
         dist_forward_epoch = dist_forward_sum / batches if batches else 0.0
         rank_aux_epoch = rank_aux_sum / batches if batches else 0.0
+        rank_corr_epoch = rank_corr_sum / batches if batches else 0.0
         time_neg_gen_epoch = timing_totals["neg_gen"] / batches if batches else 0.0
         time_hall_epoch = timing_totals["hallucinate"] / batches if batches else 0.0
         time_fwd_pos_epoch = timing_totals["forward_pos"] / batches if batches else 0.0
@@ -3656,6 +3722,7 @@ def main() -> int:
                     f"{epoch_goodness_target:.6f},{epoch_neg_mix_end:.6f},{epoch_neg_gate_margin:.6f},"
                     f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f},"
                     f"{rank_aux_epoch:.6f},"
+                    f"{rank_corr_epoch:.6f},"
                     f"{time_neg_gen_epoch:.6f},{time_hall_epoch:.6f},{time_fwd_pos_epoch:.6f},{time_fwd_neg_epoch:.6f},"
                     f"{time_loss_epoch:.6f},{time_opt_epoch:.6f}\n"
                 )
