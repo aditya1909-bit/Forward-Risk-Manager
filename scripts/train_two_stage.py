@@ -70,6 +70,12 @@ def _apply_section_overrides(cmd: list[str], section: dict, keys: list[str]) -> 
     for key in keys:
         if key not in section:
             continue
+        if key == "graph_limit_keep_recent":
+            if bool(section.get(key, True)):
+                cmd.append("--graph-limit-keep-recent")
+            else:
+                cmd.append("--graph-limit-keep-earliest")
+            continue
         flag = "--" + key.replace("_", "-")
         _append_flag(cmd, flag, section.get(key))
 
@@ -244,6 +250,26 @@ def main() -> int:
         [
             "epochs",
             "batch_size",
+            "graph_stride",
+            "graph_limit",
+            "graph_limit_keep_recent",
+            "epoch_graph_fraction",
+            "epoch_graph_min",
+            "epoch_graph_mode",
+            "epoch_graph_recent_bias_alpha",
+            "epoch_graph_regime_change_boost",
+            "epoch_graph_regime_change_spread",
+            "epoch_graph_regime_loss_scale",
+            "epoch_graph_regime_loss_cap_percentile",
+            "ff_dual_neg_every_n_batches",
+            "adaptive_dual_neg_enabled",
+            "adaptive_dual_neg_warmup_epochs",
+            "adaptive_dual_neg_min_every_n_batches",
+            "adaptive_dual_neg_max_every_n_batches",
+            "adaptive_dual_neg_sep_low",
+            "adaptive_dual_neg_sep_high",
+            "adaptive_dual_neg_forward_neg_share_high",
+            "adaptive_dual_neg_step_factor",
             "lr",
             "hidden_dim",
             "num_layers",
@@ -297,6 +323,26 @@ def main() -> int:
         [
             "epochs",
             "batch_size",
+            "graph_stride",
+            "graph_limit",
+            "graph_limit_keep_recent",
+            "epoch_graph_fraction",
+            "epoch_graph_min",
+            "epoch_graph_mode",
+            "epoch_graph_recent_bias_alpha",
+            "epoch_graph_regime_change_boost",
+            "epoch_graph_regime_change_spread",
+            "epoch_graph_regime_loss_scale",
+            "epoch_graph_regime_loss_cap_percentile",
+            "ff_dual_neg_every_n_batches",
+            "adaptive_dual_neg_enabled",
+            "adaptive_dual_neg_warmup_epochs",
+            "adaptive_dual_neg_min_every_n_batches",
+            "adaptive_dual_neg_max_every_n_batches",
+            "adaptive_dual_neg_sep_low",
+            "adaptive_dual_neg_sep_high",
+            "adaptive_dual_neg_forward_neg_share_high",
+            "adaptive_dual_neg_step_factor",
             "lr",
             "hidden_dim",
             "num_layers",

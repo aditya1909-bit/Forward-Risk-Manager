@@ -9,6 +9,7 @@ import random
 import sys
 import tomllib
 import hashlib
+import math
 import time
 import warnings
 
@@ -423,6 +424,226 @@ def _should_use_hallucination(
     return (int(step_idx) % n) == 0
 
 
+def _filter_graphs_for_training(
+    graphs,
+    stride: int,
+    limit: int,
+    keep_recent: bool,
+):
+    total = len(graphs)
+    if total == 0:
+        return graphs, []
+    step = max(1, int(stride))
+    selected_idx = list(range(0, total, step))
+    if limit > 0 and limit < len(selected_idx):
+        if keep_recent:
+            selected_idx = selected_idx[-int(limit) :]
+        else:
+            selected_idx = selected_idx[: int(limit)]
+    return [graphs[i] for i in selected_idx], selected_idx
+
+
+def _tensor_summary_stats(tensor: torch.Tensor | None) -> tuple[float, float, float]:
+    if tensor is None or not torch.is_tensor(tensor) or tensor.numel() == 0:
+        return 0.0, 0.0, 0.0
+    vals = tensor.detach().float().reshape(-1)
+    vals = vals[torch.isfinite(vals)]
+    if vals.numel() == 0:
+        return 0.0, 0.0, 0.0
+    mean = float(vals.mean().item())
+    std = float(vals.std(unbiased=False).item()) if vals.numel() > 1 else 0.0
+    abs_mean = float(vals.abs().mean().item())
+    return mean, std, abs_mean
+
+
+def _graph_regime_signature(graph) -> torch.Tensor:
+    cached = getattr(graph, "_epoch_regime_signature", None)
+    if torch.is_tensor(cached):
+        return cached
+
+    num_nodes = max(1, int(getattr(graph, "num_nodes", 0) or 0))
+    edge_index = getattr(graph, "edge_index", None)
+    num_edges = int(edge_index.size(1)) if torch.is_tensor(edge_index) and edge_index.ndim == 2 else 0
+    denom = max(1, num_nodes * max(1, num_nodes - 1))
+    density = float(num_edges) / float(denom)
+
+    edge_weight = getattr(graph, "edge_weight", None)
+    edge_mean, edge_std, edge_abs = _tensor_summary_stats(edge_weight)
+    pos_share = 0.0
+    if torch.is_tensor(edge_weight) and edge_weight.numel() > 0:
+        vals = edge_weight.detach().float().reshape(-1)
+        vals = vals[torch.isfinite(vals)]
+        if vals.numel() > 0:
+            pos_share = float((vals > 0).float().mean().item())
+
+    ret_mean_stats = _tensor_summary_stats(getattr(graph, "ret_mean", None))
+    ret_std_stats = _tensor_summary_stats(getattr(graph, "ret_std", None))
+    x_stats = _tensor_summary_stats(getattr(graph, "x", None))
+
+    sig = torch.tensor(
+        [
+            float(num_nodes),
+            float(density),
+            float(edge_mean),
+            float(edge_std),
+            float(edge_abs),
+            float(pos_share),
+            float(ret_mean_stats[0]),
+            float(ret_mean_stats[1]),
+            float(ret_mean_stats[2]),
+            float(ret_std_stats[0]),
+            float(ret_std_stats[1]),
+            float(ret_std_stats[2]),
+            float(x_stats[0]),
+            float(x_stats[1]),
+            float(x_stats[2]),
+        ],
+        dtype=torch.float32,
+    )
+    setattr(graph, "_epoch_regime_signature", sig)
+    return sig
+
+
+def _graph_regime_change_scores(
+    graphs,
+    spread: int = 5,
+) -> torch.Tensor | None:
+    total = len(graphs)
+    if total <= 1:
+        return None
+    sigs = [_graph_regime_signature(g) for g in graphs]
+    sig_mat = torch.stack(sigs, dim=0)
+    prev = sig_mat[:-1]
+    curr = sig_mat[1:]
+    scale = prev.abs().mean(dim=0).clamp(min=1e-6)
+    delta = (curr - prev).abs().div(scale).mean(dim=1)
+    change = torch.zeros(total, dtype=torch.float32)
+    change[1:] = delta
+
+    med = change.median()
+    mad = (change - med).abs().median().clamp(min=1e-6)
+    score = ((change - med) / (1.4826 * mad)).clamp(min=0.0)
+
+    horizon = max(1, int(spread))
+    if horizon > 1:
+        boosted = score.clone()
+        for offset in range(1, horizon):
+            decay = 1.0 - (float(offset) / float(horizon))
+            if decay <= 0.0:
+                break
+            boosted[offset:] = torch.maximum(boosted[offset:], score[:-offset] * decay)
+        score = boosted
+
+    peak = float(score.max().item()) if score.numel() else 0.0
+    if peak <= 0.0:
+        return torch.zeros(total, dtype=torch.float32)
+    return score / peak
+
+
+def _batch_regime_loss_weights(
+    graph_idx,
+    regime_change_scores: torch.Tensor | None,
+    scale: float,
+    cap_percentile: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if regime_change_scores is None or scale <= 0.0:
+        return None
+    if torch.is_tensor(graph_idx):
+        idx = graph_idx.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+    elif isinstance(graph_idx, (list, tuple)):
+        idx = torch.tensor([int(v) for v in graph_idx], dtype=torch.long)
+    else:
+        idx = torch.tensor([int(graph_idx)], dtype=torch.long)
+    if idx.numel() == 0:
+        return None
+    max_idx = int(regime_change_scores.numel()) - 1
+    idx = idx.clamp(min=0, max=max_idx)
+    base = regime_change_scores.index_select(0, idx).to(device=device, dtype=dtype)
+    weight = 1.0 + float(scale) * base
+    q = float(cap_percentile)
+    if weight.numel() > 1 and 0.0 < q < 1.0:
+        cap_val = torch.quantile(weight.detach().float(), q).to(device=weight.device, dtype=weight.dtype)
+        weight = torch.clamp(weight, max=cap_val)
+    return weight / weight.mean().clamp_min(torch.finfo(weight.dtype).eps)
+
+
+def _weighted_mean_loss(loss: torch.Tensor, sample_weight: torch.Tensor | None) -> torch.Tensor:
+    if sample_weight is None:
+        return loss.mean()
+    weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
+    val = loss.reshape(-1)
+    if weight.numel() != val.numel():
+        raise ValueError(
+            f"sample_weight shape mismatch: expected {val.numel()} values, got {weight.numel()}"
+        )
+    return (val * weight).sum() / weight.sum().clamp_min(1e-12)
+
+
+def _epoch_graph_subset(
+    graphs,
+    epoch: int,
+    fraction: float,
+    min_graphs: int,
+    mode: str,
+    recent_bias_alpha: float = 1.0,
+    regime_change_scores: torch.Tensor | None = None,
+    regime_change_boost: float = 0.0,
+    seed: int | None = None,
+):
+    total = len(graphs)
+    if total <= 1:
+        return graphs
+    frac = _clamp(float(fraction), 0.0, 1.0)
+    if frac >= 1.0:
+        return graphs
+    take = int(math.ceil(total * frac))
+    if min_graphs > 0:
+        take = max(take, int(min_graphs))
+    take = max(1, min(total, take))
+    if take >= total:
+        return graphs
+
+    mode_norm = str(mode).strip().lower()
+    weighted_sample = False
+    weights = None
+    if mode_norm == "random":
+        if regime_change_scores is None or regime_change_boost <= 0.0:
+            idx = sorted(random.sample(range(total), take))
+        else:
+            weighted_sample = True
+            weights = torch.ones(total, dtype=torch.float64)
+    elif mode_norm == "recent_bias":
+        # Bias selection toward newer windows while keeping batches in chronological order.
+        weighted_sample = True
+        alpha = max(0.0, float(recent_bias_alpha))
+        weights = torch.arange(1, total + 1, dtype=torch.float64)
+        if alpha != 1.0:
+            weights = weights.pow(alpha)
+    else:
+        start = ((max(1, int(epoch)) - 1) * take) % total
+        idx = list(range(start, min(total, start + take)))
+        if len(idx) < take:
+            idx.extend(range(0, take - len(idx)))
+
+    if weighted_sample:
+        if (
+            regime_change_scores is not None
+            and len(regime_change_scores) == total
+            and regime_change_boost > 0.0
+        ):
+            change = regime_change_scores.detach().float().clamp(min=0.0).to(dtype=torch.float64)
+            weights = weights * (1.0 + float(regime_change_boost) * change)
+        gen = None
+        if seed is not None:
+            gen = torch.Generator()
+            gen.manual_seed(int(seed))
+        idx_t = torch.multinomial(weights, take, replacement=False, generator=gen)
+        idx = sorted(int(v) for v in idx_t.tolist())
+    return [graphs[i] for i in idx]
+
+
 def _concat_forward_pos_neg(
     model,
     x_pos: torch.Tensor,
@@ -462,6 +683,7 @@ def _goodness_rank_alignment_loss(
     graph_idx,
     portfolio_targets: list[float | None] | None,
     device: torch.device,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if portfolio_targets is None:
         return None
@@ -484,10 +706,22 @@ def _goodness_rank_alignment_loss(
         return None
     g = g_scores[mask]
     t = t[mask]
+    if sample_weight is not None:
+        w = sample_weight.to(device=device, dtype=g_scores.dtype)[mask]
+    else:
+        w = None
     k = max(1, min(int(g.numel() // 2), int(round(0.2 * g.numel()))))
     hi = torch.topk(t, k=k, largest=True).indices
     lo = torch.topk(t, k=k, largest=False).indices
-    spread = g.index_select(0, hi).mean() - g.index_select(0, lo).mean()
+    if w is None:
+        spread = g.index_select(0, hi).mean() - g.index_select(0, lo).mean()
+    else:
+        hi_w = w.index_select(0, hi)
+        lo_w = w.index_select(0, lo)
+        spread = (
+            (g.index_select(0, hi) * hi_w).sum() / hi_w.sum().clamp_min(1e-12)
+            - (g.index_select(0, lo) * lo_w).sum() / lo_w.sum().clamp_min(1e-12)
+        )
     # Encourage high-return graphs to receive higher goodness scores.
     return F.softplus(0.1 - spread)
 
@@ -497,6 +731,7 @@ def _goodness_return_correlation_loss(
     graph_idx,
     portfolio_targets: list[float | None] | None,
     device: torch.device,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if portfolio_targets is None:
         return None
@@ -519,9 +754,20 @@ def _goodness_return_correlation_loss(
         return None
     g = g_scores[mask]
     t = t[mask]
-    g = (g - g.mean()) / (g.std(unbiased=False) + 1e-6)
-    t = (t - t.mean()) / (t.std(unbiased=False) + 1e-6)
-    corr = (g * t).mean()
+    if sample_weight is not None:
+        w = sample_weight.to(device=device, dtype=g_scores.dtype)[mask]
+        w = w / w.sum().clamp_min(1e-12)
+        g_mean = (g * w).sum()
+        t_mean = (t * w).sum()
+        g_std = torch.sqrt(((g - g_mean).pow(2) * w).sum() + 1e-6)
+        t_std = torch.sqrt(((t - t_mean).pow(2) * w).sum() + 1e-6)
+        g = (g - g_mean) / g_std
+        t = (t - t_mean) / t_std
+        corr = (g * t * w).sum()
+    else:
+        g = (g - g.mean()) / (g.std(unbiased=False) + 1e-6)
+        t = (t - t.mean()) / (t.std(unbiased=False) + 1e-6)
+        corr = (g * t).mean()
     # Maximize correlation between graph goodness and forward-return targets.
     return 1.0 - corr
 
@@ -575,6 +821,7 @@ def _compute_portfolio_head_loss(
     portfolio_targets: list[float | None],
     device: torch.device,
     loss_type: str,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if not portfolio_targets:
         return None
@@ -602,18 +849,30 @@ def _compute_portfolio_head_loss(
     if pred_raw.ndim != 1:
         raise RuntimeError(f"portfolio head output shape mismatch: {tuple(pred_raw.shape)}")
     pred = torch.tanh(pred_raw)
+    weight = None
+    if sample_weight is not None:
+        weight = sample_weight.to(device=device, dtype=pred.dtype).reshape(-1)
 
     loss_mode = str(loss_type).strip().lower()
     if loss_mode == "mse":
-        return F.mse_loss(pred[mask], target[mask])
+        err = (pred[mask] - target[mask]).pow(2)
+        if weight is None:
+            return err.mean()
+        return _weighted_mean_loss(err, weight[mask])
 
     pnl = pred[mask] * target[mask]
     if pnl.numel() == 0:
         return None
     if pnl.numel() == 1:
         return -pnl.mean()
-    mean = pnl.mean()
-    std = pnl.std(unbiased=False) + 1e-6
+    if weight is None:
+        mean = pnl.mean()
+        std = pnl.std(unbiased=False) + 1e-6
+    else:
+        w = weight[mask]
+        w = w / w.sum().clamp_min(1e-12)
+        mean = (pnl * w).sum()
+        std = torch.sqrt(((pnl - mean).pow(2) * w).sum() + 1e-6)
     return -(mean / std)
 
 
@@ -624,6 +883,7 @@ def _compute_multi_horizon_risk_loss(
     risk_targets_by_horizon: list[list[float | None]],
     device: torch.device,
     risk_loss_type: str,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if not risk_targets_by_horizon:
         return None
@@ -658,9 +918,16 @@ def _compute_multi_horizon_risk_loss(
         raise RuntimeError(
             f"risk head output shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}"
         )
+    row_weight = None
+    if sample_weight is not None:
+        row_weight = sample_weight.to(device=device, dtype=pred.dtype).reshape(-1, 1).expand_as(pred)
     if risk_loss_type == "mse":
-        return F.mse_loss(pred[mask], target[mask])
-    return F.smooth_l1_loss(pred[mask], target[mask])
+        err = (pred - target).pow(2)
+    else:
+        err = F.smooth_l1_loss(pred, target, reduction="none")
+    if row_weight is None:
+        return err[mask].mean()
+    return _weighted_mean_loss(err[mask], row_weight[mask])
 
 
 def _self_contrastive_batch_loss(
@@ -669,6 +936,7 @@ def _self_contrastive_batch_loss(
     batch: torch.Tensor,
     temperature: float,
     max_graphs: int = 0,
+    sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     z_pos = global_mean_pool(h_pos, batch)
     z_view = global_mean_pool(h_view, batch)
@@ -676,10 +944,13 @@ def _self_contrastive_batch_loss(
         idx = torch.randperm(z_pos.size(0), device=z_pos.device)[:max_graphs]
         z_pos = z_pos.index_select(0, idx)
         z_view = z_view.index_select(0, idx)
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(device=z_pos.device).index_select(0, idx)
     loss, pos_score, neg_score = self_contrastive_loss(
         z_pos,
         z_view,
         temperature=temperature,
+        sample_weight=sample_weight,
     )
     return loss, pos_score, neg_score, z_pos, z_view
 
@@ -953,6 +1224,7 @@ def _try_batch_size(
     distance_forward_max_graphs: int,
     ff_margin: float,
     ff_margin_weight: float,
+    ff_concat_posneg: bool,
     loader_shuffle: bool = True,
 ):
     loader = DataLoader(
@@ -967,8 +1239,8 @@ def _try_batch_size(
     x = batch.x
     edge_weight = getattr(batch, "edge_weight", None)
     if multiscale:
-        layers_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight, return_all=True)
         if neg_mode == "self_contrastive":
+            layers_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight, return_all=True)
             x_view = _make_self_contrastive_view(
                 x,
                 batch.batch,
@@ -1047,6 +1319,15 @@ def _try_batch_size(
                     margin_weight=ff_margin_weight,
                 )
         else:
+            layers_pos = None
+            if not ff_concat_posneg:
+                layers_pos = _forward_encoder(
+                    model,
+                    x,
+                    batch.edge_index,
+                    edge_weight=edge_weight,
+                    return_all=True,
+                )
             x_neg_hall = _make_negatives(
                 model,
                 x,
@@ -1069,11 +1350,30 @@ def _try_batch_size(
                 window_len=window_len,
                 summary_dim=summary_dim,
             )
-            layers_neg_h = _forward_encoder(model, 
-                x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
-            )
-            layers_neg_t = _forward_encoder(model, 
-                x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
+            if ff_concat_posneg:
+                layers_pos, layers_neg_h = _concat_forward_pos_neg(
+                    model=model,
+                    x_pos=x,
+                    x_neg=x_neg_hall,
+                    edge_index=batch.edge_index,
+                    edge_weight=edge_weight,
+                    batch_nodes=batch.batch,
+                    return_all=True,
+                )
+            else:
+                layers_neg_h = _forward_encoder(
+                    model,
+                    x_neg_hall,
+                    batch.edge_index,
+                    edge_weight=edge_weight,
+                    return_all=True,
+                )
+            layers_neg_t = _forward_encoder(
+                model,
+                x_neg_time,
+                batch.edge_index,
+                edge_weight=edge_weight,
+                return_all=True,
             )
             loss = 0.0
             for h_pos, h_neg_h, h_neg_t in zip(layers_pos, layers_neg_h, layers_neg_t):
@@ -1217,6 +1517,22 @@ def main() -> int:
     parser.add_argument("--graphs", help="Path to graphs.pt from build_graphs.py", default=argparse.SUPPRESS)
     parser.add_argument("--epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--graph-stride", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--graph-limit", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--graph-limit-keep-recent", dest="graph_limit_keep_recent", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--graph-limit-keep-earliest", dest="graph_limit_keep_recent", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument("--epoch-graph-fraction", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--epoch-graph-min", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--epoch-graph-mode",
+        choices=["rotate", "random", "recent_bias"],
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--epoch-graph-recent-bias-alpha", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--epoch-graph-regime-change-boost", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--epoch-graph-regime-change-spread", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--epoch-graph-regime-loss-scale", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--epoch-graph-regime-loss-cap-percentile", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--lr", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--hidden-dim", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--num-layers", type=int, default=argparse.SUPPRESS)
@@ -1278,6 +1594,16 @@ def main() -> int:
     parser.add_argument("--ff-hall-steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--ff-concat-posneg", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--ff-layer-cache", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--ff-dual-neg-every-n-batches", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-enabled", dest="adaptive_dual_neg_enabled", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-adaptive-dual-neg", dest="adaptive_dual_neg_enabled", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-warmup-epochs", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-min-every-n-batches", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-max-every-n-batches", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-sep-low", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-sep-high", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-forward-neg-share-high", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--adaptive-dual-neg-step-factor", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--ff-econ-eval-every", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--self-contrastive-view-mode", default=argparse.SUPPRESS)
@@ -1326,6 +1652,29 @@ def main() -> int:
 
     epochs = _get_setting(args, section, "epochs", 10)
     batch_size = _get_setting(args, section, "batch_size", 8)
+    graph_stride = int(_get_setting(args, section, "graph_stride", 1))
+    graph_limit = int(_get_setting(args, section, "graph_limit", 0))
+    graph_limit_keep_recent = _to_bool(
+        _get_setting(args, section, "graph_limit_keep_recent", True)
+    )
+    epoch_graph_fraction = float(_get_setting(args, section, "epoch_graph_fraction", 1.0))
+    epoch_graph_min = int(_get_setting(args, section, "epoch_graph_min", 0))
+    epoch_graph_mode = str(_get_setting(args, section, "epoch_graph_mode", "rotate")).strip().lower()
+    epoch_graph_recent_bias_alpha = float(
+        _get_setting(args, section, "epoch_graph_recent_bias_alpha", 1.0)
+    )
+    epoch_graph_regime_change_boost = float(
+        _get_setting(args, section, "epoch_graph_regime_change_boost", 0.0)
+    )
+    epoch_graph_regime_change_spread = int(
+        _get_setting(args, section, "epoch_graph_regime_change_spread", 5)
+    )
+    epoch_graph_regime_loss_scale = float(
+        _get_setting(args, section, "epoch_graph_regime_loss_scale", 0.0)
+    )
+    epoch_graph_regime_loss_cap_percentile = float(
+        _get_setting(args, section, "epoch_graph_regime_loss_cap_percentile", 0.95)
+    )
     lr = _get_setting(args, section, "lr", 1e-3)
     hidden_dim = _get_setting(args, section, "hidden_dim", 64)
     num_layers = _get_setting(args, section, "num_layers", 2)
@@ -1427,6 +1776,30 @@ def main() -> int:
     ff_concat_posneg = _to_bool(_get_setting(args, section, "ff_concat_posneg", True))
     ff_layer_cache = _to_bool(_get_setting(args, section, "ff_layer_cache", True))
     ff_dual_neg_every_n_batches = int(_get_setting(args, section, "ff_dual_neg_every_n_batches", 4))
+    adaptive_dual_neg_enabled = _to_bool(
+        _get_setting(args, section, "adaptive_dual_neg_enabled", False)
+    )
+    adaptive_dual_neg_warmup_epochs = int(
+        _get_setting(args, section, "adaptive_dual_neg_warmup_epochs", 5)
+    )
+    adaptive_dual_neg_min_every_n_batches = int(
+        _get_setting(args, section, "adaptive_dual_neg_min_every_n_batches", 2)
+    )
+    adaptive_dual_neg_max_every_n_batches = int(
+        _get_setting(args, section, "adaptive_dual_neg_max_every_n_batches", 16)
+    )
+    adaptive_dual_neg_sep_low = float(
+        _get_setting(args, section, "adaptive_dual_neg_sep_low", 0.05)
+    )
+    adaptive_dual_neg_sep_high = float(
+        _get_setting(args, section, "adaptive_dual_neg_sep_high", 0.15)
+    )
+    adaptive_dual_neg_forward_neg_share_high = float(
+        _get_setting(args, section, "adaptive_dual_neg_forward_neg_share_high", 0.35)
+    )
+    adaptive_dual_neg_step_factor = float(
+        _get_setting(args, section, "adaptive_dual_neg_step_factor", 2.0)
+    )
     ff_econ_eval_every = int(_get_setting(args, section, "ff_econ_eval_every", 1))
     grad_clip = _get_setting(args, section, "grad_clip", 1.0)
     self_contrastive_temp = float(_get_setting(args, section, "self_contrastive_temp", 0.2))
@@ -1695,6 +2068,21 @@ def main() -> int:
         encoder_conv_type = "gcn"
     encoder_gat_heads = max(1, int(encoder_gat_heads))
     encoder_rgcn_num_relations = max(2, int(encoder_rgcn_num_relations))
+    graph_stride = max(1, int(graph_stride))
+    graph_limit = max(0, int(graph_limit))
+    epoch_graph_fraction = _clamp(float(epoch_graph_fraction), 0.0, 1.0)
+    epoch_graph_min = max(0, int(epoch_graph_min))
+    epoch_graph_recent_bias_alpha = max(0.0, float(epoch_graph_recent_bias_alpha))
+    epoch_graph_regime_change_boost = max(0.0, float(epoch_graph_regime_change_boost))
+    epoch_graph_regime_change_spread = max(1, int(epoch_graph_regime_change_spread))
+    epoch_graph_regime_loss_scale = max(0.0, float(epoch_graph_regime_loss_scale))
+    epoch_graph_regime_loss_cap_percentile = _clamp(
+        float(epoch_graph_regime_loss_cap_percentile),
+        0.0,
+        1.0,
+    )
+    if epoch_graph_mode not in {"rotate", "random", "recent_bias"}:
+        epoch_graph_mode = "rotate"
 
     if strict_component_split and neg_mode == "self_contrastive":
         if "time_flip" in self_contrastive_view_mode:
@@ -1730,7 +2118,29 @@ def main() -> int:
     ff_rank_use_portfolio_targets = bool(ff_rank_use_portfolio_targets)
     ff_hall_every_n_batches = max(1, int(ff_hall_every_n_batches))
     ff_hall_warmup_epochs = max(0, int(ff_hall_warmup_epochs))
-    ff_dual_neg_every_n_batches = max(1, int(ff_dual_neg_every_n_batches))
+    adaptive_dual_neg_warmup_epochs = max(0, int(adaptive_dual_neg_warmup_epochs))
+    adaptive_dual_neg_min_every_n_batches = max(1, int(adaptive_dual_neg_min_every_n_batches))
+    adaptive_dual_neg_max_every_n_batches = max(
+        adaptive_dual_neg_min_every_n_batches,
+        int(adaptive_dual_neg_max_every_n_batches),
+    )
+    ff_dual_neg_every_n_batches = int(
+        round(
+            _clamp(
+                float(ff_dual_neg_every_n_batches),
+                float(adaptive_dual_neg_min_every_n_batches),
+                float(adaptive_dual_neg_max_every_n_batches),
+            )
+        )
+    )
+    adaptive_dual_neg_sep_low = max(0.0, float(adaptive_dual_neg_sep_low))
+    adaptive_dual_neg_sep_high = max(adaptive_dual_neg_sep_low, float(adaptive_dual_neg_sep_high))
+    adaptive_dual_neg_forward_neg_share_high = _clamp(
+        float(adaptive_dual_neg_forward_neg_share_high),
+        0.0,
+        1.0,
+    )
+    adaptive_dual_neg_step_factor = max(1.25, float(adaptive_dual_neg_step_factor))
     ff_econ_eval_every = max(1, int(ff_econ_eval_every))
     if ff_econ_eval_every != 1:
         print("ff_econ_eval_every is deprecated and currently ignored.")
@@ -1867,6 +2277,33 @@ def main() -> int:
 
     for i, g in enumerate(graphs):
         setattr(g, "graph_idx", i)
+    raw_graph_count = len(graphs)
+    graphs, selected_graph_idx = _filter_graphs_for_training(
+        graphs,
+        stride=graph_stride,
+        limit=graph_limit,
+        keep_recent=graph_limit_keep_recent,
+    )
+    if not graphs:
+        raise ValueError("Graph filtering removed all graphs. Relax graph_stride/graph_limit.")
+    epoch_graph_count = len(graphs)
+    selected_dates = [
+        dates[i] if 0 <= int(i) < len(dates) else "n/a"
+        for i in selected_graph_idx
+    ]
+    regime_change_scores = None
+    if (
+        epoch_graph_regime_loss_scale > 0.0
+        or (
+            epoch_graph_fraction < 1.0
+            and epoch_graph_mode in {"random", "recent_bias"}
+            and epoch_graph_regime_change_boost > 0.0
+        )
+    ):
+        regime_change_scores = _graph_regime_change_scores(
+            graphs,
+            spread=epoch_graph_regime_change_spread,
+        )
 
     print(f"device request: {device_choice}")
     print(f"device: {device}")
@@ -1875,6 +2312,47 @@ def main() -> int:
     print(
         f"neg_mode: {neg_mode} | batch_size: {batch_size} | loader_workers: {loader_workers}"
     )
+    print(
+        "graph_schedule: "
+        f"loaded={raw_graph_count}, selected={epoch_graph_count}, "
+        f"stride={graph_stride}, limit={graph_limit or 'all'}, "
+        f"keep_recent={graph_limit_keep_recent}, "
+        f"epoch_fraction={epoch_graph_fraction:.3f}, "
+        f"epoch_min={epoch_graph_min}, mode={epoch_graph_mode}, "
+        f"recent_bias_alpha={epoch_graph_recent_bias_alpha:.3f}, "
+        f"regime_change_boost={epoch_graph_regime_change_boost:.3f}, "
+        f"regime_change_spread={epoch_graph_regime_change_spread}, "
+        f"regime_loss_scale={epoch_graph_regime_loss_scale:.3f}, "
+        f"regime_loss_cap_pct={epoch_graph_regime_loss_cap_percentile:.2f}"
+    )
+    if selected_graph_idx:
+        first_idx = selected_graph_idx[0]
+        last_idx = selected_graph_idx[-1]
+        first_date = dates[first_idx] if first_idx < len(dates) else "n/a"
+        last_date = dates[last_idx] if last_idx < len(dates) else "n/a"
+        print(
+            "graph_span: "
+            f"selected_idx=[{first_idx},{last_idx}] dates=[{first_date},{last_date}]"
+        )
+    if epoch_graph_fraction > 0 and epoch_graph_fraction < 1.0:
+        est_epoch_graphs = min(
+            epoch_graph_count,
+            max(epoch_graph_min, int(math.ceil(epoch_graph_count * epoch_graph_fraction))),
+        )
+        print(f"epoch_graphs_per_epoch: ~{est_epoch_graphs}")
+    if (
+        regime_change_scores is not None
+        and selected_graph_idx
+        and float(regime_change_scores.max().item()) > 0.0
+    ):
+        regime_top_k = min(5, int(regime_change_scores.numel()))
+        if regime_top_k > 0:
+            top_idx = torch.topk(regime_change_scores, k=regime_top_k).indices.tolist()
+            top_dates = [
+                f"{selected_dates[int(i)]}:{float(regime_change_scores[int(i)].item()):.2f}"
+                for i in top_idx
+            ]
+            print("graph_regime_hotspots: " + ", ".join(top_dates))
     print(
         "ff_mode: "
         f"layerwise={ff_layerwise}, blockwise={ff_blockwise}, "
@@ -1987,6 +2465,15 @@ def main() -> int:
         f"hall_warmup_epochs={ff_hall_warmup_epochs}, "
         f"dual_neg_every_n_batches={ff_dual_neg_every_n_batches}"
     )
+    if adaptive_dual_neg_enabled:
+        print(
+            "adaptive_dual_neg: "
+            f"warmup={adaptive_dual_neg_warmup_epochs}, "
+            f"interval_range=[{adaptive_dual_neg_min_every_n_batches}, {adaptive_dual_neg_max_every_n_batches}], "
+            f"sep_low={adaptive_dual_neg_sep_low:.3f}, sep_high={adaptive_dual_neg_sep_high:.3f}, "
+            f"forward_neg_share_high={adaptive_dual_neg_forward_neg_share_high:.2f}, "
+            f"step_factor={adaptive_dual_neg_step_factor:.2f}"
+        )
     if torch_compile_enabled:
         print(f"torch_compile: requested (mode={torch_compile_mode})")
     if adaptive_hall_enabled:
@@ -2283,6 +2770,7 @@ def main() -> int:
                     distance_forward_max_graphs,
                     ff_margin,
                     ff_margin_weight,
+                    ff_concat_posneg,
                     loader_shuffle=train_shuffle,
                 )
                 return True, False
@@ -2386,7 +2874,9 @@ def main() -> int:
         loader_kwargs["prefetch_factor"] = int(dataloader_prefetch)
         if dataloader_mp_context:
             loader_kwargs["multiprocessing_context"] = dataloader_mp_context
-    loader = DataLoader(graphs, **loader_kwargs)
+    base_loader = None
+    if epoch_graph_fraction >= 1.0:
+        base_loader = DataLoader(graphs, **loader_kwargs)
     optim_params = [p for p in model.parameters() if p.requires_grad]
     optim_params.extend(p for p in critic.parameters() if p.requires_grad)
     if risk_head is not None:
@@ -2407,6 +2897,9 @@ def main() -> int:
                 "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
                 "hall_node_fraction_used,rank_aux_loss,"
                 "rank_corr_loss,"
+                "dual_neg_every_n_batches_used,dual_neg_ratio,regime_weight_mean,"
+                "time_neg_gen_share,time_hallucinate_share,time_forward_pos_share,time_forward_neg_share,"
+                "time_loss_terms_share,time_optimizer_share,"
                 "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
                 "time_loss_terms_s,time_optimizer_s\n"
             )
@@ -2446,6 +2939,7 @@ def main() -> int:
         epoch_hall_lr = float(hall_cfg.lr)
         epoch_hall_steps = int(hall_cfg.steps)
         epoch_hall_node_fraction = float(hall_cfg.node_fraction)
+        epoch_dual_neg_every = int(ff_dual_neg_every_n_batches)
         total_loss = 0.0
         total_pos = 0.0
         total_neg = 0.0
@@ -2458,6 +2952,7 @@ def main() -> int:
         dist_forward_sum = 0.0
         rank_aux_sum = 0.0
         rank_corr_sum = 0.0
+        regime_weight_sum = 0.0
         timing_totals = {
             "neg_gen": 0.0,
             "hallucinate": 0.0,
@@ -2474,8 +2969,24 @@ def main() -> int:
         hall_close_total = 0
         hall_hardness_sum = 0.0
         hall_hardness_count = 0
+        dual_neg_batches = 0
 
-        for batch in loader:
+        epoch_loader = base_loader
+        if epoch_loader is None:
+            epoch_graphs = _epoch_graph_subset(
+                graphs,
+                epoch=epoch,
+                fraction=epoch_graph_fraction,
+                min_graphs=max(epoch_graph_min, batch_size),
+                mode=epoch_graph_mode,
+                recent_bias_alpha=epoch_graph_recent_bias_alpha,
+                regime_change_scores=regime_change_scores,
+                regime_change_boost=epoch_graph_regime_change_boost,
+                seed=int(seed) + int(epoch) * 1009,
+            )
+            epoch_loader = DataLoader(epoch_graphs, **loader_kwargs)
+
+        for batch in epoch_loader:
             try:
                 batch = batch.to(device)
             except Exception as exc:
@@ -2487,6 +2998,16 @@ def main() -> int:
                 raise
             x = batch.x
             edge_weight = getattr(batch, "edge_weight", None)
+            graph_loss_weight = _batch_regime_loss_weights(
+                batch.graph_idx,
+                regime_change_scores=regime_change_scores,
+                scale=epoch_graph_regime_loss_scale,
+                cap_percentile=epoch_graph_regime_loss_cap_percentile,
+                device=device,
+                dtype=x.dtype,
+            )
+            if graph_loss_weight is not None:
+                regime_weight_sum += float(graph_loss_weight.mean().detach())
 
             step_idx = batches + 1
             if neg_mode == "schedule":
@@ -2603,6 +3124,7 @@ def main() -> int:
                                 batch.batch,
                                 temperature=self_contrastive_temp,
                                 max_graphs=self_contrastive_max_graphs,
+                                sample_weight=graph_loss_weight,
                             )
                             batch_loss = batch_loss + sc_loss
                             g_pos_last = float(pos_score.detach())
@@ -2616,6 +3138,7 @@ def main() -> int:
                                 z_neg_last,
                                 margin=distance_forward_margin,
                                 max_graphs=distance_forward_max_graphs,
+                                sample_weight=graph_loss_weight,
                             )
                             batch_loss = batch_loss + distance_forward_weight * dist_loss_val
                         if epoch_sc_ff_weight > 0:
@@ -2656,13 +3179,24 @@ def main() -> int:
                                 target=self_contrastive_ff_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                             batch_loss = batch_loss + epoch_sc_ff_weight * ff_aux
                     timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
                 else:
-                    t_fwd_pos = time.perf_counter()
-                    if step_scaler is not None:
-                        with _autocast_if_needed(True, amp_dtype):
+                    layers_pos = None
+                    if not ff_concat_posneg:
+                        t_fwd_pos = time.perf_counter()
+                        if step_scaler is not None:
+                            with _autocast_if_needed(True, amp_dtype):
+                                layers_pos = _forward_encoder(
+                                    model,
+                                    x,
+                                    batch.edge_index,
+                                    edge_weight=edge_weight,
+                                    return_all=True,
+                                )
+                        else:
                             layers_pos = _forward_encoder(
                                 model,
                                 x,
@@ -2670,15 +3204,7 @@ def main() -> int:
                                 edge_weight=edge_weight,
                                 return_all=True,
                             )
-                    else:
-                        layers_pos = _forward_encoder(
-                            model,
-                            x,
-                            batch.edge_index,
-                            edge_weight=edge_weight,
-                            return_all=True,
-                        )
-                    timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
+                        timing_totals["forward_pos"] += time.perf_counter() - t_fwd_pos
                     hall_active = use_mode == "hallucinate"
                     if use_mode == "hallucinate":
                         t_neg_gen = time.perf_counter()
@@ -2735,11 +3261,12 @@ def main() -> int:
                     total_used += 1
 
                     use_dual_neg = (
-                        ff_dual_neg_every_n_batches <= 1
-                        or (step_idx % ff_dual_neg_every_n_batches == 0)
+                        epoch_dual_neg_every <= 1
+                        or (step_idx % epoch_dual_neg_every == 0)
                     )
                     x_neg_time = None
                     if use_dual_neg:
+                        dual_neg_batches += 1
                         t_neg_time = time.perf_counter()
                         x_neg_time = make_negative(
                             x,
@@ -2751,18 +3278,55 @@ def main() -> int:
                         )
                         timing_totals["neg_gen"] += time.perf_counter() - t_neg_time
 
-                    t_fwd_neg = time.perf_counter()
-                    layers_neg_h = _forward_encoder(
-                        model, x_neg_hall, batch.edge_index, edge_weight=edge_weight, return_all=True
-                    )
-                    layers_neg_t = (
-                        _forward_encoder(
-                            model, x_neg_time, batch.edge_index, edge_weight=edge_weight, return_all=True
-                        )
-                        if use_dual_neg and x_neg_time is not None
-                        else None
-                    )
-                    timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                    if ff_concat_posneg:
+                        t_fwd_cat = time.perf_counter()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            layers_pos, layers_neg_h = _concat_forward_pos_neg(
+                                model=model,
+                                x_pos=x,
+                                x_neg=x_neg_hall,
+                                edge_index=batch.edge_index,
+                                edge_weight=edge_weight,
+                                batch_nodes=batch.batch,
+                                return_all=True,
+                            )
+                        dt_cat = time.perf_counter() - t_fwd_cat
+                        timing_totals["forward_pos"] += 0.5 * dt_cat
+                        timing_totals["forward_neg"] += 0.5 * dt_cat
+                        layers_neg_t = None
+                        if use_dual_neg and x_neg_time is not None:
+                            t_fwd_neg = time.perf_counter()
+                            with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                                layers_neg_t = _forward_encoder(
+                                    model,
+                                    x_neg_time,
+                                    batch.edge_index,
+                                    edge_weight=edge_weight,
+                                    return_all=True,
+                                )
+                            timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
+                    else:
+                        t_fwd_neg = time.perf_counter()
+                        with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                            layers_neg_h = _forward_encoder(
+                                model,
+                                x_neg_hall,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                                return_all=True,
+                            )
+                            layers_neg_t = (
+                                _forward_encoder(
+                                    model,
+                                    x_neg_time,
+                                    batch.edge_index,
+                                    edge_weight=edge_weight,
+                                    return_all=True,
+                                )
+                                if use_dual_neg and x_neg_time is not None
+                                else None
+                            )
+                        timing_totals["forward_neg"] += time.perf_counter() - t_fwd_neg
 
                     if use_mode == "hallucinate":
                         g_pos_probe = goodness(
@@ -2811,6 +3375,7 @@ def main() -> int:
                                 target=goodness_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                             batch_loss += ff_loss(
                                 g_p,
@@ -2818,6 +3383,7 @@ def main() -> int:
                                 target=goodness_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                     else:
                         for h_p, h_n_h in zip(layers_pos, layers_neg_h):
@@ -2831,6 +3397,7 @@ def main() -> int:
                                 target=goodness_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                     batch_loss = batch_loss / max(1, len(layers_pos))
 
@@ -2842,6 +3409,7 @@ def main() -> int:
                             z_neg_h,
                             margin=distance_forward_margin,
                             max_graphs=distance_forward_max_graphs,
+                            sample_weight=graph_loss_weight,
                         )
                         if use_dual_neg and layers_neg_t is not None:
                             z_neg_t = global_mean_pool(layers_neg_t[-1], batch.batch)
@@ -2850,6 +3418,7 @@ def main() -> int:
                                 z_neg_t,
                                 margin=distance_forward_margin,
                                 max_graphs=distance_forward_max_graphs,
+                                sample_weight=graph_loss_weight,
                             )
                             dist_loss_val = 0.5 * (dist_loss_h + dist_loss_t)
                         else:
@@ -2888,6 +3457,7 @@ def main() -> int:
                         risk_targets_by_horizon=risk_targets_by_horizon,
                         device=device,
                         risk_loss_type=str(risk_loss_type).strip().lower(),
+                        sample_weight=graph_loss_weight,
                     )
                     if risk_loss_val is not None:
                         batch_loss = batch_loss + risk_loss_weight * risk_loss_val
@@ -2902,6 +3472,7 @@ def main() -> int:
                         portfolio_targets=portfolio_targets,
                         device=device,
                         loss_type=portfolio_loss_type,
+                        sample_weight=graph_loss_weight,
                     )
                     if portfolio_loss_val is not None:
                         batch_loss = batch_loss + portfolio_loss_weight * portfolio_loss_val
@@ -2917,9 +3488,10 @@ def main() -> int:
                         graph_idx=batch.graph_idx,
                         portfolio_targets=portfolio_targets,
                         device=device,
+                        sample_weight=graph_loss_weight,
                     )
                     if rank_aux_val is None:
-                        rank_aux_val = rank_spread_loss(g_rank)
+                        rank_aux_val = rank_spread_loss(g_rank, sample_weight=graph_loss_weight)
                     batch_loss = batch_loss + ff_rank_aux_weight * rank_aux_val
                 if ff_rank_corr_weight > 0:
                     rank_corr_val = _goodness_return_correlation_loss(
@@ -2927,6 +3499,7 @@ def main() -> int:
                         graph_idx=batch.graph_idx,
                         portfolio_targets=portfolio_targets,
                         device=device,
+                        sample_weight=graph_loss_weight,
                     )
                     if rank_corr_val is not None:
                         batch_loss = batch_loss + ff_rank_corr_weight * rank_corr_val
@@ -3089,6 +3662,7 @@ def main() -> int:
                                 target=goodness_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                             block_gpos += g_pos.mean().item()
                             block_gneg += g_neg.mean().item()
@@ -3226,6 +3800,7 @@ def main() -> int:
                                 target=goodness_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                         t_opt = time.perf_counter()
                         _optimizer_step(
@@ -3293,6 +3868,7 @@ def main() -> int:
                             batch.batch,
                             temperature=self_contrastive_temp,
                             max_graphs=self_contrastive_max_graphs,
+                            sample_weight=graph_loss_weight,
                         )
                         g_pos_val = float(pos_score.detach())
                         g_neg_val = float(neg_score.detach())
@@ -3303,6 +3879,7 @@ def main() -> int:
                                 z_neg_dist,
                                 margin=distance_forward_margin,
                                 max_graphs=distance_forward_max_graphs,
+                                sample_weight=graph_loss_weight,
                             )
                             loss = loss + distance_forward_weight * dist_loss_val
                         if epoch_sc_ff_weight > 0:
@@ -3338,6 +3915,7 @@ def main() -> int:
                                 target=self_contrastive_ff_target,
                                 margin=ff_margin,
                                 margin_weight=ff_margin_weight,
+                                sample_weight=graph_loss_weight,
                             )
                             loss = loss + epoch_sc_ff_weight * ff_aux
                         timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
@@ -3463,6 +4041,7 @@ def main() -> int:
                         target=goodness_target,
                         margin=ff_margin,
                         margin_weight=ff_margin_weight,
+                        sample_weight=graph_loss_weight,
                     )
                     g_pos_val = g_pos.mean().item()
                     g_neg_val = g_neg.mean().item()
@@ -3474,6 +4053,7 @@ def main() -> int:
                             z_neg,
                             margin=distance_forward_margin,
                             max_graphs=distance_forward_max_graphs,
+                            sample_weight=graph_loss_weight,
                         )
                         loss = loss + distance_forward_weight * dist_loss_val
                     timing_totals["loss_terms"] += time.perf_counter() - t_loss_terms
@@ -3498,6 +4078,7 @@ def main() -> int:
                         risk_targets_by_horizon=risk_targets_by_horizon,
                         device=device,
                         risk_loss_type=str(risk_loss_type).strip().lower(),
+                        sample_weight=graph_loss_weight,
                     )
                     if risk_loss_val is not None:
                         loss = loss + risk_loss_weight * risk_loss_val
@@ -3511,6 +4092,7 @@ def main() -> int:
                         portfolio_targets=portfolio_targets,
                         device=device,
                         loss_type=portfolio_loss_type,
+                        sample_weight=graph_loss_weight,
                     )
                     if portfolio_loss_val is not None:
                         loss = loss + portfolio_loss_weight * portfolio_loss_val
@@ -3524,9 +4106,10 @@ def main() -> int:
                         graph_idx=batch.graph_idx,
                         portfolio_targets=portfolio_targets,
                         device=device,
+                        sample_weight=graph_loss_weight,
                     )
                     if rank_aux_val is None:
-                        rank_aux_val = rank_spread_loss(g_rank)
+                        rank_aux_val = rank_spread_loss(g_rank, sample_weight=graph_loss_weight)
                     loss = loss + ff_rank_aux_weight * rank_aux_val
                 if ff_rank_corr_weight > 0:
                     rank_corr_val = _goodness_return_correlation_loss(
@@ -3534,6 +4117,7 @@ def main() -> int:
                         graph_idx=batch.graph_idx,
                         portfolio_targets=portfolio_targets,
                         device=device,
+                        sample_weight=graph_loss_weight,
                     )
                     if rank_corr_val is not None:
                         loss = loss + ff_rank_corr_weight * rank_corr_val
@@ -3592,9 +4176,19 @@ def main() -> int:
         time_fwd_neg_epoch = timing_totals["forward_neg"] / batches if batches else 0.0
         time_loss_epoch = timing_totals["loss_terms"] / batches if batches else 0.0
         time_opt_epoch = timing_totals["optimizer"] / batches if batches else 0.0
+        timing_total_epoch = sum(max(0.0, float(v)) for v in timing_totals.values())
+        time_neg_gen_share = timing_totals["neg_gen"] / timing_total_epoch if timing_total_epoch else 0.0
+        time_hall_share = timing_totals["hallucinate"] / timing_total_epoch if timing_total_epoch else 0.0
+        time_fwd_pos_share = timing_totals["forward_pos"] / timing_total_epoch if timing_total_epoch else 0.0
+        time_fwd_neg_share = timing_totals["forward_neg"] / timing_total_epoch if timing_total_epoch else 0.0
+        time_loss_share = timing_totals["loss_terms"] / timing_total_epoch if timing_total_epoch else 0.0
+        time_opt_share = timing_totals["optimizer"] / timing_total_epoch if timing_total_epoch else 0.0
+        dual_neg_ratio = dual_neg_batches / batches if batches else 0.0
+        regime_weight_mean_epoch = regime_weight_sum / batches if batches else 0.0
         epoch_loss = total_loss / batches if batches else 0.0
         epoch_pos = total_pos / batches if batches else 0.0
         epoch_neg = total_neg / batches if batches else 0.0
+        epoch_sep = epoch_pos - epoch_neg
 
         target_updated = False
         if adaptive_target_enabled and batches and epoch >= adaptive_target_warmup:
@@ -3608,6 +4202,35 @@ def main() -> int:
             if abs(new_target - goodness_target) > 1e-8:
                 goodness_target = new_target
                 target_updated = True
+
+        dual_neg_event = ""
+        if (
+            adaptive_dual_neg_enabled
+            and ff_multiscale
+            and neg_mode != "self_contrastive"
+            and batches
+            and epoch >= adaptive_dual_neg_warmup_epochs
+        ):
+            prev_dual_neg_every = int(ff_dual_neg_every_n_batches)
+            if epoch_sep <= adaptive_dual_neg_sep_low:
+                next_dual_neg_every = max(
+                    adaptive_dual_neg_min_every_n_batches,
+                    int(math.floor(prev_dual_neg_every / adaptive_dual_neg_step_factor)),
+                )
+                if next_dual_neg_every < prev_dual_neg_every:
+                    ff_dual_neg_every_n_batches = next_dual_neg_every
+                    dual_neg_event = f"dual_neg_harder:{prev_dual_neg_every}->{next_dual_neg_every}"
+            elif (
+                epoch_sep >= adaptive_dual_neg_sep_high
+                and time_fwd_neg_share >= adaptive_dual_neg_forward_neg_share_high
+            ):
+                next_dual_neg_every = min(
+                    adaptive_dual_neg_max_every_n_batches,
+                    int(math.ceil(prev_dual_neg_every * adaptive_dual_neg_step_factor)),
+                )
+                if next_dual_neg_every > prev_dual_neg_every:
+                    ff_dual_neg_every_n_batches = next_dual_neg_every
+                    dual_neg_event = f"dual_neg_lighter:{prev_dual_neg_every}->{next_dual_neg_every}"
 
         adapt_event = ""
         if (
@@ -3702,13 +4325,33 @@ def main() -> int:
                 _sync_hall_curriculum_end()
                 adapt_event = "easier_neg"
 
-        if adapt_event or target_updated:
+        adapt_tokens = []
+        if adapt_event:
+            adapt_tokens.append(adapt_event)
+        if target_updated:
+            adapt_tokens.append("target")
+        if dual_neg_event:
+            adapt_tokens.append(dual_neg_event)
+        if adapt_tokens:
             print(
-                f"epoch {epoch}: adapt={adapt_event or 'target_only'} "
+                f"epoch {epoch}: adapt={','.join(adapt_tokens)} "
                 f"target={goodness_target:.3f} mix_end={neg_mix_end:.3f} "
                 f"gate_margin={neg_gate_margin:.3f} hall_steps={hall_steps} "
-                f"hall_lr={hall_lr:.4f} hall_node_fraction={hall_node_fraction:.2f}"
+                f"hall_lr={hall_lr:.4f} hall_node_fraction={hall_node_fraction:.2f} "
+                f"dual_neg_every={ff_dual_neg_every_n_batches}"
             )
+        print(
+            f"epoch {epoch} timing: neg_gen={time_neg_gen_share:.1%} "
+            f"fwd_pos={time_fwd_pos_share:.1%} fwd_neg={time_fwd_neg_share:.1%} "
+            f"loss={time_loss_share:.1%} opt={time_opt_share:.1%} "
+            f"dual_neg_ratio={dual_neg_ratio:.2f} dual_neg_every={epoch_dual_neg_every}"
+        )
+        epoch_iter.set_postfix(
+            loss=f"{epoch_loss:.3f}",
+            sep=f"{epoch_sep:.3f}",
+            dneg=f"{epoch_dual_neg_every}",
+            nshare=f"{time_fwd_neg_share:.0%}",
+        )
 
         if log_csv:
             with Path(log_csv).open("a") as f:
@@ -3723,6 +4366,9 @@ def main() -> int:
                     f"{epoch_hall_lr:.6f},{epoch_hall_steps},{epoch_hall_node_fraction:.6f},"
                     f"{rank_aux_epoch:.6f},"
                     f"{rank_corr_epoch:.6f},"
+                    f"{epoch_dual_neg_every},{dual_neg_ratio:.6f},{regime_weight_mean_epoch:.6f},"
+                    f"{time_neg_gen_share:.6f},{time_hall_share:.6f},{time_fwd_pos_share:.6f},"
+                    f"{time_fwd_neg_share:.6f},{time_loss_share:.6f},{time_opt_share:.6f},"
                     f"{time_neg_gen_epoch:.6f},{time_hall_epoch:.6f},{time_fwd_pos_epoch:.6f},{time_fwd_neg_epoch:.6f},"
                     f"{time_loss_epoch:.6f},{time_opt_epoch:.6f}\n"
                 )

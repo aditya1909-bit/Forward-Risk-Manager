@@ -261,6 +261,7 @@ def ff_loss(
     target: float = 1.0,
     margin: float = 0.0,
     margin_weight: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Encourage g_pos > target and g_neg < target
     loss_pos = F.softplus(target - g_pos)
@@ -269,6 +270,13 @@ def ff_loss(
     if margin > 0 and margin_weight > 0:
         gap = g_pos - g_neg
         loss = loss + float(margin_weight) * F.softplus(float(margin) - gap)
+    if sample_weight is not None:
+        weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
+        if weight.numel() != loss.numel():
+            raise ValueError(
+                f"sample_weight shape mismatch: expected {loss.numel()} values, got {weight.numel()}"
+            )
+        return (loss * weight).sum() / weight.sum().clamp_min(1e-12)
     return loss.mean()
 
 
@@ -295,6 +303,7 @@ def self_contrastive_loss(
     z_a: torch.Tensor,
     z_b: torch.Tensor,
     temperature: float = 0.2,
+    sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if z_a.ndim != 2 or z_b.ndim != 2:
         raise ValueError("Expected z_a and z_b to have shape [num_graphs, dim]")
@@ -310,7 +319,20 @@ def self_contrastive_loss(
     z_b_n = F.normalize(z_b, p=2, dim=1)
     logits_ab = (z_a_n @ z_b_n.T) / float(temperature)
     labels = torch.arange(z_a_n.size(0), device=z_a.device, dtype=torch.long)
-    loss = 0.5 * (F.cross_entropy(logits_ab, labels) + F.cross_entropy(logits_ab.T, labels))
+    loss_ab = F.cross_entropy(logits_ab, labels, reduction="none")
+    loss_ba = F.cross_entropy(logits_ab.T, labels, reduction="none")
+    if sample_weight is not None:
+        weight = sample_weight.to(device=loss_ab.device, dtype=loss_ab.dtype).reshape(-1)
+        if weight.numel() != loss_ab.numel():
+            raise ValueError(
+                f"sample_weight shape mismatch: expected {loss_ab.numel()} values, got {weight.numel()}"
+            )
+        loss = 0.5 * (
+            (loss_ab * weight).sum() / weight.sum().clamp_min(1e-12)
+            + (loss_ba * weight).sum() / weight.sum().clamp_min(1e-12)
+        )
+    else:
+        loss = 0.5 * (loss_ab.mean() + loss_ba.mean())
 
     sim = z_a_n @ z_b_n.T
     pos_sim = sim.diag().mean()
@@ -347,6 +369,7 @@ def pairwise_distance_forward_loss(
     z_neg: torch.Tensor,
     margin: float = 0.15,
     max_graphs: int = 0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if z_pos.ndim != 2 or z_neg.ndim != 2:
         raise ValueError("Expected z_pos and z_neg to have shape [num_graphs, dim]")
@@ -359,21 +382,36 @@ def pairwise_distance_forward_loss(
         idx = torch.randperm(z_pos.size(0), device=z_pos.device)[: int(max_graphs)]
         z_pos = z_pos.index_select(0, idx)
         z_neg = z_neg.index_select(0, idx)
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(device=z_pos.device).index_select(0, idx)
 
     d_neg = torch.norm(z_pos - z_neg, p=2, dim=1)
     if z_pos.size(0) == 1:
-        return F.relu(float(margin) - d_neg).mean()
+        loss = F.relu(float(margin) - d_neg)
+        if sample_weight is not None:
+            weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
+            return (loss * weight).sum() / weight.sum().clamp_min(1e-12)
+        return loss.mean()
 
     dist_pp = torch.cdist(z_pos, z_pos, p=2)
     eye = torch.eye(dist_pp.size(0), dtype=torch.bool, device=dist_pp.device)
     nearest_pos = dist_pp.masked_fill(eye, float("inf")).min(dim=1).values
-    return F.relu(float(margin) + nearest_pos - d_neg).mean()
+    loss = F.relu(float(margin) + nearest_pos - d_neg)
+    if sample_weight is not None:
+        weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
+        if weight.numel() != loss.numel():
+            raise ValueError(
+                f"sample_weight shape mismatch: expected {loss.numel()} values, got {weight.numel()}"
+            )
+        return (loss * weight).sum() / weight.sum().clamp_min(1e-12)
+    return loss.mean()
 
 
 def rank_spread_loss(
     scores: torch.Tensor,
     top_frac: float = 0.2,
     margin: float = 0.1,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if scores.ndim != 1:
         raise ValueError("Expected scores to have shape [num_graphs]")
@@ -385,6 +423,19 @@ def rank_spread_loss(
     frac = float(max(1e-3, min(0.49, top_frac)))
     k = max(1, int(round(frac * n)))
     k = min(k, n // 2)
-    top = torch.topk(scores, k=k, largest=True).values.mean()
-    bot = torch.topk(scores, k=k, largest=False).values.mean()
+    if sample_weight is None:
+        top = torch.topk(scores, k=k, largest=True).values.mean()
+        bot = torch.topk(scores, k=k, largest=False).values.mean()
+    else:
+        weight = sample_weight.to(device=scores.device, dtype=scores.dtype).reshape(-1)
+        if weight.numel() != scores.numel():
+            raise ValueError(
+                f"sample_weight shape mismatch: expected {scores.numel()} values, got {weight.numel()}"
+            )
+        top_idx = torch.topk(scores, k=k, largest=True).indices
+        bot_idx = torch.topk(scores, k=k, largest=False).indices
+        top_w = weight.index_select(0, top_idx)
+        bot_w = weight.index_select(0, bot_idx)
+        top = (scores.index_select(0, top_idx) * top_w).sum() / top_w.sum().clamp_min(1e-12)
+        bot = (scores.index_select(0, bot_idx) * bot_w).sum() / bot_w.sum().clamp_min(1e-12)
     return F.softplus(float(margin) - (top - bot))
