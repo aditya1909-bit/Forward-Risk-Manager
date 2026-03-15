@@ -6,6 +6,7 @@ import csv
 import contextlib
 import random
 import time
+from collections.abc import Sequence
 from pathlib import Path
 import sys
 import tomllib
@@ -51,6 +52,7 @@ from frisk.splits import (
     simple_split_indices,
     simple_train_eval_split,
     walk_forward_splits,
+    walk_forward_split_indices,
 )
 from frisk.econ_eval import (
     evaluate_goodness_strategy,
@@ -63,6 +65,7 @@ from frisk.targets import (
     compute_forward_return_targets_cached,
     compute_risk_targets_cached,
 )
+from frisk.graph_artifact import GraphIndexSequence, load_graph_artifact
 
 _NEG_AUG_MODES = {
     "shuffle",
@@ -80,6 +83,12 @@ _NEG_AUG_MODES = {
 }
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+
+
+def _slice_by_indices(values: Sequence | None, indices: Sequence[int]) -> list:
+    if not values:
+        return []
+    return [values[int(i)] for i in indices if 0 <= int(i) < len(values)]
 
 
 def _parse_positive_int_list(value, fallback: int) -> list[int]:
@@ -1453,8 +1462,6 @@ def _benchmark_ff(
             split_mode=config.get("split_mode", "chronological"),
         )
     else:
-        train_graphs = list(train_graphs)
-        eval_graphs = list(eval_graphs)
         if not train_graphs or not eval_graphs:
             raise ValueError("Explicit fold split must include non-empty train and eval graphs.")
     train_shuffle = True
@@ -2201,8 +2208,6 @@ def _benchmark_backprop(
             split_mode=config.get("split_mode", "chronological"),
         )
     else:
-        train_graphs = list(train_graphs)
-        eval_graphs = list(eval_graphs)
         if not train_graphs or not eval_graphs:
             raise ValueError("Explicit fold split must include non-empty train and eval graphs.")
     loader_kwargs = {
@@ -2621,16 +2626,12 @@ def main() -> int:
     build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
-    try:
-        payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(graphs_path, map_location="cpu")
-    graphs = payload["graphs"] if isinstance(payload, dict) and "graphs" in payload else payload
-    graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
+    artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
+    graph_dates = artifact.dates
     if graph_dates and len(graph_dates) != len(graphs):
         graph_dates = []
-    for i, g in enumerate(graphs):
-        setattr(g, "graph_idx", i)
+    print(f"graph artifact: {artifact.path} (format={artifact.format})")
 
     device = _choose_device(train_cfg.get("device", "auto"))
     _set_seed(int(train_cfg.get("seed", 7)))
@@ -3046,8 +3047,8 @@ def main() -> int:
     use_walk_forward = is_walk_forward_mode(split_mode_cfg)
     walk_forward = []
     if use_walk_forward:
-        walk_forward = walk_forward_splits(
-            graphs,
+        walk_forward = walk_forward_split_indices(
+            len(graphs),
             train_frac=float(config.get("walk_forward_train_frac", 0.6)),
             eval_frac=float(config.get("walk_forward_eval_frac", config.get("eval_frac", 0.2))),
             step_frac=float(config.get("walk_forward_step_frac", 0.2)),
@@ -3145,13 +3146,11 @@ def main() -> int:
                         }
                     )
                 for fold in walk_forward:
-                    train_fold = fold["train_items"]
-                    eval_fold = fold["eval_items"]
-                    eval_dates_fold = []
-                    if graph_dates:
-                        s = int(fold["eval_start"])
-                        e = int(fold["eval_end"])
-                        eval_dates_fold = list(graph_dates[s:e])
+                    train_idx = [int(i) for i in fold["train_idx"]]
+                    eval_idx = [int(i) for i in fold["eval_idx"]]
+                    train_fold = GraphIndexSequence(graphs, train_idx)
+                    eval_fold = GraphIndexSequence(graphs, eval_idx)
+                    eval_dates_fold = _slice_by_indices(graph_dates, eval_idx)
                     fold_meta = {
                         "mode": mode,
                         "row_type": "fold",
@@ -3252,9 +3251,9 @@ def main() -> int:
                     seed=seed_mode,
                     split_mode=split_mode_mode,
                 )
-                train_graphs_mode = [graphs[i] for i in tr_idx]
-                eval_graphs_mode = [graphs[i] for i in ev_idx]
-                eval_dates_mode = [graph_dates[i] for i in ev_idx] if graph_dates else []
+                train_graphs_mode = GraphIndexSequence(graphs, tr_idx)
+                eval_graphs_mode = GraphIndexSequence(graphs, ev_idx)
+                eval_dates_mode = _slice_by_indices(graph_dates, ev_idx)
 
                 attempts = [(cfg_mode, False, False)]
                 if retry_safe_on_error:

@@ -112,3 +112,58 @@ def walk_forward_splits(
             "No valid walk-forward folds were generated. Adjust train/eval fractions or min sizes."
         )
     return splits
+
+
+def walk_forward_split_indices(
+    n_items: int,
+    train_frac: float = 0.6,
+    eval_frac: float = 0.2,
+    step_frac: float | None = None,
+    min_train_size: int = 64,
+    min_eval_size: int = 16,
+    max_folds: int = 0,
+) -> list[dict[str, object]]:
+    n = int(n_items)
+    if n < 2:
+        raise ValueError("Need at least 2 items for walk-forward splits.")
+
+    train_size = max(int(round(n * float(train_frac))), int(min_train_size))
+    train_size = min(max(1, train_size), n - 1)
+
+    eval_size = max(int(round(n * float(eval_frac))), int(min_eval_size))
+    eval_size = min(max(1, eval_size), n - train_size)
+    if eval_size <= 0:
+        raise ValueError("walk-forward eval_size resolved to zero.")
+
+    if step_frac is None or float(step_frac) <= 0:
+        step_size = eval_size
+    else:
+        step_size = max(1, int(round(n * float(step_frac))))
+
+    splits: list[dict[str, object]] = []
+    eval_start = train_size
+    while eval_start + eval_size <= n:
+        eval_end = eval_start + eval_size
+        train_idx = list(range(0, eval_start))
+        eval_idx = list(range(eval_start, eval_end))
+        if train_idx and eval_idx:
+            splits.append(
+                {
+                    "fold_id": len(splits),
+                    "train_start": 0,
+                    "train_end": eval_start,
+                    "eval_start": eval_start,
+                    "eval_end": eval_end,
+                    "train_idx": train_idx,
+                    "eval_idx": eval_idx,
+                }
+            )
+            if max_folds > 0 and len(splits) >= int(max_folds):
+                break
+        eval_start += step_size
+
+    if not splits:
+        raise ValueError(
+            "No valid walk-forward folds were generated. Adjust train/eval fractions or min sizes."
+        )
+    return splits

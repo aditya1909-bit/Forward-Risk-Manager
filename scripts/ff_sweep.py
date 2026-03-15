@@ -40,6 +40,7 @@ from frisk.ff import (
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import resolve_device, sync_device
+from frisk.graph_artifact import load_graph_artifact
 from frisk.eval_metrics import ff_binary_metrics
 from frisk.econ_eval import (
     evaluate_goodness_strategy,
@@ -77,12 +78,9 @@ def _load_graphs_cached(graphs_path: str):
     cached = _GRAPH_CACHE.get(key)
     if cached is not None:
         return cached
-    try:
-        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(Path(graphs_path), map_location="cpu")
-    graphs = payload["graphs"] if isinstance(payload, dict) else payload
-    graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
+    artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
+    graph_dates = artifact.dates
     if graph_dates and len(graph_dates) != len(graphs):
         graph_dates = []
     out = (graphs, graph_dates)

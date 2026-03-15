@@ -18,6 +18,7 @@ from frisk.models import GCNEncoder
 from frisk.ff import goodness
 from frisk.eval_metrics import binary_auroc
 from frisk.econ_eval import max_drawdown, resolve_price_ticker, strategy_stats
+from frisk.graph_artifact import load_graph_artifact
 
 
 def _load_config(path: str) -> dict:
@@ -127,12 +128,9 @@ def main() -> int:
     build_cfg = cfg.get("build_graphs", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
-    try:
-        payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(graphs_path, map_location="cpu")
-    graphs = payload["graphs"]
-    dates = payload.get("dates", [])
+    artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
+    dates = artifact.dates
     if not graphs or not dates:
         raise ValueError("Graphs or dates missing.")
 

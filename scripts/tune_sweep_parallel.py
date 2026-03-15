@@ -20,6 +20,7 @@ sys.path.append(str(ROOT / "src"))
 from frisk.models import GCNEncoder
 from frisk.ff import goodness, make_negative, ff_loss
 from frisk.device import resolve_device, sync_device
+from frisk.graph_artifact import load_graph_artifact
 
 _THREAD_STATE = {"threads": None, "interop": None}
 _THREAD_WARNED = False
@@ -79,11 +80,8 @@ def _load_graphs_cached(graphs_path: str):
     graphs = _GRAPH_CACHE.get(key)
     if graphs is not None:
         return graphs
-    try:
-        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(Path(graphs_path), map_location="cpu")
-    graphs = payload["graphs"]
+    artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
     _GRAPH_CACHE[key] = graphs
     return graphs
 

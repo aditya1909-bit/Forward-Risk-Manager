@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import GCNEncoder
+from frisk.graph_artifact import load_graph_artifact
 
 
 def _load_config(path: str) -> dict:
@@ -104,13 +105,10 @@ def main() -> int:
     train_cfg = cfg.get("train", {})
 
     graphs_path = Path(args.graphs or train_cfg.get("graphs", "data/processed/graphs.pt"))
-    try:
-        payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(graphs_path, map_location="cpu")
-    graphs = payload["graphs"] if isinstance(payload, dict) else payload
-    dates = payload.get("dates", []) if isinstance(payload, dict) else []
-    tickers = payload.get("tickers", []) if isinstance(payload, dict) else []
+    artifact = load_graph_artifact(graphs_path, include_tickers=True, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
+    dates = artifact.dates
+    tickers = artifact.tickers or []
     if not graphs:
         raise ValueError("No graphs found.")
 

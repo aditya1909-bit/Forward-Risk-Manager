@@ -22,6 +22,7 @@ from frisk.models import (
     SequenceEnergyCritic,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.graph_artifact import load_graph_artifact
 
 
 def _load_config(path: str) -> dict:
@@ -690,15 +691,13 @@ def main() -> int:
         raise ValueError("--adaptive requires --target-ticker")
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
-    try:
-        payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(graphs_path, map_location="cpu")
-    graphs = payload["graphs"]
-    tickers_list = payload.get("tickers", [])
-    dates = payload.get("dates", [])
+    artifact = load_graph_artifact(graphs_path, include_tickers=True, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
+    tickers_list = artifact.tickers or []
+    dates = artifact.dates
     if not graphs:
         raise ValueError("No graphs found.")
+    print(f"graph artifact: {artifact.path} (format={artifact.format})")
 
     if args.target_ticker in {"AUTO", "AUTO_DETECT", "AUTO-DETECT"}:
         resolved = _resolve_auto_target_ticker(tickers_list)

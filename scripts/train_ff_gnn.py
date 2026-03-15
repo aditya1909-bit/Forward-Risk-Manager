@@ -41,6 +41,7 @@ from frisk.ff import (
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
+from frisk.graph_artifact import GraphIndexSequence, load_graph_artifact
 from frisk.econ_eval import resolve_price_ticker
 from frisk.targets import (
     compute_forward_return_targets_cached,
@@ -440,7 +441,7 @@ def _filter_graphs_for_training(
             selected_idx = selected_idx[-int(limit) :]
         else:
             selected_idx = selected_idx[: int(limit)]
-    return [graphs[i] for i in selected_idx], selected_idx
+    return GraphIndexSequence(graphs, selected_idx), selected_idx
 
 
 def _tensor_summary_stats(tensor: torch.Tensor | None) -> tuple[float, float, float]:
@@ -2265,18 +2266,12 @@ def main() -> int:
             print("amp_dtype=bfloat16 not supported on this CUDA device; falling back to float16.")
     scaler = _make_scaler(amp_enabled and amp_dtype == torch.float16)
 
-    try:
-        payload = torch.load(Path(graphs_path), map_location="cpu", weights_only=False)
-    except TypeError:
-        # Older torch versions don't support weights_only
-        payload = torch.load(Path(graphs_path), map_location="cpu")
-    graphs = payload["graphs"]
-    dates = payload.get("dates", [])
+    artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
+    graphs = artifact.graphs
+    dates = artifact.dates
     if not graphs:
         raise ValueError("No graphs found in the provided file.")
-
-    for i, g in enumerate(graphs):
-        setattr(g, "graph_idx", i)
+    print(f"graph artifact: {artifact.path} (format={artifact.format})")
     raw_graph_count = len(graphs)
     graphs, selected_graph_idx = _filter_graphs_for_training(
         graphs,

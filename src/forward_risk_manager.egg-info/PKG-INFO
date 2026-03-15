@@ -40,34 +40,40 @@ Publish curated artifacts from a run:
 python scripts/publish_run.py --run-id <run_id>
 ```
 
-## Current Results Snapshot (as of 2026-02-18)
+## Current Results Snapshot (as of 2026-02-25)
 Latest notebook run IDs:
-- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260218_024603/`
+- Latest paper benchmark (500 epochs): `runs/experiments/paper_final_500_20260225_002036/`
 - Latest full end-to-end run (sweep/scenario/calibration/backtest): `runs/experiments/e2e_runbook_20260215_143702/`
 - Recovery ablation outputs: `runs/experiments/recovery_ablation/`
 
 Published index status (`reports/index.csv`):
-- Published benchmark/scenario/sweep/hallucination/train snapshots currently point to `long_constituents` (timestamp `2026-02-13T00:40:52Z`).
+- Published benchmark/scenario/sweep/hallucination/train snapshots currently point to `long_constituents` (timestamp `2026-02-24T22:19:12Z`).
+- Paper benchmark artifacts are now tracked for GitHub under `reports/published/benchmark/`:
+  - `paper_final_500_latest_summary.csv`
+  - `paper_final_500_latest_summary.md`
+  - `paper_final_500_latest_summary.json`
+  - `paper_final_500_latest_benchmark.csv`
+  - `paper_final_500_latest_walk_forward_folds.csv`
 - `sweep/latest_tune.csv` still points to `legacy-20260211-colab`.
-- Notebook runbook artifacts (`e2e_runbook_*` and `paper_final_500_*`) are local run artifacts until promoted/published.
+- Notebook runbook artifacts (`e2e_runbook_*` and `paper_final_500_*`) remain local run artifacts under `runs/`; use `reports/published/` for tracked snapshots.
 
-Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260218_024603/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
+Latest paper benchmark rerun (`runs/experiments/paper_final_500_20260225_002036/metrics/paper_benchmark_summary.csv`, walk-forward with 3 folds):
 
 | mode | quality metric | quality value | eval_auroc | eval_auprc | avg_epoch_s | graphs_per_s | econ_ann_return_uplift | econ_sharpe_uplift |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| `ff_layerwise` | `eval_sep` | `6.28991` | `0.74806` | `0.79869` | `1.767` | `817.6` | `-29.78%` | `-0.396` |
-| `ff_e2e` | `eval_sep` | `14.64823` | `1.00000` | `1.00000` | `0.808` | `1786.6` | `-30.05%` | `-0.274` |
-| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.532` | `2713.4` | `-26.89%` | `+0.193` |
+| `ff_layerwise` | `eval_sep` | `6.51199` | `0.62829` | `0.67070` | `1.349` | `1070.2` | `-26.70%` | `-0.223` |
+| `ff_e2e` | `eval_sep` | `14.23771` | `1.00000` | `1.00000` | `0.706` | `2045.5` | `-27.76%` | `-0.338` |
+| `backprop` | `eval_auroc` | `1.00000` | `1.00000` | `1.00000` | `0.340` | `4253.3` | `-29.28%` | `-0.448` |
 
 Latest completed benchmark status:
-- Best quality: `ff_e2e` (`eval_sep=14.64823`, `eval_auroc=1.00000`).
-- Fastest mode: `backprop` (`2713.4` graphs/s).
-- Best economics in this run (Sharpe-based): `backprop` (`econ_sharpe_uplift=+0.193`, `econ_ann_return_uplift=-26.89%`).
+- Best quality: `ff_e2e` (`eval_sep=14.23771`, `eval_auroc=1.00000`).
+- Fastest mode: `backprop` (`4253.3` graphs/s).
+- Best economics in this run (Sharpe-based): `ff_layerwise` (`econ_sharpe_uplift=-0.223`, `econ_ann_return_uplift=-26.70%`).
 
 How to read this latest paper result:
 - Quality and economics are still not aligned: `ff_e2e` has the strongest separation objective (`eval_sep`) but does not win economics.
-- `backprop` is best on speed and Sharpe uplift, but all three modes still have negative annual return uplift versus buy-and-hold in this window.
-- Fold-level economics remain unstable (`runs/experiments/paper_final_500_20260218_024603/metrics/benchmark_walk_forward_folds.csv`), with Sharpe uplift changing sign across folds for every mode.
+- `backprop` is best on speed and classifier metrics, but all three modes are negative on both annual return uplift and Sharpe uplift versus buy-and-hold in this run.
+- Fold-level economics remain unstable for FF modes (`runs/experiments/paper_final_500_20260225_002036/metrics/benchmark_walk_forward_folds.csv`): `ff_layerwise` and `ff_e2e` switch Sharpe-uplift sign across folds, while `backprop` stays negative across all folds.
 - `objective_track` matters when reading rows: `ff_*` rows are critic/separation-tracked; `backprop` is classifier/`eval_auroc`-tracked.
 
 Recovery ablation runbook (`notebooks/recovery_ablation_runbook.ipynb`, outputs from `runs/experiments/recovery_ablation/metrics/`, focused `risk_head` rerun generated 2026-02-14 21:32):
@@ -138,6 +144,62 @@ python scripts/qc_export_to_tidy.py \
 
 Note: If you pass a directory to `--prices`, every CSV in that directory is treated as price data. Keep constituents/coarse in separate directories or pass explicit files.
 
+## Local `Data FF` Consolidation
+If your raw dataset lives outside Drive (for example `/Users/<you>/Desktop/Data FF`), consolidate it into a few CSVs first:
+
+```bash
+python scripts/consolidate_data_ff.py \
+  --data-ff-root "/Users/<you>/Desktop/Data FF" \
+  --out-dir "data/consolidated_ff_local"
+```
+
+This writes:
+- `data/consolidated_ff_local/prices.csv`
+- `data/consolidated_ff_local/macro.csv`
+- `data/consolidated_ff_local/sec_submissions_entities.csv`
+- `data/consolidated_ff_local/sec_companyfacts_selected.csv`
+
+For a fast smoke run:
+
+```bash
+python scripts/consolidate_data_ff.py \
+  --data-ff-root "/Users/<you>/Desktop/Data FF" \
+  --out-dir "data/consolidated_ff_local_smoke" \
+  --max-sec-files 1000 \
+  --skip-companyfacts
+```
+
+If your DATA FF folder uses a `submissions` subfolder (not `SEC_XBRL_submissions`), pass `--submissions-dir submissions`.
+
+After consolidation, you can build the **master graph** once (locally or on Colab) and use it for all runs. Sync `data/consolidated_ff_local/` to Drive, then on Colab open `notebooks/colab_setup.ipynb` or run `build_graphs.py` with `configs/master_graph_ff.toml`; the notebooks auto-detect consolidated data and use it for graph build and economic-profit–focused train/benchmark.
+
+For a dedicated build-only Colab workflow, use `notebooks/graph_factory_colab.ipynb`. It creates a reusable graph artifact (`data/processed/graphs_master_ff_rich.pt`) plus a fingerprint manifest so unchanged inputs/config can skip rebuilds.
+
+## Notebook Workflow
+The notebooks are now intentionally thin wrappers over shared helpers in `src/frisk/notebook_runtime.py`. Shared behavior that used to be duplicated inline now lives there:
+- repo/runtime bootstrap helpers
+- streamed shell execution with per-command logs
+- TOML runtime-config overlay writing
+- CSV merge helpers for per-mode benchmark outputs
+- source fingerprinting and run-step manifest helpers
+
+Notebook hygiene is handled with:
+
+```bash
+python scripts/notebook_hygiene.py --strip notebooks/*.ipynb
+python scripts/notebook_hygiene.py --fail-on-outputs --syntax-check notebooks/*.ipynb
+```
+
+Recommended workflow:
+- keep notebook outputs out of git and regenerate them locally when needed
+- keep orchestration logic in `src/` or `scripts/`, not inline in notebook cells
+- treat notebooks as control panels and artifact viewers, not the system of record for pipeline behavior
+
+`build_graphs.py` now also supports SEC-derived node features directly from consolidation outputs:
+- `sec_companyfacts` -> parsed into per-ticker, per-date features and accounting ratios
+- `sec_submissions` -> optional ticker-level metadata features (e.g. `sec_sic`, `sec_recent_filings_count`)
+- use `feature_mode = "window_plus_summary_fund"` to append these SEC fundamentals to node features
+
 ## Rolling Correlation Graphs
 Build rolling correlation graphs using a window size (in trading days). The correlation matrix for each graph is computed from the last `window` days ending at each date.
 
@@ -168,6 +230,11 @@ python scripts/build_graphs.py \
 Tip: Use `--include-tickers <TICKER>` only if that ticker also exists in your prices data and you want it forced into membership.
 You can disable the progress bar with `--no-progress` or `progress = false` in config.
 
+Each graph now carries relation metadata in addition to edge weights:
+- `edge_relation_mask`: bitmask over edge sources (`corr_pos`, `corr_neg`, `lead_lag`, `sector_static`, `static_overlay`)
+- `edge_lag_days`: lag depth for temporal lead-lag edges
+- `edge_type`: compact primary relation id for relation-aware encoders
+
 ## Optional: joblib Parallel Backend
 If you want `joblib` parallelism for graph building on macOS, set:
 ```
@@ -184,6 +251,13 @@ Train a simple Forward-Forward GNN that uses graph topology during message passi
 
 ```bash
 python scripts/train_ff_gnn.py --config configs/default.toml
+```
+
+To use relation-aware message passing, set:
+```toml
+[train]
+encoder_conv_type = "rgcn"
+encoder_rgcn_num_relations = 8
 ```
 
 ### Encoder/Critic Split (Recommended)
@@ -346,6 +420,7 @@ Stability add-ons:
 - `neg_gate_margin`: if hallucinated negatives are too strong (`g_neg > g_pos + margin`), fall back to shuffle for that batch.
 - `grad_clip`: gradient norm clipping to reduce instability.
 - `ff_rank_aux_weight`: rank-spread auxiliary on goodness.
+- `ff_rank_corr_weight`: correlation auxiliary between graph goodness and forward-return targets (economics alignment).
 - `ff_rank_use_portfolio_targets = true`: when graph dates are available, rank aux is aligned to forward-return targets (`portfolio_ticker`/`portfolio_horizon`) instead of pure unsupervised spread.
 
 Distance-forward auxiliary loss (graph-level pairwise margin):
@@ -361,6 +436,7 @@ Recommended run location: `runs/experiments/<run_id>/metrics/ff_train.csv` and `
 Published snapshots should live under `reports/published/`.
 The CSV now includes `hall_hardness` (avg `g_neg - g_pos` for hallucinated batches).
 It also includes `dist_forward_loss` when distance-forward auxiliary training is enabled.
+When enabled, it also reports `rank_aux_loss` and `rank_corr_loss`.
 
 ## Baseline Config
 The current tuned baseline is stored at `configs/baseline.toml`.
@@ -409,6 +485,9 @@ Customize via `configs/default.toml`:
 epochs = 5
 batch_size = 32
 eval_frac = 0.2
+seeds = [7, 17, 29]
+seed_bootstrap_samples = 2000
+seed_bootstrap_alpha = 0.05
 neg_mode = "mix"
 eval_neg_mode = "auto"
 eval_neg_modes = ["time_flip", "block_bootstrap", "cross_asset_mix", "phase_randomize"]
@@ -421,6 +500,8 @@ econ_ticker = "AUTO"
 econ_signal_window = 126
 econ_signal_quantile = 0.5
 econ_turnover_cost_bps = 0.0
+econ_short_borrow_bps = 0.0
+econ_max_abs_exposure = 1.0
 out_csv = "runs/experiments/default/metrics/benchmark.csv"
 ```
 When `train.risk_head_enabled = true`, benchmark FF/backprop runs now include the same auxiliary risk loss path used in training and report `risk_loss_train`/`risk_head_enabled_effective`.
@@ -438,6 +519,7 @@ walk_forward_max_folds = 0
 walk_forward_out_csv = "runs/experiments/default/metrics/benchmark_walk_forward_folds.csv"
 ```
 This writes aggregate metrics (mean/std across folds) to `out_csv` and fold-level metrics with date ranges to `walk_forward_out_csv`.
+If you set multiple `benchmark.seeds`, the CSV includes per-seed rows plus an aggregate row with bootstrap confidence intervals (`*_ci_lo`, `*_ci_hi`).
 
 The CSV includes `avg_epoch_s`, `graphs_per_s`, and outcome metrics like `eval_sep`, `eval_auroc`, `eval_auprc`, `eval_brier`, `eval_ece`, plus thresholded `eval_acc`.
 It also appends economic columns (`econ_strategy_*`, `econ_bh_*`, `econ_ann_return_uplift`, `econ_sharpe_uplift`) computed from goodness-driven risk-on/off signals on the eval window.

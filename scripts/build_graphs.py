@@ -25,6 +25,7 @@ from frisk.data import (
     build_macro_features_from_market_data,
 )
 from frisk.graph_builder import GraphBuildConfig, build_rolling_corr_graphs
+from frisk.graph_artifact import save_graph_artifact
 
 
 def _load_config(path: str | None) -> dict:
@@ -118,7 +119,19 @@ def main() -> int:
         help="Optional static edge CSV (e.g., src,dst,weight,directed).",
         default=argparse.SUPPRESS,
     )
-    parser.add_argument("--out", help="Output .pt file", default=argparse.SUPPRESS)
+    parser.add_argument("--out", help="Output graph artifact path (.pt or sharded dir)", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--artifact-format",
+        choices=["packed", "sharded"],
+        default=argparse.SUPPRESS,
+        help="Artifact format: packed .pt or sharded directory for lazy loading.",
+    )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Graphs per shard when artifact-format=sharded.",
+    )
     parser.add_argument("--window", type=int, help="Rolling window size in days", default=argparse.SUPPRESS)
     parser.add_argument("--step", type=int, help="Step size between windows", default=argparse.SUPPRESS)
     parser.add_argument(
@@ -358,6 +371,8 @@ def main() -> int:
     macro_auto_long_window = int(_get_setting(args, section, "macro_auto_long_window", 63))
     static_edges_path = _get_setting(args, section, "static_edges", None)
     out_path = _get_setting(args, section, "out", "data/processed/graphs.pt")
+    artifact_format = str(_get_setting(args, section, "artifact_format", "packed"))
+    shard_size = int(_get_setting(args, section, "shard_size", 256))
 
     if not prices_path:
         raise ValueError("Provide --prices (or set it in config).")
@@ -603,24 +618,26 @@ def main() -> int:
         joblib_n_jobs=joblib_n_jobs,
         progress=progress,
     )
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "graphs": graphs,
-        "dates": dates,
-        "tickers": tickers,
-        "config": cfg.__dict__,
-        "stats": stats,
-    }
-    torch.save(payload, out_path)
+    out_path = save_graph_artifact(
+        out_path,
+        graphs=graphs,
+        dates=dates,
+        tickers=tickers,
+        config=cfg.__dict__,
+        stats=stats,
+        artifact_format=artifact_format,
+        shard_size=shard_size,
+    )
     if dates:
         start_date = dates[0]
         end_date = dates[-1]
     else:
         start_date = "n/a"
         end_date = "n/a"
-    print(f"Wrote {out_path} with {len(graphs)} graphs")
+    print(
+        f"Wrote {out_path} with {len(graphs)} graphs "
+        f"(format={artifact_format}, shard_size={shard_size if artifact_format == 'sharded' else 'n/a'})"
+    )
     print(
         f"Date range: {start_date} -> {end_date} | "
         f"windows: {stats.get('total_windows', 0)} | "

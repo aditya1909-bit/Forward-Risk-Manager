@@ -167,6 +167,49 @@ After consolidation, you can build the **master graph** once (locally or on Cola
 
 For a dedicated build-only Colab workflow, use `notebooks/graph_factory_colab.ipynb`. It creates a reusable graph artifact (`data/processed/graphs_master_ff_rich.pt`) plus a fingerprint manifest so unchanged inputs/config can skip rebuilds.
 
+For very large graph artifacts, you can now shard the graph payload for lazy loading:
+
+```bash
+python scripts/shard_graph_artifact.py \
+  --graphs data/processed/graphs_master_ff_rich.pt \
+  --out data/processed/graphs_master_ff_rich.pt.sharded \
+  --shard-size 256
+```
+
+`benchmark_training.py` and `train_ff_gnn.py` automatically prefer the sibling sharded artifact at `<graphs>.pt.sharded` when it exists, without needing config changes.
+
+For a dedicated Colab workflow that stages the packed artifact onto local `/content` SSD before sharding, use `notebooks/shard_graph_artifact_colab.ipynb`.
+
+You can also emit a sharded artifact directly from graph build:
+
+```bash
+python scripts/build_graphs.py \
+  --config configs/master_graph_ff.toml \
+  --out data/processed/graphs_master_ff_rich_sharded \
+  --artifact-format sharded \
+  --shard-size 256
+```
+
+## Notebook Workflow
+The notebooks are now intentionally thin wrappers over shared helpers in `src/frisk/notebook_runtime.py`. Shared behavior that used to be duplicated inline now lives there:
+- repo/runtime bootstrap helpers
+- streamed shell execution with per-command logs
+- TOML runtime-config overlay writing
+- CSV merge helpers for per-mode benchmark outputs
+- source fingerprinting and run-step manifest helpers
+
+Notebook hygiene is handled with:
+
+```bash
+python scripts/notebook_hygiene.py --strip notebooks/*.ipynb
+python scripts/notebook_hygiene.py --fail-on-outputs --syntax-check notebooks/*.ipynb
+```
+
+Recommended workflow:
+- keep notebook outputs out of git and regenerate them locally when needed
+- keep orchestration logic in `src/` or `scripts/`, not inline in notebook cells
+- treat notebooks as control panels and artifact viewers, not the system of record for pipeline behavior
+
 `build_graphs.py` now also supports SEC-derived node features directly from consolidation outputs:
 - `sec_companyfacts` -> parsed into per-ticker, per-date features and accounting ratios
 - `sec_submissions` -> optional ticker-level metadata features (e.g. `sec_sic`, `sec_recent_filings_count`)
