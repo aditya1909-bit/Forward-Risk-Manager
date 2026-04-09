@@ -182,7 +182,7 @@ def _build_updates(best: dict, apply_mode: bool) -> dict:
         mode = str(best.get("mode", "")).strip().lower()
         if mode == "ff_layerwise":
             updates["ff_layerwise"] = True
-        elif mode in ("ff_e2e", "backprop"):
+        elif mode in ("ff_e2e", "backprop", "backprop_contrastive", "backprop_contrastive_core"):
             updates["ff_layerwise"] = False
 
     return updates

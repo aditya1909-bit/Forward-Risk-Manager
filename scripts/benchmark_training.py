@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import contextlib
 import random
 import time
 from collections.abc import Sequence
@@ -14,7 +13,6 @@ import tomllib
 import numpy as np
 import pandas as pd
 import torch
-from torch.optim import Adam
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_mean_pool
 from tqdm import tqdm
@@ -23,11 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import (
-    CompositeEnergyCritic,
-    EnergyCritic,
-    EnergyCriticEnsemble,
     GCNEncoder,
-    SequenceEnergyCritic,
 )
 from frisk.ff import (
     ff_loss,
@@ -40,7 +34,7 @@ from frisk.ff import (
     self_contrastive_retrieval_accuracy,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
-from frisk.device import resolve_device, sync_device
+from frisk.device import resolve_device
 from frisk.eval_metrics import (
     binary_auprc,
     binary_auroc,
@@ -51,12 +45,10 @@ from frisk.splits import (
     is_walk_forward_mode,
     simple_split_indices,
     simple_train_eval_split,
-    walk_forward_splits,
     walk_forward_split_indices,
 )
 from frisk.econ_eval import (
     evaluate_goodness_strategy,
-    infer_graph_goodness,
     infer_graph_goodness_with_uncertainty,
     load_forward_returns_from_prices,
     resolve_price_ticker,
@@ -66,6 +58,35 @@ from frisk.targets import (
     compute_risk_targets_cached,
 )
 from frisk.graph_artifact import GraphIndexSequence, load_graph_artifact
+from frisk.benchmarking.semantics import (
+    apply_mode_profile as _apply_mode_profile,
+    attach_primary_metrics as _attach_primary_metrics,
+    canonical_mode_name as _canonical_mode_name,
+    ff_loss_kwargs as _ff_loss_kwargs,
+    goodness_kwargs as _goodness_kwargs,
+    objective_track as _objective_track,
+)
+from frisk.training.critics import build_critic as _build_critic
+from frisk.training.objectives import (
+    compute_multi_horizon_risk_loss as _compute_multi_horizon_risk_loss,
+    compute_portfolio_head_loss as _compute_portfolio_head_loss,
+    compute_supervised_return_loss as _compute_supervised_return_loss,
+    graph_target_tensor as _graph_target_tensor,
+    regression_eval_metrics as _regression_eval_metrics,
+)
+from frisk.training.runtime import (
+    autocast_if_needed as _autocast_if_needed,
+    build_optimizer as _build_optimizer,
+    compile_mode_candidates as _compile_mode_candidates,
+    forward_encoder as _forward_encoder,
+    make_scaler as _make_scaler,
+    maybe_compile_encoder as _maybe_compile_encoder,
+    optimizer_step as _optimizer_step,
+    parse_amp_dtype as _parse_amp_dtype,
+    peak_cuda_memory_mb as _peak_cuda_memory_mb,
+    reset_peak_cuda_memory as _reset_peak_cuda_memory,
+    sync as _sync,
+)
 
 _NEG_AUG_MODES = {
     "shuffle",
@@ -160,101 +181,6 @@ def _compute_forward_return_targets(
     )
 
 
-def _compute_portfolio_head_loss(
-    portfolio_head: torch.nn.Module,
-    embeddings: torch.Tensor,
-    graph_idx,
-    portfolio_targets: list[float | None],
-    device: torch.device,
-    loss_type: str,
-) -> torch.Tensor | None:
-    if not portfolio_targets:
-        return None
-    if torch.is_tensor(graph_idx):
-        idx_list = graph_idx.detach().cpu().tolist()
-    elif isinstance(graph_idx, (list, tuple)):
-        idx_list = list(graph_idx)
-    else:
-        idx_list = [int(graph_idx)]
-    target_vals = []
-    for gi in idx_list:
-        if 0 <= gi < len(portfolio_targets):
-            tv = portfolio_targets[gi]
-        else:
-            tv = None
-        target_vals.append(float(tv) if tv is not None else float("nan"))
-    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
-    mask = torch.isfinite(target)
-    if not mask.any():
-        return None
-
-    pred_raw = portfolio_head(embeddings)
-    if pred_raw.ndim == 2 and pred_raw.size(1) == 1:
-        pred_raw = pred_raw.squeeze(1)
-    if pred_raw.ndim != 1:
-        raise RuntimeError(f"portfolio head output shape mismatch: {tuple(pred_raw.shape)}")
-    pred = torch.tanh(pred_raw)
-
-    loss_mode = str(loss_type).strip().lower()
-    if loss_mode == "mse":
-        return torch.nn.functional.mse_loss(pred[mask], target[mask])
-
-    pnl = pred[mask] * target[mask]
-    if pnl.numel() == 0:
-        return None
-    if pnl.numel() == 1:
-        return -pnl.mean()
-    mean = pnl.mean()
-    std = pnl.std(unbiased=False) + 1e-6
-    return -(mean / std)
-
-
-def _compute_multi_horizon_risk_loss(
-    risk_head: torch.nn.Module,
-    embeddings: torch.Tensor,
-    graph_idx,
-    risk_targets_by_horizon: list[list[float | None]],
-    device: torch.device,
-    risk_loss_type: str,
-) -> torch.Tensor | None:
-    if not risk_targets_by_horizon:
-        return None
-
-    if torch.is_tensor(graph_idx):
-        idx_list = graph_idx.detach().cpu().tolist()
-    elif isinstance(graph_idx, (list, tuple)):
-        idx_list = list(graph_idx)
-    else:
-        idx_list = [int(graph_idx)]
-
-    target_rows = []
-    for gi in idx_list:
-        row = []
-        for horizon_targets in risk_targets_by_horizon:
-            if 0 <= gi < len(horizon_targets):
-                t = horizon_targets[gi]
-            else:
-                t = None
-            row.append(float(t) if t is not None else float("nan"))
-        target_rows.append(row)
-
-    target = torch.tensor(target_rows, dtype=torch.float32, device=device)
-    mask = torch.isfinite(target)
-    if not mask.any():
-        return None
-
-    pred = risk_head(embeddings)
-    if pred.ndim == 1:
-        pred = pred.unsqueeze(-1)
-    if pred.shape != target.shape:
-        raise RuntimeError(
-            f"risk head output shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}"
-        )
-    if risk_loss_type == "mse":
-        return torch.nn.functional.mse_loss(pred[mask], target[mask])
-    return torch.nn.functional.smooth_l1_loss(pred[mask], target[mask])
-
-
 def _goodness_rank_alignment_loss(
     g_scores: torch.Tensor,
     graph_idx,
@@ -337,97 +263,6 @@ def _choose_device(device: str) -> torch.device:
     return resolve_device(device)
 
 
-def _parse_amp_dtype(value) -> torch.dtype:
-    name = str(value).strip().lower()
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float16
-
-
-def _build_optimizer(params, lr: float, device: torch.device, use_fused: bool):
-    params = tuple(params)
-    if not params:
-        raise ValueError("optimizer got an empty parameter list")
-    kwargs = {}
-    if device.type == "cuda":
-        kwargs["foreach"] = True
-        if use_fused:
-            kwargs["fused"] = True
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("fused", None)
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("foreach", None)
-        return Adam(params, lr=lr, **kwargs)
-
-
-def _make_scaler(enabled: bool):
-    if not enabled:
-        return None
-    try:
-        return torch.amp.GradScaler("cuda", enabled=True)
-    except Exception:
-        return torch.cuda.amp.GradScaler(enabled=True)
-
-
-def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
-    if not enabled:
-        return contextlib.nullcontext()
-    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
-
-
-def _forward_encoder(model, *args, **kwargs):
-    compiler_ns = getattr(torch, "compiler", None)
-    mark_step = (
-        getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
-    )
-    if callable(mark_step):
-        mark_step()
-    return model(*args, **kwargs)
-
-
-def _compile_mode_candidates(requested_mode: str, device: torch.device) -> list[str]:
-    requested = str(requested_mode).strip() or "default"
-    candidates: list[str] = []
-    if device.type == "cuda" and requested == "reduce-overhead":
-        # FF-style multi-forward loops are sensitive to CUDA graph reuse.
-        candidates.append("max-autotune-no-cudagraphs")
-    candidates.append(requested)
-    if "default" not in candidates:
-        candidates.append("default")
-    seen: set[str] = set()
-    return [m for m in candidates if not (m in seen or seen.add(m))]
-
-
-def _maybe_compile_encoder(
-    model: torch.nn.Module,
-    config: dict,
-    device: torch.device,
-    context: str,
-) -> torch.nn.Module:
-    if not bool(config.get("torch_compile", False)):
-        return model
-    if not hasattr(torch, "compile"):
-        config["torch_compile"] = False
-        print(f"warning: {context} torch.compile requested but unavailable; disabled.")
-        return model
-    requested_mode = str(config.get("torch_compile_mode", "max-autotune-no-cudagraphs"))
-    for mode in _compile_mode_candidates(requested_mode, device):
-        try:
-            model = torch.compile(model, mode=mode)
-            config["torch_compile_mode"] = mode
-            print(f"{context} torch_compile active (mode={mode})")
-            return model
-        except Exception as exc:
-            print(f"warning: {context} torch.compile failed (mode={mode}): {exc}")
-    config["torch_compile"] = False
-    print(f"warning: {context} torch.compile disabled after fallback attempts.")
-    return model
-
-
 def _safe_retry_config(cfg_mode: dict) -> dict:
     safe_cfg = cfg_mode.copy()
     safe_cfg.update(
@@ -454,22 +289,6 @@ def _error_metadata(exc: Exception, max_len: int = 1000) -> tuple[str, str]:
     if len(err_msg) > max_len:
         err_msg = err_msg[: max_len - 3] + "..."
     return err_type, err_msg
-
-
-def _optimizer_step(optim, loss: torch.Tensor, grad_clip: float, clip_params, scaler) -> None:
-    optim.zero_grad(set_to_none=True)
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        if grad_clip > 0:
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-        scaler.step(optim)
-        scaler.update()
-        return
-    loss.backward()
-    if grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-    optim.step()
 
 
 def _split_graphs(
@@ -516,11 +335,14 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
             "eval_objective",
             "objective_track",
             "primary_eval_metric_name",
+            "primary_metric_family",
             "primary_eval_metric_robust_name",
             "neg_mode_effective",
             "eval_neg_mode_effective",
             "risk_head_enabled_effective",
             "portfolio_head_enabled_effective",
+            "task_family",
+            "signal_family",
         ):
             if key in first_fail:
                 out_failed[key] = first_fail[key]
@@ -562,11 +384,14 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
         "eval_objective",
         "objective_track",
         "primary_eval_metric_name",
+        "primary_metric_family",
         "primary_eval_metric_robust_name",
         "neg_mode_effective",
         "eval_neg_mode_effective",
         "risk_head_enabled_effective",
         "portfolio_head_enabled_effective",
+        "task_family",
+        "signal_family",
     ):
         if key in first:
             out[key] = first[key]
@@ -672,12 +497,15 @@ def _aggregate_seed_results(
         "eval_objective",
         "objective_track",
         "primary_eval_metric_name",
+        "primary_metric_family",
         "primary_eval_metric_robust_name",
         "neg_mode_effective",
         "eval_neg_mode_effective",
         "risk_head_enabled_effective",
         "portfolio_head_enabled_effective",
         "split_mode_effective",
+        "task_family",
+        "signal_family",
     ):
         if key in first:
             out[key] = first[key]
@@ -697,6 +525,7 @@ def _compute_econ_metrics_for_eval(
     eval_graphs,
     eval_dates,
     config: dict,
+    score_values: Sequence[float] | None = None,
 ):
     t0 = time.perf_counter()
     meta = {
@@ -713,13 +542,18 @@ def _compute_econ_metrics_for_eval(
     fwd_ret_1 = config.get("econ_fwd_ret_1")
     if fwd_ret_1 is None:
         return meta
-    g, g_unc = infer_graph_goodness_with_uncertainty(
-        model,
-        eval_graphs,
-        goodness_temp=float(config.get("goodness_temp", 1.0)),
-        batch_size=int(config.get("econ_loader_batch_size", config.get("batch_size", 64))),
-        critic=critic,
-    )
+    if score_values is None:
+        g, g_unc = infer_graph_goodness_with_uncertainty(
+            model,
+            eval_graphs,
+            goodness_temp=float(config.get("goodness_temp", 1.0)),
+            batch_size=int(config.get("econ_loader_batch_size", config.get("batch_size", 64))),
+            critic=critic,
+            **_goodness_kwargs(config),
+        )
+    else:
+        g = np.asarray(list(score_values), dtype=float)
+        g_unc = None
     if g.size == 0:
         return meta
     risk_signal = None
@@ -1060,73 +894,6 @@ def _self_contrastive_step(
     return loss, pos_score, neg_score, z_pos, z_view
 
 
-def _sync(device: torch.device) -> None:
-    sync_device(device)
-
-
-def _build_critic(config: dict, hidden_dim: int, device: torch.device):
-    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
-    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
-    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
-    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
-    if critic_positive not in {"softplus", "square"}:
-        critic_positive = "softplus"
-
-    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
-    seed_base = int(config.get("seed", 7))
-    seed_stride = max(1, int(config.get("critic_ensemble_seed_stride", 1009)))
-    critics = []
-    for i in range(ensemble_size):
-        if ensemble_size > 1:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(seed_base + i * seed_stride)
-                member = EnergyCritic(
-                    in_dim=hidden_dim,
-                    hidden_dim=critic_hidden_dim,
-                    num_layers=critic_num_layers,
-                    dropout=critic_dropout,
-                    positive_activation=critic_positive,
-                )
-        else:
-            member = EnergyCritic(
-                in_dim=hidden_dim,
-                hidden_dim=critic_hidden_dim,
-                num_layers=critic_num_layers,
-                dropout=critic_dropout,
-                positive_activation=critic_positive,
-            )
-        critics.append(member.to(device))
-
-    if len(critics) == 1:
-        base_critic = critics[0]
-    else:
-        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
-
-    seq_enabled = bool(config.get("sequence_critic_enabled", False))
-    if not seq_enabled:
-        return base_critic
-
-    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
-    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
-    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
-    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
-    if seq_positive not in {"softplus", "square"}:
-        seq_positive = "softplus"
-    seq_weight = float(config.get("sequence_critic_weight", 0.0))
-    seq_critic = SequenceEnergyCritic(
-        in_dim=hidden_dim,
-        hidden_dim=seq_hidden,
-        num_layers=seq_layers,
-        dropout=seq_dropout,
-        positive_activation=seq_positive,
-    ).to(device)
-    return CompositeEnergyCritic(
-        base_critic=base_critic,
-        sequence_critic=seq_critic,
-        sequence_weight=seq_weight,
-    ).to(device)
-
-
 def _eval_ff_metrics(
     model,
     critic,
@@ -1142,7 +909,9 @@ def _eval_ff_metrics(
     window_len: int | None = None,
     summary_dim: int = 0,
     ece_bins: int = 10,
+    goodness_kwargs: dict | None = None,
 ):
+    goodness_kwargs = goodness_kwargs or {}
     eval_mode = str(neg_mode).strip().lower()
     if eval_mode == "self_contrastive":
         prev_mode = model.training
@@ -1217,7 +986,13 @@ def _eval_ff_metrics(
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
             h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+            g_pos = goodness(
+                h_pos,
+                batch.batch,
+                temperature=goodness_temp,
+                critic=critic,
+                **goodness_kwargs,
+            )
 
         if eval_mode == "hallucinate":
             with torch.enable_grad():
@@ -1254,7 +1029,13 @@ def _eval_ff_metrics(
 
         with torch.no_grad():
             h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
-            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
+            g_neg = goodness(
+                h_neg,
+                batch.batch,
+                temperature=goodness_temp,
+                critic=critic,
+                **goodness_kwargs,
+            )
             pred_pos = (g_pos > goodness_target)
             pred_neg = (g_neg <= goodness_target)
             acc_num += (pred_pos.sum() + pred_neg.sum()).item()
@@ -1282,62 +1063,6 @@ def _eval_ff_metrics(
     }
 
 
-def _finite_or_none(value):
-    try:
-        v = float(value)
-    except Exception:
-        return None
-    if not np.isfinite(v):
-        return None
-    return v
-
-
-def _objective_primary_metric(metrics: dict) -> tuple[str, float]:
-    objective = str(metrics.get("eval_objective", "")).strip().lower()
-    if objective == "self_contrastive":
-        for key in ("eval_sc_gap", "eval_sep", "eval_sc_acc", "eval_acc"):
-            v = _finite_or_none(metrics.get(key))
-            if v is not None:
-                return key, v
-    if objective in {"bce", "backprop"}:
-        for key in ("eval_auroc", "eval_auprc", "eval_sep", "eval_acc"):
-            v = _finite_or_none(metrics.get(key))
-            if v is not None:
-                return key, v
-    for key in ("eval_sep", "eval_auroc", "eval_auprc", "eval_acc"):
-        v = _finite_or_none(metrics.get(key))
-        if v is not None:
-            return key, v
-    return "none", float("nan")
-
-
-def _objective_track(objective: str) -> str:
-    obj = str(objective).strip().lower()
-    if obj == "self_contrastive":
-        return "encoder"
-    if obj in {"ff", "forward_forward", "forward-forward"} or obj.startswith("ff_"):
-        return "critic"
-    if obj in {"bce", "backprop"}:
-        return "classifier"
-    return "unknown"
-
-
-def _objective_primary_metric_robust(metrics: dict) -> tuple[str, float]:
-    # Robust metric intentionally mirrors objective-primary metric.
-    # Time-flip discrimination belongs to critic evaluation/sanity checks, not self-contrastive ranking.
-    return _objective_primary_metric(metrics)
-
-
-def _attach_primary_metrics(out: dict) -> None:
-    metric_name, metric_val = _objective_primary_metric(out)
-    robust_name, robust_val = _objective_primary_metric_robust(out)
-    out["objective_track"] = _objective_track(out.get("eval_objective", ""))
-    out["primary_eval_metric_name"] = metric_name
-    out["primary_eval_metric"] = metric_val
-    out["primary_eval_metric_robust_name"] = robust_name
-    out["primary_eval_metric_robust"] = robust_val
-
-
 def _baseline_context(config: dict, device: torch.device, num_graphs: int) -> dict[str, float | str]:
     return {
         "baseline_seed": int(config.get("seed", 0)),
@@ -1362,7 +1087,9 @@ def _calibrate_goodness_target(
     summary_dim: int = 0,
     max_batches: int = 0,
     quantiles: int = 31,
+    goodness_kwargs: dict | None = None,
 ):
+    goodness_kwargs = goodness_kwargs or {}
     if str(neg_mode).strip().lower() == "self_contrastive":
         return float(default_target), float("nan")
     model.eval()
@@ -1376,7 +1103,13 @@ def _calibrate_goodness_target(
         edge_weight = getattr(batch, "edge_weight", None)
         with torch.no_grad():
             h_pos = _forward_encoder(model, x, batch.edge_index, edge_weight=edge_weight)
-            g_pos = goodness(h_pos, batch.batch, temperature=goodness_temp, critic=critic)
+            g_pos = goodness(
+                h_pos,
+                batch.batch,
+                temperature=goodness_temp,
+                critic=critic,
+                **goodness_kwargs,
+            )
 
         if neg_mode == "hallucinate":
             with torch.enable_grad():
@@ -1413,7 +1146,13 @@ def _calibrate_goodness_target(
 
         with torch.no_grad():
             h_neg = _forward_encoder(model, x_neg, batch.edge_index, edge_weight=edge_weight)
-            g_neg = goodness(h_neg, batch.batch, temperature=goodness_temp, critic=critic)
+            g_neg = goodness(
+                h_neg,
+                batch.batch,
+                temperature=goodness_temp,
+                critic=critic,
+                **goodness_kwargs,
+            )
 
         pos_vals.append(g_pos.detach().cpu())
         neg_vals.append(g_neg.detach().cpu())
@@ -1595,6 +1334,8 @@ def _benchmark_ff(
         if not bf16_ok:
             amp_dtype = torch.float16
     scaler = _make_scaler(amp_enabled and amp_dtype == torch.float16)
+    goodness_kwargs = _goodness_kwargs(config)
+    ff_loss_kwargs = _ff_loss_kwargs(config)
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if layerwise and train_neg_mode == "self_contrastive":
         fallback = str(config.get("layerwise_neg_mode", "shuffle")).strip().lower()
@@ -1629,6 +1370,7 @@ def _benchmark_ff(
         "loss_terms": 0.0,
         "optimizer": 0.0,
     }
+    _reset_peak_cuda_memory(device)
     steps_total = 0
     risk_loss_sum = 0.0
     risk_batches = 0
@@ -1638,6 +1380,7 @@ def _benchmark_ff(
     rank_aux_batches = 0
     rank_corr_sum = 0.0
     rank_corr_batches = 0
+    epoch_history = []
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -1650,6 +1393,7 @@ def _benchmark_ff(
         t0 = time.perf_counter()
         graphs_seen = 0
         total_loss = 0.0
+        loss_updates = 0
         for batch_idx, batch in enumerate(loader, start=1):
             batch = batch.to(device)
             x = batch.x
@@ -1709,12 +1453,14 @@ def _benchmark_ff(
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             ).mean().item()
                             g_neg_probe = goodness(
                                 layers_neg[last_idx],
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             ).mean().item()
                         if g_neg_probe > g_pos_probe + config["neg_gate_margin"]:
                             x_neg = make_negative(
@@ -1739,12 +1485,14 @@ def _benchmark_ff(
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             )
                             g_neg = goodness(
                                 layers_neg[li],
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             )
                             loss = loss + ff_loss(
                                 g_pos,
@@ -1752,6 +1500,7 @@ def _benchmark_ff(
                                 target=config["goodness_target"],
                                 margin=float(config.get("ff_margin", 0.0)),
                                 margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                                **ff_loss_kwargs,
                             )
                     loss = loss / max(1, len(ff_block_endpoints))
                     t_opt = time.perf_counter()
@@ -1764,6 +1513,7 @@ def _benchmark_ff(
                     )
                     component_times["optimizer"] += time.perf_counter() - t_opt
                     total_loss += loss.item()
+                    loss_updates += 1
                 else:
                     x_in = x
                     for li in range(len(model.layers)):
@@ -1779,6 +1529,7 @@ def _benchmark_ff(
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             )
                         x_neg = _make_negatives(
                             model,
@@ -1807,6 +1558,7 @@ def _benchmark_ff(
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             )
                             loss = ff_loss(
                                 g_pos,
@@ -1814,6 +1566,7 @@ def _benchmark_ff(
                                 target=config["goodness_target"],
                                 margin=float(config.get("ff_margin", 0.0)),
                                 margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                                **ff_loss_kwargs,
                             )
                         t_opt = time.perf_counter()
                         _optimizer_step(
@@ -1825,6 +1578,7 @@ def _benchmark_ff(
                         )
                         component_times["optimizer"] += time.perf_counter() - t_opt
                         total_loss += loss.item()
+                        loss_updates += 1
                         x_in = h_pos.detach()
             else:
                 if use_mode == "self_contrastive":
@@ -1879,12 +1633,14 @@ def _benchmark_ff(
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             )
                             g_neg_aux = goodness(
                                 h_neg_aux,
                                 batch.batch,
                                 temperature=config["goodness_temp"],
                                 critic=critic,
+                                **goodness_kwargs,
                             )
                             loss = loss + sc_ff_weight * ff_loss(
                                 g_pos_aux,
@@ -1892,6 +1648,7 @@ def _benchmark_ff(
                                 target=sc_ff_target,
                                 margin=float(config.get("ff_margin", 0.0)),
                                 margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                                **ff_loss_kwargs,
                             )
                 else:
                     x_neg = _make_negatives(
@@ -1944,12 +1701,14 @@ def _benchmark_ff(
                         batch.batch,
                         temperature=config["goodness_temp"],
                         critic=critic,
+                        **goodness_kwargs,
                     )
                     g_neg = goodness(
                         h_neg,
                         batch.batch,
                         temperature=config["goodness_temp"],
                         critic=critic,
+                        **goodness_kwargs,
                     )
                     loss = ff_loss(
                         g_pos,
@@ -1957,6 +1716,7 @@ def _benchmark_ff(
                         target=config["goodness_target"],
                         margin=float(config.get("ff_margin", 0.0)),
                         margin_weight=float(config.get("ff_margin_weight", 1.0)),
+                        **ff_loss_kwargs,
                     )
                     if apply_distance:
                         z_pos = global_mean_pool(h_pos, batch.batch)
@@ -2004,6 +1764,7 @@ def _benchmark_ff(
                             batch.batch,
                             temperature=config["goodness_temp"],
                             critic=critic,
+                            **goodness_kwargs,
                         )
                     if ff_rank_aux_weight > 0:
                         rank_aux_val = _goodness_rank_alignment_loss(
@@ -2034,6 +1795,7 @@ def _benchmark_ff(
                 )
                 component_times["optimizer"] += time.perf_counter() - t_opt
                 total_loss += loss.item()
+                loss_updates += 1
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
@@ -2060,6 +1822,15 @@ def _benchmark_ff(
         _sync(device)
         dt = time.perf_counter() - t0
         epoch_times.append((dt, graphs_seen))
+        epoch_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(total_loss / max(1, loss_updates)),
+                "epoch_s": float(dt),
+                "graphs_seen": int(graphs_seen),
+                "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
+            }
+        )
 
     target_eval = float(config["goodness_target"])
     target_cal_acc = float("nan")
@@ -2080,6 +1851,7 @@ def _benchmark_ff(
             summary_dim=config.get("summary_dim", 0),
             max_batches=int(config.get("calibrate_batches", 0)),
             quantiles=int(config.get("calibrate_quantiles", 31)),
+            goodness_kwargs=goodness_kwargs,
         )
         print(
             "calibrated goodness_target="
@@ -2101,6 +1873,7 @@ def _benchmark_ff(
         window_len=config.get("window_len"),
         summary_dim=config.get("summary_dim", 0),
         ece_bins=int(config.get("ece_bins", 10)),
+        goodness_kwargs=goodness_kwargs,
     )
     warm = int(config.get("timing_warmup_epochs", 0))
     usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
@@ -2121,10 +1894,14 @@ def _benchmark_ff(
         "time_loss_terms_s": float(component_times["loss_terms"] / steps_denom),
         "time_optimizer_s": float(component_times["optimizer"] / steps_denom),
         "time_econ_eval_s": 0.0,
+        "time_to_target_metric": float("nan"),
         "goodness_target_eval": target_eval,
         "target_cal_acc": target_cal_acc,
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
+        "task_family": str(config.get("task_family", "custom")),
+        "signal_family": str(config.get("signal_family", "custom")),
+        "peak_cuda_mem_mb": _peak_cuda_memory_mb(device),
         "risk_head_enabled_effective": bool(risk_head is not None),
         "risk_loss_train": risk_loss_train,
         "portfolio_head_enabled_effective": bool(portfolio_head is not None),
@@ -2176,6 +1953,7 @@ def _benchmark_ff(
                 window_len=config.get("window_len"),
                 summary_dim=config.get("summary_dim", 0),
                 ece_bins=int(config.get("ece_bins", 10)),
+                goodness_kwargs=goodness_kwargs,
             )
             mode_key = mode.replace("+", "_plus_")
             out[f"eval_{mode_key}_acc"] = mode_metrics.get("eval_acc")
@@ -2188,6 +1966,7 @@ def _benchmark_ff(
         out["eval_neg_modes_reported"] = ",".join(reported)
         if skipped:
             out["eval_neg_modes_skipped"] = ",".join(skipped)
+    out["_epoch_history"] = epoch_history
     _attach_primary_metrics(out)
     return out
 
@@ -2269,6 +2048,7 @@ def _benchmark_backprop(
         if not bf16_ok:
             bp_amp_dtype = torch.float16
     bp_scaler = _make_scaler(bp_amp_enabled and bp_amp_dtype == torch.float16)
+    goodness_kwargs = _goodness_kwargs(config)
 
     hall_cfg = HallucinationConfig(
         steps=config["hall_steps"],
@@ -2322,11 +2102,13 @@ def _benchmark_backprop(
         "loss_terms": 0.0,
         "optimizer": 0.0,
     }
+    _reset_peak_cuda_memory(device)
     steps_total = 0
     risk_loss_sum = 0.0
     risk_batches = 0
     portfolio_loss_sum = 0.0
     portfolio_batches = 0
+    epoch_history = []
     for epoch in tqdm(
         range(1, config["epochs"] + 1),
         desc="Benchmark",
@@ -2337,6 +2119,8 @@ def _benchmark_backprop(
         model.train()
         t0 = time.perf_counter()
         graphs_seen = 0
+        total_loss = 0.0
+        loss_updates = 0
         for batch in loader:
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
@@ -2442,6 +2226,8 @@ def _benchmark_backprop(
                 scaler=bp_scaler,
             )
             component_times["optimizer"] += time.perf_counter() - t_opt
+            total_loss += float(loss.detach().item())
+            loss_updates += 1
             if risk_loss_val is not None:
                 risk_loss_sum += float(risk_loss_val.detach())
                 risk_batches += 1
@@ -2460,6 +2246,15 @@ def _benchmark_backprop(
         _sync(device)
         dt = time.perf_counter() - t0
         epoch_times.append((dt, graphs_seen))
+        epoch_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(total_loss / max(1, loss_updates)),
+                "epoch_s": float(dt),
+                "graphs_seen": int(graphs_seen),
+                "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
+            }
+        )
 
     # eval accuracy
     model.eval()
@@ -2536,8 +2331,18 @@ def _benchmark_backprop(
             eval_losses.append(bce(logits, y).item())
             all_scores.extend(logits.detach().cpu().tolist())
             all_labels.extend(y.detach().cpu().tolist())
-            g_pos = goodness(h_pos, batch.batch, temperature=config["goodness_temp"])
-            g_neg = goodness(h_neg, batch.batch, temperature=config["goodness_temp"])
+            g_pos = goodness(
+                h_pos,
+                batch.batch,
+                temperature=config["goodness_temp"],
+                **goodness_kwargs,
+            )
+            g_neg = goodness(
+                h_neg,
+                batch.batch,
+                temperature=config["goodness_temp"],
+                **goodness_kwargs,
+            )
             gpos.append(g_pos.mean().item())
             gneg.append(g_neg.mean().item())
 
@@ -2574,6 +2379,7 @@ def _benchmark_backprop(
         "time_loss_terms_s": float(component_times["loss_terms"] / steps_denom),
         "time_optimizer_s": float(component_times["optimizer"] / steps_denom),
         "time_econ_eval_s": 0.0,
+        "time_to_target_metric": float("nan"),
         "eval_acc": correct / total if total else 0.0,
         "eval_bce": float(np.mean(eval_losses)) if eval_losses else 0.0,
         "eval_g_pos": float(np.mean(gpos)) if gpos else 0.0,
@@ -2586,6 +2392,9 @@ def _benchmark_backprop(
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
         "eval_objective": "bce",
+        "task_family": str(config.get("task_family", "custom")),
+        "signal_family": str(config.get("signal_family", "custom")),
+        "peak_cuda_mem_mb": _peak_cuda_memory_mb(device),
         "risk_head_enabled_effective": bool(risk_head is not None),
         "risk_loss_train": risk_loss_train,
         "portfolio_head_enabled_effective": bool(portfolio_head is not None),
@@ -2606,6 +2415,247 @@ def _benchmark_backprop(
     if econ:
         out.update(econ)
         out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
+    out["_epoch_history"] = epoch_history
+    _attach_primary_metrics(out)
+    return out
+
+
+def _benchmark_backprop_supervised_return(
+    graphs,
+    device,
+    config,
+    train_graphs=None,
+    eval_graphs=None,
+    eval_dates=None,
+):
+    if train_graphs is None or eval_graphs is None:
+        train_graphs, eval_graphs = _split_graphs(
+            graphs,
+            eval_frac=config["eval_frac"],
+            seed=config["seed"],
+            split_mode=config.get("split_mode", "chronological"),
+        )
+    else:
+        if not train_graphs or not eval_graphs:
+            raise ValueError("Explicit fold split must include non-empty train and eval graphs.")
+    portfolio_targets = config.get("portfolio_targets")
+    if not portfolio_targets:
+        raise ValueError("backprop_supervised_return requires portfolio_targets.")
+
+    loader_kwargs = {
+        "batch_size": config["batch_size"],
+        "shuffle": True,
+        "drop_last": False,
+        "num_workers": config["loader_workers"],
+        "pin_memory": bool(config.get("pin_memory", False)) if device.type == "cuda" else False,
+    }
+    if config["loader_workers"] > 0:
+        loader_kwargs["persistent_workers"] = bool(config.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+        mp_ctx = config.get("multiprocessing_context", "")
+        if mp_ctx:
+            loader_kwargs["multiprocessing_context"] = mp_ctx
+    loader = DataLoader(train_graphs, **loader_kwargs)
+    eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
+
+    model = GCNEncoder(
+        in_dim=graphs[0].x.shape[1],
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        dropout=config["dropout"],
+        conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(config.get("encoder_gat_heads", 2)),
+        rgcn_num_relations=max(2, int(config.get("encoder_rgcn_num_relations", 8))),
+        residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
+    ).to(device)
+    model = _maybe_compile_encoder(model, config, device, context="benchmark supervised return")
+    return_head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
+
+    risk_targets_by_horizon = config.get("risk_targets_by_horizon")
+    risk_horizons_effective = config.get("risk_horizons_effective", [])
+    risk_head = None
+    if bool(config.get("risk_head_enabled", False)) and risk_targets_by_horizon:
+        risk_head = torch.nn.Linear(config["hidden_dim"], len(risk_horizons_effective)).to(device)
+
+    optim_params = list(model.parameters()) + list(return_head.parameters())
+    if risk_head is not None:
+        optim_params.extend(list(risk_head.parameters()))
+    optim = _build_optimizer(
+        optim_params,
+        lr=config["lr"],
+        device=device,
+        use_fused=bool(config.get("backprop_fused_optimizer", True)),
+    )
+    bp_amp_dtype = _parse_amp_dtype(config.get("backprop_amp_dtype", "float16"))
+    bp_amp_enabled = bool(config.get("backprop_amp", False) and device.type == "cuda")
+    if bp_amp_enabled and bp_amp_dtype == torch.bfloat16:
+        bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+        if not bf16_ok:
+            bp_amp_dtype = torch.float16
+    bp_scaler = _make_scaler(bp_amp_enabled and bp_amp_dtype == torch.float16)
+
+    component_times = {
+        "neg_gen": 0.0,
+        "hallucinate": 0.0,
+        "forward_pos": 0.0,
+        "forward_neg": 0.0,
+        "loss_terms": 0.0,
+        "optimizer": 0.0,
+    }
+    _reset_peak_cuda_memory(device)
+    steps_total = 0
+    risk_loss_sum = 0.0
+    risk_batches = 0
+    epoch_times = []
+    epoch_history = []
+
+    for epoch in tqdm(
+        range(1, config["epochs"] + 1),
+        desc="Benchmark",
+        unit="epoch",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    ):
+        model.train()
+        return_head.train()
+        if risk_head is not None:
+            risk_head.train()
+        t0 = time.perf_counter()
+        graphs_seen = 0
+        total_loss = 0.0
+        loss_updates = 0
+        for batch in loader:
+            batch = batch.to(device)
+            edge_weight = getattr(batch, "edge_weight", None)
+            batch_t0 = time.perf_counter()
+            comp_before = component_times.copy()
+            with _autocast_if_needed(bp_amp_enabled, bp_amp_dtype):
+                t_fwd = time.perf_counter()
+                h = _forward_encoder(model, batch.x, batch.edge_index, edge_weight=edge_weight)
+                component_times["forward_pos"] += time.perf_counter() - t_fwd
+                z = global_mean_pool(h, batch.batch)
+                loss, pred, _ = _compute_supervised_return_loss(
+                    return_head=return_head,
+                    embeddings=z,
+                    graph_idx=batch.graph_idx,
+                    portfolio_targets=portfolio_targets,
+                    device=device,
+                    loss_type=str(config.get("supervised_return_loss_type", "huber")).strip().lower(),
+                )
+                if loss is None:
+                    continue
+                risk_loss_val = None
+                if risk_head is not None and risk_targets_by_horizon is not None:
+                    risk_loss_val = _compute_multi_horizon_risk_loss(
+                        risk_head=risk_head,
+                        embeddings=z,
+                        graph_idx=batch.graph_idx,
+                        risk_targets_by_horizon=risk_targets_by_horizon,
+                        device=device,
+                        risk_loss_type=str(config.get("risk_loss_type", "huber")).strip().lower(),
+                    )
+                    if risk_loss_val is not None:
+                        loss = loss + float(config.get("risk_loss_weight", 0.0)) * risk_loss_val
+            t_opt = time.perf_counter()
+            _optimizer_step(
+                optim=optim,
+                loss=loss,
+                grad_clip=float(config["grad_clip"]),
+                clip_params=optim_params,
+                scaler=bp_scaler,
+            )
+            component_times["optimizer"] += time.perf_counter() - t_opt
+            total_loss += float(loss.detach().item())
+            loss_updates += 1
+            if risk_loss_val is not None:
+                risk_loss_sum += float(risk_loss_val.detach())
+                risk_batches += 1
+            batch_elapsed = time.perf_counter() - batch_t0
+            known_elapsed = sum(
+                max(0.0, component_times[k] - comp_before.get(k, 0.0))
+                for k in ("neg_gen", "hallucinate", "forward_pos", "forward_neg", "loss_terms", "optimizer")
+            )
+            if batch_elapsed > known_elapsed:
+                component_times["loss_terms"] += (batch_elapsed - known_elapsed)
+            steps_total += 1
+            graphs_seen += batch.num_graphs
+        _sync(device)
+        dt = time.perf_counter() - t0
+        epoch_times.append((dt, graphs_seen))
+        epoch_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(total_loss / max(1, loss_updates)),
+                "epoch_s": float(dt),
+                "graphs_seen": int(graphs_seen),
+                "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
+            }
+        )
+
+    model.eval()
+    return_head.eval()
+    eval_pred = []
+    eval_target = []
+    econ_scores = []
+    for batch in eval_loader:
+        batch = batch.to(device)
+        edge_weight = getattr(batch, "edge_weight", None)
+        with torch.no_grad():
+            h = _forward_encoder(model, batch.x, batch.edge_index, edge_weight=edge_weight)
+            z = global_mean_pool(h, batch.batch)
+            pred = return_head(z).squeeze(-1)
+        econ_scores.extend(pred.detach().cpu().tolist())
+        target_t, mask_t = _graph_target_tensor(batch.graph_idx, portfolio_targets, device=device)
+        if target_t is not None and mask_t is not None and mask_t.any():
+            eval_pred.extend(pred[mask_t].detach().cpu().tolist())
+            eval_target.extend(target_t[mask_t].detach().cpu().tolist())
+
+    eval_metrics = _regression_eval_metrics(eval_pred, eval_target)
+    warm = int(config.get("timing_warmup_epochs", 0))
+    usable = epoch_times[warm:] if warm < len(epoch_times) else epoch_times
+    avg_time = float(np.mean([t for t, _ in usable]))
+    avg_gps = float(np.mean([g / t for t, g in usable]))
+    steps_denom = max(1, int(steps_total))
+    out = {
+        "avg_epoch_s": avg_time,
+        "graphs_per_s": avg_gps,
+        "time_neg_gen_s": 0.0,
+        "time_hallucinate_s": 0.0,
+        "time_forward_pos_s": float(component_times["forward_pos"] / steps_denom),
+        "time_forward_neg_s": 0.0,
+        "time_loss_terms_s": float(component_times["loss_terms"] / steps_denom),
+        "time_optimizer_s": float(component_times["optimizer"] / steps_denom),
+        "time_econ_eval_s": 0.0,
+        "time_to_target_metric": float("nan"),
+        "eval_objective": "supervised_return",
+        "eval_acc": float("nan"),
+        "task_family": str(config.get("task_family", "financial_value")),
+        "signal_family": str(config.get("signal_family", "return_forecast")),
+        "peak_cuda_mem_mb": _peak_cuda_memory_mb(device),
+        "risk_head_enabled_effective": bool(risk_head is not None),
+        "risk_loss_train": (risk_loss_sum / risk_batches) if risk_batches else 0.0,
+        "portfolio_head_enabled_effective": False,
+        "portfolio_loss_train": float("nan"),
+    }
+    out.update(eval_metrics)
+    econ = _compute_econ_metrics_for_eval(
+        model,
+        None,
+        eval_graphs,
+        eval_dates or [],
+        config,
+        score_values=econ_scores,
+    )
+    if econ:
+        out.update(econ)
+        out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
+    if risk_head is not None:
+        out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
+        out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
+    out["_epoch_history"] = epoch_history
     _attach_primary_metrics(out)
     return out
 
@@ -2615,8 +2665,11 @@ def main() -> int:
     parser.add_argument("--config", required=True, help="Path to TOML config")
     parser.add_argument(
         "--modes",
-        default="ff_layerwise,ff_e2e,backprop",
-        help="Comma-separated modes: ff_layerwise,ff_e2e,backprop",
+        default="ff_e2e_core,ff_financial,backprop_contrastive_core,backprop_supervised_return",
+        help=(
+            "Comma-separated modes: ff_layerwise,ff_e2e,ff_e2e_core,ff_financial,ff_fast,"
+            "ff_accurate,backprop_contrastive,backprop_contrastive_core,backprop_supervised_return"
+        ),
     )
     args = parser.parse_args()
 
@@ -2714,8 +2767,12 @@ def main() -> int:
         "neg_mix_ramp_epochs": int(train_cfg.get("neg_mix_ramp_epochs", 10)),
         "goodness_target": float(train_cfg.get("goodness_target", 1.0)),
         "goodness_temp": float(train_cfg.get("goodness_temp", 1.0)),
+        "goodness_norm": str(train_cfg.get("goodness_norm", "none")),
+        "goodness_reducer": str(train_cfg.get("goodness_reducer", "logsumexp")),
         "ff_margin": float(train_cfg.get("ff_margin", 0.0)),
         "ff_margin_weight": float(train_cfg.get("ff_margin_weight", 1.0)),
+        "ff_loss_type": str(train_cfg.get("ff_loss_type", train_cfg.get("ff_loss", "softplus_margin"))),
+        "ff_mode": str(train_cfg.get("ff_mode", "classic")),
         "self_contrastive_temp": float(train_cfg.get("self_contrastive_temp", 0.2)),
         "self_contrastive_view_mode": str(
             train_cfg.get("self_contrastive_view_mode", "shuffle+noise")
@@ -2864,6 +2921,12 @@ def main() -> int:
         "portfolio_standardize": bool(train_cfg.get("portfolio_standardize", True)),
         "portfolio_cache_dir": str(train_cfg.get("portfolio_cache_dir", "runs/cache")),
         "portfolio_max_abs_logret": float(train_cfg.get("portfolio_max_abs_logret", 0.5)),
+        "supervised_return_loss_type": str(
+            bench_cfg.get(
+                "supervised_return_loss_type",
+                train_cfg.get("supervised_return_loss_type", "huber"),
+            )
+        ),
         "timing_warmup_epochs": int(bench_cfg.get("timing_warmup_epochs", 1)),
         "baseline_ref_csv": str(bench_cfg.get("baseline_ref_csv", "")),
         "require_baseline_match": bool(bench_cfg.get("require_baseline_match", False)),
@@ -2913,7 +2976,12 @@ def main() -> int:
         "econ_regime_high_quantile": float(bench_cfg.get("econ_regime_high_quantile", 0.67)),
         "econ_loader_batch_size": int(bench_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
+        "task_family": "custom",
+        "signal_family": "custom",
     }
+    modes = [_canonical_mode_name(m.strip()) for m in args.modes.split(",") if m.strip()]
+    if not modes:
+        modes = ["ff_layerwise", "ff_e2e", "backprop_contrastive", "backprop_supervised_return"]
     config["econ_fwd_ret_1"] = None
     config["econ_ticker_effective"] = ""
     config["econ_ticker_source"] = ""
@@ -2995,7 +3063,12 @@ def main() -> int:
         float(config.get("ff_rank_aux_weight", 0.0)) > 0.0
         or float(config.get("ff_rank_corr_weight", 0.0)) > 0.0
     )
-    load_portfolio_targets = bool(config.get("portfolio_head_enabled", False)) or rank_needs_portfolio_targets
+    supervised_return_modes = {"backprop_supervised_return"}
+    load_portfolio_targets = (
+        bool(config.get("portfolio_head_enabled", False))
+        or rank_needs_portfolio_targets
+        or any(m in supervised_return_modes for m in modes)
+    )
     if load_portfolio_targets:
         if not graph_dates:
             config["portfolio_head_enabled"] = False
@@ -3040,9 +3113,9 @@ def main() -> int:
     if not isinstance(mode_overrides, dict):
         mode_overrides = {}
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     results = []
     fold_results = []
+    history_rows = []
     split_mode_cfg = str(config.get("split_mode", "chronological"))
     use_walk_forward = is_walk_forward_mode(split_mode_cfg)
     walk_forward = []
@@ -3086,7 +3159,7 @@ def main() -> int:
                 eval_graphs=ev_graphs,
                 eval_dates=ev_dates,
             )
-        if mode_name == "ff_e2e":
+        if mode_name in {"ff_e2e", "ff_e2e_core", "ff_financial", "ff_fast", "ff_accurate"}:
             return _benchmark_ff(
                 graphs,
                 device,
@@ -3096,7 +3169,7 @@ def main() -> int:
                 eval_graphs=ev_graphs,
                 eval_dates=ev_dates,
             )
-        if mode_name == "backprop":
+        if mode_name in {"backprop", "backprop_contrastive", "backprop_contrastive_core"}:
             return _benchmark_backprop(
                 graphs,
                 device,
@@ -3105,7 +3178,38 @@ def main() -> int:
                 eval_graphs=ev_graphs,
                 eval_dates=ev_dates,
             )
+        if mode_name == "backprop_supervised_return":
+            return _benchmark_backprop_supervised_return(
+                graphs,
+                device,
+                cfg_run,
+                train_graphs=tr_graphs,
+                eval_graphs=ev_graphs,
+                eval_dates=ev_dates,
+            )
         raise ValueError(f"Unknown mode: {mode_name}")
+
+    def _append_epoch_history(
+        rows,
+        *,
+        mode_name: str,
+        seed_run: int,
+        split_mode_effective: str,
+        fold: dict | None = None,
+    ) -> None:
+        for row in rows or []:
+            item = dict(row)
+            item["mode"] = mode_name
+            item["seed_run"] = int(seed_run)
+            item["row_type"] = "epoch"
+            item["split_mode_effective"] = str(split_mode_effective)
+            if fold is not None:
+                item["fold_id"] = int(fold.get("fold_id", -1))
+                item["fold_train_start_idx"] = int(fold.get("train_start", 0))
+                item["fold_train_end_idx"] = int(fold.get("train_end", 0)) - 1
+                item["fold_eval_start_idx"] = int(fold.get("eval_start", 0))
+                item["fold_eval_end_idx"] = int(fold.get("eval_end", 0)) - 1
+            history_rows.append(item)
 
     mode_success_map: dict[str, bool] = {m: False for m in modes}
     abort_after_write = False
@@ -3117,10 +3221,16 @@ def main() -> int:
     print(f"benchmark seeds: {benchmark_seeds}")
 
     for mode in modes:
+        mode = _canonical_mode_name(mode)
         cfg_mode_base = config.copy()
+        mode, cfg_mode_base = _apply_mode_profile(mode, cfg_mode_base)
         mode_override = mode_overrides.get(mode, {})
         if isinstance(mode_override, dict):
             cfg_mode_base.update(mode_override)
+        if str(cfg_mode_base.get("ff_mode", "classic")).strip().lower() == "self_contrastive":
+            cfg_mode_base["neg_mode"] = "self_contrastive"
+            if str(cfg_mode_base.get("eval_neg_mode", "auto")).strip().lower() in {"", "auto"}:
+                cfg_mode_base["eval_neg_mode"] = "self_contrastive"
         _warn_self_contrastive_eval_view(cfg_mode_base, mode)
         mode_seed_rows: list[dict] = []
 
@@ -3186,6 +3296,14 @@ def main() -> int:
                                 train_fold,
                                 eval_fold,
                                 eval_dates_fold,
+                            )
+                            epoch_history = fold_res.pop("_epoch_history", [])
+                            _append_epoch_history(
+                                epoch_history,
+                                mode_name=mode,
+                                seed_run=int(seed_run),
+                                split_mode_effective="walk_forward",
+                                fold=fold,
                             )
                             fold_res.update(fold_meta)
                             fold_res["status"] = "ok"
@@ -3272,6 +3390,13 @@ def main() -> int:
                             train_graphs_mode,
                             eval_graphs_mode,
                             eval_dates_mode,
+                        )
+                        epoch_history = mode_row.pop("_epoch_history", [])
+                        _append_epoch_history(
+                            epoch_history,
+                            mode_name=mode,
+                            seed_run=int(seed_run),
+                            split_mode_effective=split_mode_mode,
                         )
                         mode_row.update(base_ctx)
                         mode_row["mode"] = mode
@@ -3456,6 +3581,32 @@ def main() -> int:
             for r in fold_results:
                 w.writerow(r)
         print(f"Wrote {fold_out_path}")
+    history_out = str(bench_cfg.get("history_out_csv", "")).strip()
+    if history_rows or history_out:
+        history_out_path = (
+            Path(history_out)
+            if history_out
+            else out_path.with_name(f"{out_path.stem}_history.csv")
+        )
+        history_out_path.parent.mkdir(parents=True, exist_ok=True)
+        history_base_cols = {
+            "mode",
+            "row_type",
+            "split_mode_effective",
+            "seed_run",
+            "epoch",
+            "train_loss",
+            "epoch_s",
+            "graphs_seen",
+            "graphs_per_s_epoch",
+        }
+        history_keys = sorted(history_base_cols | {k for r in history_rows for k in r.keys()})
+        with history_out_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=history_keys)
+            w.writeheader()
+            for r in history_rows:
+                w.writerow(r)
+        print(f"Wrote {history_out_path}")
     for r in results:
         print(r)
 
@@ -3468,22 +3619,43 @@ def main() -> int:
             r
             for r in results
             if str(r.get("status", "ok")).strip().lower() == "ok"
+            and str(r.get("row_type", "")).strip().lower() != "seed"
             and isinstance(r.get("graphs_per_s"), (int, float, np.number))
             and np.isfinite(float(r.get("graphs_per_s")))
         ]
         if not plot_rows:
             raise RuntimeError("no successful benchmark rows available for plotting")
-        xs = [float(r.get("graphs_per_s")) for r in plot_rows]
-        ys = [float(r.get("eval_sep", 0.0) or 0.0) for r in plot_rows]
-        labels = [str(r.get("mode", "")) for r in plot_rows]
 
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.scatter(xs, ys, color="#4C78A8")
-        for x, y, label in zip(xs, ys, labels):
-            ax.annotate(label, (x, y), textcoords="offset points", xytext=(6, 4))
-        ax.set_xlabel("graphs/sec")
-        ax.set_ylabel("eval_gap (objective-dependent)")
-        ax.set_title("Speed vs Separation")
+        families = []
+        seen_families = set()
+        for row in plot_rows:
+            family = str(row.get("task_family", "custom")).strip() or "custom"
+            if family not in seen_families:
+                seen_families.add(family)
+                families.append(family)
+
+        fig, axes = plt.subplots(len(families), 1, figsize=(7, 4 * max(1, len(families))))
+        if len(families) == 1:
+            axes = [axes]
+        for ax, family in zip(axes, families):
+            family_rows = [r for r in plot_rows if str(r.get("task_family", "custom")).strip() == family]
+            xs = [float(r.get("graphs_per_s")) for r in family_rows]
+            ys = [float(r.get("primary_eval_metric", float("nan"))) for r in family_rows]
+            labels = [str(r.get("mode", "")) for r in family_rows]
+            metric_names = sorted(
+                {
+                    str(r.get("primary_eval_metric_name", "")).strip()
+                    for r in family_rows
+                    if str(r.get("primary_eval_metric_name", "")).strip()
+                }
+            )
+            ax.scatter(xs, ys, color="#4C78A8")
+            for x, y, label in zip(xs, ys, labels):
+                ax.annotate(label, (x, y), textcoords="offset points", xytext=(6, 4))
+            ax.set_xlabel("graphs/sec")
+            ax.set_ylabel("primary metric")
+            title_suffix = ", ".join(metric_names) if metric_names else "primary metric"
+            ax.set_title(f"{family}: speed vs {title_suffix}")
         fig.tight_layout()
         plot_path = Path(plot_path)
         plot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3491,27 +3663,20 @@ def main() -> int:
         plt.close(fig)
         print(f"Wrote {plot_path}")
 
-        # Bar chart summary (avg_epoch_s + objective-aware quality)
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        modes = [str(r.get("mode", "")) for r in plot_rows]
-        avg_epoch_s = [float(r.get("avg_epoch_s", float("nan"))) for r in plot_rows]
-        quality = []
-        for r in plot_rows:
-            if str(r.get("eval_objective", "")).strip().lower() == "self_contrastive":
-                quality.append(r.get("eval_sc_gap", r.get("eval_sep", 0.0)))
-            else:
-                quality.append(r.get("eval_sep", 0.0))
-
-        ax = axes[0]
-        ax.bar(modes, avg_epoch_s, color=["#4C78A8", "#72B7B2", "#F58518"])
-        ax.set_title("Avg Epoch Time (s)")
-        ax.set_ylabel("seconds")
-
-        ax = axes[1]
-        ax.bar(modes, quality, color=["#4C78A8", "#72B7B2", "#F58518"])
-        ax.set_title("Eval Separation / SC Gap")
-        ax.set_ylabel("quality")
-
+        fig, axes = plt.subplots(len(families), 2, figsize=(12, 4 * max(1, len(families))))
+        if len(families) == 1:
+            axes = np.asarray([axes], dtype=object)
+        for row_axes, family in zip(axes, families):
+            family_rows = [r for r in plot_rows if str(r.get("task_family", "custom")).strip() == family]
+            modes_family = [str(r.get("mode", "")) for r in family_rows]
+            epoch_s_family = [float(r.get("avg_epoch_s", float("nan"))) for r in family_rows]
+            quality_family = [float(r.get("primary_eval_metric", float("nan"))) for r in family_rows]
+            row_axes[0].bar(modes_family, epoch_s_family, color="#4C78A8")
+            row_axes[0].set_title(f"{family}: avg epoch time")
+            row_axes[0].set_ylabel("seconds")
+            row_axes[1].bar(modes_family, quality_family, color="#72B7B2")
+            row_axes[1].set_title(f"{family}: primary metric")
+            row_axes[1].set_ylabel("value")
         fig.tight_layout()
         bar_plot_path = Path(bar_plot_path)
         bar_plot_path.parent.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,19 @@
 
 This repo starts with a data conversion pipeline from QuantConnect Research exports into tidy CSVs that are easy to feed into PyTorch/PyG.
 
+## Repo Architecture
+- `src/frisk/` is the system of record for reusable ML, benchmarking, reporting, and notebook runtime code.
+- `scripts/` contains CLI entrypoints and workflow orchestration only. Large scripts should compose `src/frisk` helpers rather than define separate copies of training or benchmark logic.
+- `notebooks/` are thin viewers and runbooks. Keep business logic in `src/frisk` or `scripts/`, not in notebook cells.
+- `reports/published/` is curated output only. Ad hoc experiment output belongs under `runs/experiments/<run_id>/`.
+- `src/forward_risk_manager.egg-info/` is generated build metadata and should not be treated as source.
+
+Allowed dependency direction:
+- `src/frisk/*` may depend on other `src/frisk/*` modules.
+- `scripts/*` may depend on `src/frisk/*`.
+- `notebooks/*` may depend on `src/frisk.notebook_runtime` and stable scripts, but not own the primary implementation.
+- Published reports should be copied from `runs/experiments/<run_id>/` via explicit publish steps.
+
 ## Data You Should Export
 From QuantConnect Research, export daily history for:
 - Prices for your symbol universe (include any benchmark ticker you plan to use for evaluation/risk targets).
@@ -21,6 +34,7 @@ The converter writes:
 - Global report index: `reports/index.csv`.
 
 Keep raw/intermediate outputs out of `reports/` root.
+Keep notebook outputs, scratch CSVs, and generated build metadata out of normal source changes.
 
 One-time legacy consolidation:
 ```bash
@@ -31,6 +45,14 @@ Publish curated artifacts from a run:
 ```bash
 python scripts/publish_run.py --run-id <run_id>
 ```
+
+## Public Entrypoints
+- `scripts/build_graphs.py`: build the graph artifact from processed market data into `data/processed/graphs.pt` or sharded graph outputs.
+- `scripts/train_ff_gnn.py`: train the main FF or BP model variants and write per-run artifacts under `runs/experiments/<run_id>/`.
+- `scripts/benchmark_training.py`: run the canonical FF vs BP benchmark and write benchmark rows, fold rows, and optional history rows.
+- `scripts/ff_sweep.py`: run parameter sweeps against the shared benchmark/training stack and write sweep metrics under a run directory.
+- `scripts/publish_run.py`: copy curated artifacts from a run into `reports/published/` and refresh `reports/index.csv`.
+- `scripts/notebook_hygiene.py`: strip notebook outputs and fail CI/local checks when notebooks contain outputs or syntax errors.
 
 ## Current Results Snapshot (as of 2026-02-25)
 Latest notebook run IDs:

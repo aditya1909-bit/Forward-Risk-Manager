@@ -3,19 +3,17 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 from pathlib import Path
 from typing import Iterable
+import sys
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "src"))
 
-def _to_float(value):
-    try:
-        out = float(value)
-    except Exception:
-        return None
-    if math.isnan(out) or math.isinf(out):
-        return None
-    return out
+from frisk.reporting.metrics import (
+    primary_metric_from_row as _primary_metric,
+    to_finite_float as _to_float,
+)
 
 
 def _load_rows(path: Path):
@@ -27,49 +25,6 @@ def _load_rows(path: Path):
         for row in reader:
             rows.append(dict(row))
     return rows
-
-
-def _primary_metric(row):
-    robust = _to_float(row.get("primary_eval_metric_robust"))
-    if robust is not None:
-        robust_name = str(row.get("primary_eval_metric_robust_name", "")).strip()
-        return robust_name or "primary_eval_metric_robust", robust
-
-    objective = str(row.get("eval_objective", "")).strip().lower()
-    if objective == "self_contrastive":
-        sc_gap = _to_float(row.get("eval_sc_gap"))
-        if sc_gap is not None:
-            return "eval_sc_gap", sc_gap
-
-    if objective in {"bce", "backprop"}:
-        auroc = _to_float(row.get("eval_auroc"))
-        if auroc is not None:
-            return "eval_auroc", auroc
-        auprc = _to_float(row.get("eval_auprc"))
-        if auprc is not None:
-            return "eval_auprc", auprc
-
-    sep = _to_float(row.get("eval_sep"))
-    if sep is not None:
-        return "eval_sep", sep
-
-    auroc = _to_float(row.get("eval_auroc"))
-    if auroc is not None:
-        return "eval_auroc", auroc
-
-    auprc = _to_float(row.get("eval_auprc"))
-    if auprc is not None:
-        return "eval_auprc", auprc
-
-    sc_gap = _to_float(row.get("eval_sc_gap"))
-    if sc_gap is not None:
-        return "eval_sc_gap", sc_gap
-
-    acc = _to_float(row.get("eval_acc"))
-    if acc is not None:
-        return "eval_acc", acc
-
-    return "none", float("-inf")
 
 
 def _minmax_norm(value, lo, hi):
@@ -377,7 +332,15 @@ def main() -> int:
     if not benchmark_rows:
         raise ValueError("No rows found in benchmark CSV.")
 
-    backprop = next((r for r in benchmark_rows if str(r.get("mode", "")).strip() == "backprop"), None)
+    backprop = next(
+        (
+            r
+            for r in benchmark_rows
+            if str(r.get("mode", "")).strip()
+            in {"backprop_supervised_return", "backprop_contrastive", "backprop"}
+        ),
+        None,
+    )
 
     e2e_source_rows = sweep_e2e_rows if sweep_e2e_rows else sweep_rows
     e2e_candidates = _track_rows(e2e_source_rows, benchmark_rows, mode="ff_e2e")

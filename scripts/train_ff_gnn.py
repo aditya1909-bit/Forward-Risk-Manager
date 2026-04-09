@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 from pathlib import Path
 import random
@@ -15,7 +14,6 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_mean_pool
 from tqdm import tqdm
@@ -24,11 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import (
-    CompositeEnergyCritic,
-    EnergyCritic,
-    EnergyCriticEnsemble,
     GCNEncoder,
-    SequenceEnergyCritic,
 )
 from frisk.ff import (
     ff_loss,
@@ -46,6 +40,21 @@ from frisk.econ_eval import resolve_price_ticker
 from frisk.targets import (
     compute_forward_return_targets_cached,
     compute_risk_targets_cached,
+)
+from frisk.training.critics import build_critic as _build_critic
+from frisk.training.objectives import (
+    compute_multi_horizon_risk_loss as _compute_multi_horizon_risk_loss,
+    compute_portfolio_head_loss as _compute_portfolio_head_loss,
+)
+from frisk.training.runtime import (
+    autocast_if_needed as _autocast_if_needed,
+    build_optimizer as _build_optimizer,
+    configure_cuda_runtime as _configure_cuda_runtime,
+    forward_encoder as _forward_encoder,
+    make_scaler as _make_scaler,
+    optimizer_step as _optimizer_step,
+    parse_amp_dtype as _parse_amp_dtype,
+    state_dict_for_save as _state_dict_for_save,
 )
 
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
@@ -144,13 +153,6 @@ def _to_bool(value) -> bool:
     return bool(value)
 
 
-def _parse_amp_dtype(value) -> torch.dtype:
-    name = str(value).strip().lower()
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float16
-
-
 def _autotune_cache_key(parts: dict) -> str:
     raw = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -190,92 +192,6 @@ def _save_autotune_cache(path: str | None, cache: dict[str, int]) -> None:
         cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
     except Exception:
         return
-
-
-def _build_optimizer(params, lr: float, device: torch.device, use_fused: bool):
-    params = tuple(params)
-    if not params:
-        raise ValueError("optimizer got an empty parameter list")
-    kwargs = {}
-    if device.type == "cuda":
-        kwargs["foreach"] = True
-        if use_fused:
-            kwargs["fused"] = True
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("fused", None)
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("foreach", None)
-        return Adam(params, lr=lr, **kwargs)
-
-
-def _make_scaler(enabled: bool):
-    if not enabled:
-        return None
-    try:
-        return torch.amp.GradScaler("cuda", enabled=True)
-    except Exception:
-        return torch.cuda.amp.GradScaler(enabled=True)
-
-
-def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
-    if not enabled:
-        return contextlib.nullcontext()
-    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
-
-
-def _configure_cuda_runtime(device: torch.device) -> None:
-    if device.type != "cuda":
-        return
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    except Exception:
-        pass
-
-
-def _state_dict_for_save(module: torch.nn.Module):
-    inner = getattr(module, "_orig_mod", module)
-    return inner.state_dict()
-
-
-def _forward_encoder(model, *args, **kwargs):
-    compiler_ns = getattr(torch, "compiler", None)
-    mark_step = (
-        getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
-    )
-    if callable(mark_step):
-        mark_step()
-    return model(*args, **kwargs)
-
-
-def _optimizer_step(
-    optim: torch.optim.Optimizer,
-    loss: torch.Tensor,
-    grad_clip: float,
-    clip_params,
-    scaler,
-) -> None:
-    optim.zero_grad(set_to_none=True)
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        if grad_clip and grad_clip > 0:
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-        scaler.step(optim)
-        scaler.update()
-        return
-    loss.backward()
-    if grad_clip and grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-    optim.step()
 
 
 def _parse_positive_int_list(value, fallback: int) -> list[int]:
@@ -570,18 +486,6 @@ def _batch_regime_loss_weights(
     return weight / weight.mean().clamp_min(torch.finfo(weight.dtype).eps)
 
 
-def _weighted_mean_loss(loss: torch.Tensor, sample_weight: torch.Tensor | None) -> torch.Tensor:
-    if sample_weight is None:
-        return loss.mean()
-    weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
-    val = loss.reshape(-1)
-    if weight.numel() != val.numel():
-        raise ValueError(
-            f"sample_weight shape mismatch: expected {val.numel()} values, got {weight.numel()}"
-        )
-    return (val * weight).sum() / weight.sum().clamp_min(1e-12)
-
-
 def _epoch_graph_subset(
     graphs,
     epoch: int,
@@ -815,122 +719,6 @@ def _compute_forward_return_targets(
     )
 
 
-def _compute_portfolio_head_loss(
-    portfolio_head: torch.nn.Module,
-    embeddings: torch.Tensor,
-    graph_idx,
-    portfolio_targets: list[float | None],
-    device: torch.device,
-    loss_type: str,
-    sample_weight: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    if not portfolio_targets:
-        return None
-    if torch.is_tensor(graph_idx):
-        idx_list = graph_idx.detach().cpu().tolist()
-    elif isinstance(graph_idx, (list, tuple)):
-        idx_list = list(graph_idx)
-    else:
-        idx_list = [int(graph_idx)]
-    target_vals = []
-    for gi in idx_list:
-        if 0 <= gi < len(portfolio_targets):
-            tv = portfolio_targets[gi]
-        else:
-            tv = None
-        target_vals.append(float(tv) if tv is not None else float("nan"))
-    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
-    mask = torch.isfinite(target)
-    if not mask.any():
-        return None
-
-    pred_raw = portfolio_head(embeddings)
-    if pred_raw.ndim == 2 and pred_raw.size(1) == 1:
-        pred_raw = pred_raw.squeeze(1)
-    if pred_raw.ndim != 1:
-        raise RuntimeError(f"portfolio head output shape mismatch: {tuple(pred_raw.shape)}")
-    pred = torch.tanh(pred_raw)
-    weight = None
-    if sample_weight is not None:
-        weight = sample_weight.to(device=device, dtype=pred.dtype).reshape(-1)
-
-    loss_mode = str(loss_type).strip().lower()
-    if loss_mode == "mse":
-        err = (pred[mask] - target[mask]).pow(2)
-        if weight is None:
-            return err.mean()
-        return _weighted_mean_loss(err, weight[mask])
-
-    pnl = pred[mask] * target[mask]
-    if pnl.numel() == 0:
-        return None
-    if pnl.numel() == 1:
-        return -pnl.mean()
-    if weight is None:
-        mean = pnl.mean()
-        std = pnl.std(unbiased=False) + 1e-6
-    else:
-        w = weight[mask]
-        w = w / w.sum().clamp_min(1e-12)
-        mean = (pnl * w).sum()
-        std = torch.sqrt(((pnl - mean).pow(2) * w).sum() + 1e-6)
-    return -(mean / std)
-
-
-def _compute_multi_horizon_risk_loss(
-    risk_head: torch.nn.Module,
-    embeddings: torch.Tensor,
-    graph_idx,
-    risk_targets_by_horizon: list[list[float | None]],
-    device: torch.device,
-    risk_loss_type: str,
-    sample_weight: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    if not risk_targets_by_horizon:
-        return None
-
-    if torch.is_tensor(graph_idx):
-        idx_list = graph_idx.detach().cpu().tolist()
-    elif isinstance(graph_idx, (list, tuple)):
-        idx_list = list(graph_idx)
-    else:
-        idx_list = [int(graph_idx)]
-
-    target_rows = []
-    for gi in idx_list:
-        row = []
-        for horizon_targets in risk_targets_by_horizon:
-            if 0 <= gi < len(horizon_targets):
-                t = horizon_targets[gi]
-            else:
-                t = None
-            row.append(float(t) if t is not None else float("nan"))
-        target_rows.append(row)
-
-    target = torch.tensor(target_rows, dtype=torch.float32, device=device)
-    mask = torch.isfinite(target)
-    if not mask.any():
-        return None
-
-    pred = risk_head(embeddings)
-    if pred.ndim == 1:
-        pred = pred.unsqueeze(-1)
-    if pred.shape != target.shape:
-        raise RuntimeError(
-            f"risk head output shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}"
-        )
-    row_weight = None
-    if sample_weight is not None:
-        row_weight = sample_weight.to(device=device, dtype=pred.dtype).reshape(-1, 1).expand_as(pred)
-    if risk_loss_type == "mse":
-        err = (pred - target).pow(2)
-    else:
-        err = F.smooth_l1_loss(pred, target, reduction="none")
-    if row_weight is None:
-        return err[mask].mean()
-    return _weighted_mean_loss(err[mask], row_weight[mask])
-
-
 def _self_contrastive_batch_loss(
     h_pos: torch.Tensor,
     h_view: torch.Tensor,
@@ -1093,69 +881,6 @@ def _make_negatives(
         factor_start_idx=factor_start_idx,
         factor_dim=factor_dim,
     )
-
-
-def _build_critic(config: dict, hidden_dim: int, device: torch.device):
-    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
-    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
-    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
-    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
-    if critic_positive not in {"softplus", "square"}:
-        critic_positive = "softplus"
-
-    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
-    seed_base = int(config.get("seed", 7))
-    seed_stride = max(1, int(config.get("critic_ensemble_seed_stride", 1009)))
-    critics = []
-    for i in range(ensemble_size):
-        if ensemble_size > 1:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(seed_base + i * seed_stride)
-                member = EnergyCritic(
-                    in_dim=hidden_dim,
-                    hidden_dim=critic_hidden_dim,
-                    num_layers=critic_num_layers,
-                    dropout=critic_dropout,
-                    positive_activation=critic_positive,
-                )
-        else:
-            member = EnergyCritic(
-                in_dim=hidden_dim,
-                hidden_dim=critic_hidden_dim,
-                num_layers=critic_num_layers,
-                dropout=critic_dropout,
-                positive_activation=critic_positive,
-            )
-        critics.append(member.to(device))
-
-    if len(critics) == 1:
-        base_critic = critics[0]
-    else:
-        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
-
-    seq_enabled = bool(config.get("sequence_critic_enabled", False))
-    if not seq_enabled:
-        return base_critic
-
-    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
-    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
-    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
-    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
-    if seq_positive not in {"softplus", "square"}:
-        seq_positive = "softplus"
-    seq_weight = float(config.get("sequence_critic_weight", 0.0))
-    seq_critic = SequenceEnergyCritic(
-        in_dim=hidden_dim,
-        hidden_dim=seq_hidden,
-        num_layers=seq_layers,
-        dropout=seq_dropout,
-        positive_activation=seq_positive,
-    ).to(device)
-    return CompositeEnergyCritic(
-        base_critic=base_critic,
-        sequence_critic=seq_critic,
-        sequence_weight=seq_weight,
-    ).to(device)
 
 
 def _make_self_contrastive_view(
