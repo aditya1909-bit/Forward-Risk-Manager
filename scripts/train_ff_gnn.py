@@ -37,6 +37,16 @@ from frisk.hallucinate import HallucinationConfig, hallucinate_negative
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
 from frisk.graph_artifact import GraphIndexSequence, load_graph_artifact
 from frisk.econ_eval import resolve_price_ticker
+from frisk.resume import (
+    capture_rng_state,
+    load_module_state_for_resume,
+    load_resume_payload,
+    module_state_for_resume,
+    move_optimizer_state_to_device,
+    restore_rng_state,
+    resume_fingerprint,
+    save_resume_payload,
+)
 from frisk.targets import (
     compute_forward_return_targets_cached,
     compute_risk_targets_cached,
@@ -118,6 +128,17 @@ def _load_state_dict_compat(path: str):
             out[kk] = v
         return out
     return state
+
+
+def _default_resume_state_path(*candidates) -> str:
+    for candidate in candidates:
+        raw = str(candidate).strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        parent = path if not path.suffix else path.parent
+        return str(parent / "train_resume.pt")
+    return "runs/checkpoints/train_resume.pt"
 
 
 def _is_oom(exc: Exception) -> bool:
@@ -1355,6 +1376,10 @@ def main() -> int:
     parser.add_argument("--critic-checkpoint-in", default=argparse.SUPPRESS)
     parser.add_argument("--save-encoder", default=argparse.SUPPRESS)
     parser.add_argument("--save-critic", default=argparse.SUPPRESS)
+    parser.add_argument("--resume-enabled", dest="resume_enabled", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-resume", dest="resume_enabled", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument("--resume-state-path", default=argparse.SUPPRESS)
+    parser.add_argument("--resume-save-every-epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-hidden-dim", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-num-layers", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-dropout", type=float, default=argparse.SUPPRESS)
@@ -1431,6 +1456,9 @@ def main() -> int:
     save_model = _get_setting(args, section, "save_model", "")
     save_encoder = _get_setting(args, section, "save_encoder", save_model)
     save_critic = _get_setting(args, section, "save_critic", "")
+    resume_enabled = _to_bool(_get_setting(args, section, "resume_enabled", True))
+    resume_state_path = _get_setting(args, section, "resume_state_path", "")
+    resume_save_every_epochs = max(1, int(_get_setting(args, section, "resume_save_every_epochs", 1)))
     encoder_checkpoint_in = _get_setting(args, section, "encoder_checkpoint_in", "")
     critic_checkpoint_in = _get_setting(args, section, "critic_checkpoint_in", "")
     strict_component_split = _to_bool(
@@ -1809,6 +1837,14 @@ def main() -> int:
     )
     if epoch_graph_mode not in {"rotate", "random", "recent_bias"}:
         epoch_graph_mode = "rotate"
+    if not str(resume_state_path).strip():
+        resume_state_path = _default_resume_state_path(
+            save_encoder,
+            save_model,
+            save_critic,
+            log_csv,
+            plot_path,
+        )
 
     if strict_component_split and neg_mode == "self_contrastive":
         if "time_flip" in self_contrastive_view_mode:
@@ -2607,25 +2643,156 @@ def main() -> int:
         raise ValueError("No trainable parameters. Check freeze_encoder/freeze_critic settings.")
     optim = _build_optimizer(optim_params, lr=lr, device=device, use_fused=fused_optimizer)
 
+    resume_state_path = str(Path(str(resume_state_path)).expanduser()) if resume_enabled else ""
+    resume_sig = {
+        "script": "train_ff_gnn",
+        "graphs_path": str(graphs_path),
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+        "graph_stride": int(graph_stride),
+        "graph_limit": int(graph_limit),
+        "graph_limit_keep_recent": bool(graph_limit_keep_recent),
+        "epoch_graph_fraction": float(epoch_graph_fraction),
+        "epoch_graph_min": int(epoch_graph_min),
+        "epoch_graph_mode": str(epoch_graph_mode),
+        "seed": int(seed),
+        "hidden_dim": int(hidden_dim),
+        "num_layers": int(num_layers),
+        "dropout": float(dropout),
+        "lr": float(lr),
+        "neg_mode": str(neg_mode),
+        "ff_layerwise": bool(ff_layerwise),
+        "ff_blockwise": bool(ff_blockwise),
+        "ff_block_size": int(ff_block_size),
+        "ff_multiscale": bool(ff_multiscale),
+        "risk_head_enabled": bool(risk_head is not None),
+        "portfolio_head_enabled": bool(portfolio_head is not None),
+        "encoder_checkpoint_in": str(encoder_checkpoint_in),
+        "critic_checkpoint_in": str(critic_checkpoint_in),
+    }
+    resume_key = resume_fingerprint(resume_sig)
+    resume_payload = (
+        load_resume_payload(resume_state_path, expected_fingerprint=resume_key)
+        if resume_enabled and resume_state_path
+        else None
+    )
+    start_epoch = 1
+    if resume_enabled and resume_state_path:
+        print(f"resume_state_path: {resume_state_path}")
+
+    def _resume_metadata(epoch_completed: int) -> dict:
+        return {
+            "epoch_completed": int(epoch_completed),
+            "goodness_target": float(goodness_target),
+            "neg_mix_end": float(neg_mix_end),
+            "neg_gate_margin": float(neg_gate_margin),
+            "hall_steps": int(hall_steps),
+            "hall_lr": float(hall_lr),
+            "hall_l2": float(hall_l2),
+            "hall_mean": float(hall_mean),
+            "hall_std": float(hall_std),
+            "hall_corr": float(hall_corr),
+            "hall_node_fraction": float(hall_node_fraction),
+            "hall_node_min": int(hall_node_min),
+            "hall_min_delta": float(hall_min_delta),
+            "ff_dual_neg_every_n_batches": int(ff_dual_neg_every_n_batches),
+        }
+
+    def _save_train_resume(status: str, epoch_completed: int) -> None:
+        if not resume_enabled or not resume_state_path:
+            return
+        model_states = {
+            "model": module_state_for_resume(model),
+            "critic": module_state_for_resume(critic),
+        }
+        if risk_head is not None:
+            model_states["risk_head"] = module_state_for_resume(risk_head)
+        if portfolio_head is not None:
+            model_states["portfolio_head"] = module_state_for_resume(portfolio_head)
+        save_resume_payload(
+            resume_state_path,
+            fingerprint=resume_key,
+            status=status,
+            epoch_completed=int(epoch_completed),
+            model_states=model_states,
+            optimizer_state=optim.state_dict(),
+            scaler_state=scaler.state_dict() if scaler is not None else None,
+            metadata=_resume_metadata(epoch_completed),
+            rng_state=capture_rng_state(),
+        )
+
+    if resume_payload:
+        model_states = resume_payload.get("model_states", {})
+        if isinstance(model_states, dict):
+            if "model" in model_states:
+                load_module_state_for_resume(model, model_states["model"])
+            if "critic" in model_states:
+                try:
+                    load_module_state_for_resume(critic, model_states["critic"], strict=True)
+                except Exception:
+                    load_module_state_for_resume(critic, model_states["critic"], strict=False)
+            if risk_head is not None and "risk_head" in model_states:
+                load_module_state_for_resume(risk_head, model_states["risk_head"], strict=False)
+            if portfolio_head is not None and "portfolio_head" in model_states:
+                load_module_state_for_resume(portfolio_head, model_states["portfolio_head"], strict=False)
+        optim_state = resume_payload.get("optimizer_state")
+        if isinstance(optim_state, dict):
+            optim.load_state_dict(optim_state)
+            move_optimizer_state_to_device(optim, device)
+        scaler_state = resume_payload.get("scaler_state")
+        if scaler is not None and isinstance(scaler_state, dict):
+            scaler.load_state_dict(scaler_state)
+        resume_meta = resume_payload.get("metadata", {}) if isinstance(resume_payload.get("metadata"), dict) else {}
+        goodness_target = float(resume_meta.get("goodness_target", goodness_target))
+        neg_mix_end = float(resume_meta.get("neg_mix_end", neg_mix_end))
+        neg_gate_margin = float(resume_meta.get("neg_gate_margin", neg_gate_margin))
+        hall_steps = int(resume_meta.get("hall_steps", hall_steps))
+        hall_lr = float(resume_meta.get("hall_lr", hall_lr))
+        hall_l2 = float(resume_meta.get("hall_l2", hall_l2))
+        hall_mean = float(resume_meta.get("hall_mean", hall_mean))
+        hall_std = float(resume_meta.get("hall_std", hall_std))
+        hall_corr = float(resume_meta.get("hall_corr", hall_corr))
+        hall_node_fraction = float(resume_meta.get("hall_node_fraction", hall_node_fraction))
+        hall_node_min = int(resume_meta.get("hall_node_min", hall_node_min))
+        hall_min_delta = float(resume_meta.get("hall_min_delta", hall_min_delta))
+        ff_dual_neg_every_n_batches = int(
+            resume_meta.get("ff_dual_neg_every_n_batches", ff_dual_neg_every_n_batches)
+        )
+        _sync_hall_curriculum_end()
+        restore_rng_state(resume_payload.get("rng_state"))
+        saved_epoch = max(0, int(resume_payload.get("epoch_completed", 0)))
+        resume_status = str(resume_payload.get("status", "in_progress")).strip().lower()
+        start_epoch = saved_epoch + 1
+        if resume_status == "completed":
+            start_epoch = int(epochs) + 1
+        print(
+            f"resume: status={resume_status} epoch_completed={saved_epoch} "
+            f"next_epoch={min(start_epoch, int(epochs) + 1)}"
+        )
+
     if log_csv:
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w") as f:
-            f.write(
-                "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
-                "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
-                "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
-                "hall_node_fraction_used,rank_aux_loss,"
-                "rank_corr_loss,"
-                "dual_neg_every_n_batches_used,dual_neg_ratio,regime_weight_mean,"
-                "time_neg_gen_share,time_hallucinate_share,time_forward_pos_share,time_forward_neg_share,"
-                "time_loss_terms_share,time_optimizer_share,"
-                "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
-                "time_loss_terms_s,time_optimizer_s\n"
-            )
+        should_init_log = True
+        if resume_payload is not None and log_path.exists() and int(resume_payload.get("epoch_completed", 0)) > 0:
+            should_init_log = False
+        if should_init_log:
+            with log_path.open("w") as f:
+                f.write(
+                    "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
+                    "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
+                    "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
+                    "hall_node_fraction_used,rank_aux_loss,"
+                    "rank_corr_loss,"
+                    "dual_neg_every_n_batches_used,dual_neg_ratio,regime_weight_mean,"
+                    "time_neg_gen_share,time_hallucinate_share,time_forward_pos_share,time_forward_neg_share,"
+                    "time_loss_terms_share,time_optimizer_share,"
+                    "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
+                    "time_loss_terms_s,time_optimizer_s\n"
+                )
 
     epoch_iter = tqdm(
-        range(1, epochs + 1),
+        range(start_epoch, epochs + 1),
         desc="Training",
         unit="epoch",
         dynamic_ncols=True,
@@ -4092,6 +4259,11 @@ def main() -> int:
                     f"{time_neg_gen_epoch:.6f},{time_hall_epoch:.6f},{time_fwd_pos_epoch:.6f},{time_fwd_neg_epoch:.6f},"
                     f"{time_loss_epoch:.6f},{time_opt_epoch:.6f}\n"
                 )
+
+        if epoch % resume_save_every_epochs == 0 or epoch == epochs:
+            _save_train_resume("in_progress", epoch)
+
+    _save_train_resume("completed", epochs)
 
     if save_encoder:
         save_path = Path(str(save_encoder))

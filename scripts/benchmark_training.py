@@ -74,6 +74,16 @@ from frisk.training.objectives import (
     graph_target_tensor as _graph_target_tensor,
     regression_eval_metrics as _regression_eval_metrics,
 )
+from frisk.resume import (
+    capture_rng_state,
+    load_module_state_for_resume,
+    load_resume_payload,
+    module_state_for_resume,
+    move_optimizer_state_to_device,
+    restore_rng_state,
+    resume_fingerprint,
+    save_resume_payload,
+)
 from frisk.training.runtime import (
     autocast_if_needed as _autocast_if_needed,
     build_optimizer as _build_optimizer,
@@ -104,6 +114,140 @@ _NEG_AUG_MODES = {
 }
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+
+
+def _slug_token(value) -> str:
+    return "".join(ch if str(ch).isalnum() or ch in "._-" else "_" for ch in str(value).strip()) or "value"
+
+
+def _default_benchmark_resume_dir(out_csv: str | Path) -> Path:
+    out_path = Path(str(out_csv))
+    return out_path.parent / "resume"
+
+
+def _benchmark_resume_path(
+    *,
+    resume_dir: str | Path,
+    mode_name: str,
+    seed_run: int,
+    split_mode_effective: str,
+    fold_id: int | None,
+    attempt_tag: str,
+) -> Path:
+    parts = [
+        _slug_token(mode_name),
+        f"seed_{int(seed_run)}",
+        _slug_token(split_mode_effective),
+        _slug_token(attempt_tag),
+    ]
+    if fold_id is not None:
+        parts.append(f"fold_{int(fold_id)}")
+    return Path(resume_dir) / ("__".join(parts) + ".pt")
+
+
+def _benchmark_resume_signature(
+    cfg_attempt: dict,
+    *,
+    mode_name: str,
+    seed_run: int,
+    split_mode_effective: str,
+    fold_id: int | None,
+    attempt_tag: str,
+    train_len: int,
+    eval_len: int,
+) -> str:
+    payload = {
+        "script": "benchmark_training",
+        "mode_name": str(mode_name),
+        "seed_run": int(seed_run),
+        "split_mode_effective": str(split_mode_effective),
+        "fold_id": int(fold_id) if fold_id is not None else None,
+        "attempt_tag": str(attempt_tag),
+        "train_len": int(train_len),
+        "eval_len": int(eval_len),
+        "epochs": int(cfg_attempt.get("epochs", 0)),
+        "batch_size": int(cfg_attempt.get("batch_size", 0)),
+        "hidden_dim": int(cfg_attempt.get("hidden_dim", 0)),
+        "num_layers": int(cfg_attempt.get("num_layers", 0)),
+        "dropout": float(cfg_attempt.get("dropout", 0.0)),
+        "lr": float(cfg_attempt.get("lr", 0.0)),
+        "neg_mode": str(cfg_attempt.get("neg_mode", "")),
+        "eval_neg_mode": str(cfg_attempt.get("eval_neg_mode", "")),
+        "ff_mode": str(cfg_attempt.get("ff_mode", "")),
+        "ff_blockwise": bool(cfg_attempt.get("ff_blockwise", False)),
+        "ff_block_size": int(cfg_attempt.get("ff_block_size", 0)),
+        "torch_compile": bool(cfg_attempt.get("torch_compile", False)),
+        "risk_head_enabled": bool(cfg_attempt.get("risk_head_enabled", False)),
+        "portfolio_head_enabled": bool(cfg_attempt.get("portfolio_head_enabled", False)),
+        "backprop_concat_posneg": bool(cfg_attempt.get("backprop_concat_posneg", True)),
+    }
+    return resume_fingerprint(payload)
+
+
+def _load_benchmark_resume_state(
+    *,
+    checkpoint_path: str,
+    fingerprint: str,
+    device: torch.device,
+    modules: dict[str, torch.nn.Module | None],
+    optimizer: torch.optim.Optimizer,
+    scaler,
+) -> tuple[dict | None, dict]:
+    payload = load_resume_payload(checkpoint_path, expected_fingerprint=fingerprint)
+    if not payload:
+        return None, {}
+    model_states = payload.get("model_states", {})
+    if isinstance(model_states, dict):
+        for name, module in modules.items():
+            if module is None or name not in model_states:
+                continue
+            try:
+                load_module_state_for_resume(module, model_states[name], strict=True)
+            except Exception:
+                load_module_state_for_resume(module, model_states[name], strict=False)
+    optimizer_state = payload.get("optimizer_state")
+    if isinstance(optimizer_state, dict):
+        optimizer.load_state_dict(optimizer_state)
+        move_optimizer_state_to_device(optimizer, device)
+    scaler_state = payload.get("scaler_state")
+    if scaler is not None and isinstance(scaler_state, dict):
+        scaler.load_state_dict(scaler_state)
+    restore_rng_state(payload.get("rng_state"))
+    metadata = payload.get("metadata", {})
+    return payload, metadata if isinstance(metadata, dict) else {}
+
+
+def _save_benchmark_resume_state(
+    checkpoint_path: str,
+    *,
+    fingerprint: str,
+    status: str,
+    epoch_completed: int,
+    modules: dict[str, torch.nn.Module | None],
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    metadata: dict | None = None,
+    result: dict | None = None,
+    epoch_history: list[dict] | None = None,
+) -> None:
+    model_states = {}
+    for name, module in modules.items():
+        if module is None:
+            continue
+        model_states[name] = module_state_for_resume(module)
+    save_resume_payload(
+        checkpoint_path,
+        fingerprint=fingerprint,
+        status=status,
+        epoch_completed=int(epoch_completed),
+        model_states=model_states,
+        optimizer_state=optimizer.state_dict(),
+        scaler_state=scaler.state_dict() if scaler is not None else None,
+        metadata=metadata or {},
+        result=result,
+        epoch_history=epoch_history or [],
+        rng_state=capture_rng_state(),
+    )
 
 
 def _slice_by_indices(values: Sequence | None, indices: Sequence[int]) -> list:
@@ -1336,6 +1480,31 @@ def _benchmark_ff(
     scaler = _make_scaler(amp_enabled and amp_dtype == torch.float16)
     goodness_kwargs = _goodness_kwargs(config)
     ff_loss_kwargs = _ff_loss_kwargs(config)
+    resume_checkpoint_path = str(config.get("resume_checkpoint_path", "")).strip()
+    resume_fingerprint_key = str(config.get("resume_fingerprint", "")).strip()
+    resume_payload = None
+    resume_meta: dict = {}
+    if resume_checkpoint_path and resume_fingerprint_key:
+        resume_payload, resume_meta = _load_benchmark_resume_state(
+            checkpoint_path=resume_checkpoint_path,
+            fingerprint=resume_fingerprint_key,
+            device=device,
+            modules={
+                "model": model,
+                "critic": critic,
+                "risk_head": risk_head,
+                "portfolio_head": portfolio_head,
+            },
+            optimizer=optim,
+            scaler=scaler,
+        )
+        if (
+            resume_payload
+            and str(resume_payload.get("status", "")).strip().lower() == "completed"
+            and isinstance(resume_payload.get("result"), dict)
+        ):
+            print(f"resume checkpoint already completed: {resume_checkpoint_path}")
+            return dict(resume_payload["result"])
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if layerwise and train_neg_mode == "self_contrastive":
         fallback = str(config.get("layerwise_neg_mode", "shuffle")).strip().lower()
@@ -1361,28 +1530,51 @@ def _benchmark_ff(
     hall_every_n_batches = max(1, int(config.get("ff_hall_every_n_batches", 1)))
     hall_warmup_epochs = max(0, int(config.get("ff_hall_warmup_epochs", 0)))
 
-    epoch_times = []
+    epoch_times = [
+        (float(item[0]), int(item[1]))
+        for item in resume_meta.get("epoch_times", [])
+        if isinstance(item, (list, tuple)) and len(item) == 2
+    ]
     component_times = {
-        "neg_gen": 0.0,
-        "hallucinate": 0.0,
-        "forward_pos": 0.0,
-        "forward_neg": 0.0,
-        "loss_terms": 0.0,
-        "optimizer": 0.0,
+        "neg_gen": float(resume_meta.get("component_times", {}).get("neg_gen", 0.0)),
+        "hallucinate": float(resume_meta.get("component_times", {}).get("hallucinate", 0.0)),
+        "forward_pos": float(resume_meta.get("component_times", {}).get("forward_pos", 0.0)),
+        "forward_neg": float(resume_meta.get("component_times", {}).get("forward_neg", 0.0)),
+        "loss_terms": float(resume_meta.get("component_times", {}).get("loss_terms", 0.0)),
+        "optimizer": float(resume_meta.get("component_times", {}).get("optimizer", 0.0)),
     }
     _reset_peak_cuda_memory(device)
-    steps_total = 0
-    risk_loss_sum = 0.0
-    risk_batches = 0
-    portfolio_loss_sum = 0.0
-    portfolio_batches = 0
-    rank_aux_sum = 0.0
-    rank_aux_batches = 0
-    rank_corr_sum = 0.0
-    rank_corr_batches = 0
-    epoch_history = []
+    steps_total = int(resume_meta.get("steps_total", 0))
+    risk_loss_sum = float(resume_meta.get("risk_loss_sum", 0.0))
+    risk_batches = int(resume_meta.get("risk_batches", 0))
+    portfolio_loss_sum = float(resume_meta.get("portfolio_loss_sum", 0.0))
+    portfolio_batches = int(resume_meta.get("portfolio_batches", 0))
+    rank_aux_sum = float(resume_meta.get("rank_aux_sum", 0.0))
+    rank_aux_batches = int(resume_meta.get("rank_aux_batches", 0))
+    rank_corr_sum = float(resume_meta.get("rank_corr_sum", 0.0))
+    rank_corr_batches = int(resume_meta.get("rank_corr_batches", 0))
+    epoch_history = list(resume_meta.get("epoch_history", []))
+    start_epoch = max(1, int(resume_payload.get("epoch_completed", 0)) + 1) if resume_payload else 1
+
+    def _resume_metadata(epoch_completed: int) -> dict:
+        return {
+            "epoch_times": epoch_times,
+            "component_times": component_times,
+            "steps_total": int(steps_total),
+            "risk_loss_sum": float(risk_loss_sum),
+            "risk_batches": int(risk_batches),
+            "portfolio_loss_sum": float(portfolio_loss_sum),
+            "portfolio_batches": int(portfolio_batches),
+            "rank_aux_sum": float(rank_aux_sum),
+            "rank_aux_batches": int(rank_aux_batches),
+            "rank_corr_sum": float(rank_corr_sum),
+            "rank_corr_batches": int(rank_corr_batches),
+            "epoch_history": list(epoch_history),
+            "epoch_completed": int(epoch_completed),
+        }
+
     for epoch in tqdm(
-        range(1, config["epochs"] + 1),
+        range(start_epoch, config["epochs"] + 1),
         desc="Benchmark",
         unit="epoch",
         dynamic_ncols=True,
@@ -1831,6 +2023,24 @@ def _benchmark_ff(
                 "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
             }
         )
+        if resume_checkpoint_path and resume_fingerprint_key:
+            if epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0 or epoch == int(config["epochs"]):
+                _save_benchmark_resume_state(
+                    resume_checkpoint_path,
+                    fingerprint=resume_fingerprint_key,
+                    status="in_progress",
+                    epoch_completed=epoch,
+                    modules={
+                        "model": model,
+                        "critic": critic,
+                        "risk_head": risk_head,
+                        "portfolio_head": portfolio_head,
+                    },
+                    optimizer=optim,
+                    scaler=scaler,
+                    metadata=_resume_metadata(epoch),
+                    epoch_history=epoch_history,
+                )
 
     target_eval = float(config["goodness_target"])
     target_cal_acc = float("nan")
@@ -1967,6 +2177,24 @@ def _benchmark_ff(
         if skipped:
             out["eval_neg_modes_skipped"] = ",".join(skipped)
     out["_epoch_history"] = epoch_history
+    if resume_checkpoint_path and resume_fingerprint_key:
+        _save_benchmark_resume_state(
+            resume_checkpoint_path,
+            fingerprint=resume_fingerprint_key,
+            status="completed",
+            epoch_completed=int(config["epochs"]),
+            modules={
+                "model": model,
+                "critic": critic,
+                "risk_head": risk_head,
+                "portfolio_head": portfolio_head,
+            },
+            optimizer=optim,
+            scaler=scaler,
+            metadata=_resume_metadata(int(config["epochs"])),
+            result=out,
+            epoch_history=epoch_history,
+        )
     _attach_primary_metrics(out)
     return out
 
@@ -2049,6 +2277,31 @@ def _benchmark_backprop(
             bp_amp_dtype = torch.float16
     bp_scaler = _make_scaler(bp_amp_enabled and bp_amp_dtype == torch.float16)
     goodness_kwargs = _goodness_kwargs(config)
+    resume_checkpoint_path = str(config.get("resume_checkpoint_path", "")).strip()
+    resume_fingerprint_key = str(config.get("resume_fingerprint", "")).strip()
+    resume_payload = None
+    resume_meta: dict = {}
+    if resume_checkpoint_path and resume_fingerprint_key:
+        resume_payload, resume_meta = _load_benchmark_resume_state(
+            checkpoint_path=resume_checkpoint_path,
+            fingerprint=resume_fingerprint_key,
+            device=device,
+            modules={
+                "model": model,
+                "head": head,
+                "risk_head": risk_head,
+                "portfolio_head": portfolio_head,
+            },
+            optimizer=optim,
+            scaler=bp_scaler,
+        )
+        if (
+            resume_payload
+            and str(resume_payload.get("status", "")).strip().lower() == "completed"
+            and isinstance(resume_payload.get("result"), dict)
+        ):
+            print(f"resume checkpoint already completed: {resume_checkpoint_path}")
+            return dict(resume_payload["result"])
 
     hall_cfg = HallucinationConfig(
         steps=config["hall_steps"],
@@ -2093,24 +2346,43 @@ def _benchmark_backprop(
     hall_warmup_epochs = max(0, int(config.get("ff_hall_warmup_epochs", 0)))
     backprop_concat_posneg = bool(config.get("backprop_concat_posneg", True))
 
-    epoch_times = []
+    epoch_times = [
+        (float(item[0]), int(item[1]))
+        for item in resume_meta.get("epoch_times", [])
+        if isinstance(item, (list, tuple)) and len(item) == 2
+    ]
     component_times = {
-        "neg_gen": 0.0,
-        "hallucinate": 0.0,
-        "forward_pos": 0.0,
-        "forward_neg": 0.0,
-        "loss_terms": 0.0,
-        "optimizer": 0.0,
+        "neg_gen": float(resume_meta.get("component_times", {}).get("neg_gen", 0.0)),
+        "hallucinate": float(resume_meta.get("component_times", {}).get("hallucinate", 0.0)),
+        "forward_pos": float(resume_meta.get("component_times", {}).get("forward_pos", 0.0)),
+        "forward_neg": float(resume_meta.get("component_times", {}).get("forward_neg", 0.0)),
+        "loss_terms": float(resume_meta.get("component_times", {}).get("loss_terms", 0.0)),
+        "optimizer": float(resume_meta.get("component_times", {}).get("optimizer", 0.0)),
     }
     _reset_peak_cuda_memory(device)
-    steps_total = 0
-    risk_loss_sum = 0.0
-    risk_batches = 0
-    portfolio_loss_sum = 0.0
-    portfolio_batches = 0
-    epoch_history = []
+    steps_total = int(resume_meta.get("steps_total", 0))
+    risk_loss_sum = float(resume_meta.get("risk_loss_sum", 0.0))
+    risk_batches = int(resume_meta.get("risk_batches", 0))
+    portfolio_loss_sum = float(resume_meta.get("portfolio_loss_sum", 0.0))
+    portfolio_batches = int(resume_meta.get("portfolio_batches", 0))
+    epoch_history = list(resume_meta.get("epoch_history", []))
+    start_epoch = max(1, int(resume_payload.get("epoch_completed", 0)) + 1) if resume_payload else 1
+
+    def _resume_metadata(epoch_completed: int) -> dict:
+        return {
+            "epoch_times": epoch_times,
+            "component_times": component_times,
+            "steps_total": int(steps_total),
+            "risk_loss_sum": float(risk_loss_sum),
+            "risk_batches": int(risk_batches),
+            "portfolio_loss_sum": float(portfolio_loss_sum),
+            "portfolio_batches": int(portfolio_batches),
+            "epoch_history": list(epoch_history),
+            "epoch_completed": int(epoch_completed),
+        }
+
     for epoch in tqdm(
-        range(1, config["epochs"] + 1),
+        range(start_epoch, config["epochs"] + 1),
         desc="Benchmark",
         unit="epoch",
         dynamic_ncols=True,
@@ -2255,6 +2527,24 @@ def _benchmark_backprop(
                 "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
             }
         )
+        if resume_checkpoint_path and resume_fingerprint_key:
+            if epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0 or epoch == int(config["epochs"]):
+                _save_benchmark_resume_state(
+                    resume_checkpoint_path,
+                    fingerprint=resume_fingerprint_key,
+                    status="in_progress",
+                    epoch_completed=epoch,
+                    modules={
+                        "model": model,
+                        "head": head,
+                        "risk_head": risk_head,
+                        "portfolio_head": portfolio_head,
+                    },
+                    optimizer=optim,
+                    scaler=bp_scaler,
+                    metadata=_resume_metadata(epoch),
+                    epoch_history=epoch_history,
+                )
 
     # eval accuracy
     model.eval()
@@ -2416,6 +2706,24 @@ def _benchmark_backprop(
         out.update(econ)
         out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
     out["_epoch_history"] = epoch_history
+    if resume_checkpoint_path and resume_fingerprint_key:
+        _save_benchmark_resume_state(
+            resume_checkpoint_path,
+            fingerprint=resume_fingerprint_key,
+            status="completed",
+            epoch_completed=int(config["epochs"]),
+            modules={
+                "model": model,
+                "head": head,
+                "risk_head": risk_head,
+                "portfolio_head": portfolio_head,
+            },
+            optimizer=optim,
+            scaler=bp_scaler,
+            metadata=_resume_metadata(int(config["epochs"])),
+            result=out,
+            epoch_history=epoch_history,
+        )
     _attach_primary_metrics(out)
     return out
 
@@ -2496,24 +2804,64 @@ def _benchmark_backprop_supervised_return(
         if not bf16_ok:
             bp_amp_dtype = torch.float16
     bp_scaler = _make_scaler(bp_amp_enabled and bp_amp_dtype == torch.float16)
+    resume_checkpoint_path = str(config.get("resume_checkpoint_path", "")).strip()
+    resume_fingerprint_key = str(config.get("resume_fingerprint", "")).strip()
+    resume_payload = None
+    resume_meta: dict = {}
+    if resume_checkpoint_path and resume_fingerprint_key:
+        resume_payload, resume_meta = _load_benchmark_resume_state(
+            checkpoint_path=resume_checkpoint_path,
+            fingerprint=resume_fingerprint_key,
+            device=device,
+            modules={
+                "model": model,
+                "return_head": return_head,
+                "risk_head": risk_head,
+            },
+            optimizer=optim,
+            scaler=bp_scaler,
+        )
+        if (
+            resume_payload
+            and str(resume_payload.get("status", "")).strip().lower() == "completed"
+            and isinstance(resume_payload.get("result"), dict)
+        ):
+            print(f"resume checkpoint already completed: {resume_checkpoint_path}")
+            return dict(resume_payload["result"])
 
     component_times = {
-        "neg_gen": 0.0,
-        "hallucinate": 0.0,
-        "forward_pos": 0.0,
-        "forward_neg": 0.0,
-        "loss_terms": 0.0,
-        "optimizer": 0.0,
+        "neg_gen": float(resume_meta.get("component_times", {}).get("neg_gen", 0.0)),
+        "hallucinate": float(resume_meta.get("component_times", {}).get("hallucinate", 0.0)),
+        "forward_pos": float(resume_meta.get("component_times", {}).get("forward_pos", 0.0)),
+        "forward_neg": float(resume_meta.get("component_times", {}).get("forward_neg", 0.0)),
+        "loss_terms": float(resume_meta.get("component_times", {}).get("loss_terms", 0.0)),
+        "optimizer": float(resume_meta.get("component_times", {}).get("optimizer", 0.0)),
     }
     _reset_peak_cuda_memory(device)
-    steps_total = 0
-    risk_loss_sum = 0.0
-    risk_batches = 0
-    epoch_times = []
-    epoch_history = []
+    steps_total = int(resume_meta.get("steps_total", 0))
+    risk_loss_sum = float(resume_meta.get("risk_loss_sum", 0.0))
+    risk_batches = int(resume_meta.get("risk_batches", 0))
+    epoch_times = [
+        (float(item[0]), int(item[1]))
+        for item in resume_meta.get("epoch_times", [])
+        if isinstance(item, (list, tuple)) and len(item) == 2
+    ]
+    epoch_history = list(resume_meta.get("epoch_history", []))
+    start_epoch = max(1, int(resume_payload.get("epoch_completed", 0)) + 1) if resume_payload else 1
+
+    def _resume_metadata(epoch_completed: int) -> dict:
+        return {
+            "component_times": component_times,
+            "steps_total": int(steps_total),
+            "risk_loss_sum": float(risk_loss_sum),
+            "risk_batches": int(risk_batches),
+            "epoch_times": epoch_times,
+            "epoch_history": list(epoch_history),
+            "epoch_completed": int(epoch_completed),
+        }
 
     for epoch in tqdm(
-        range(1, config["epochs"] + 1),
+        range(start_epoch, config["epochs"] + 1),
         desc="Benchmark",
         unit="epoch",
         dynamic_ncols=True,
@@ -2594,6 +2942,23 @@ def _benchmark_backprop_supervised_return(
                 "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
             }
         )
+        if resume_checkpoint_path and resume_fingerprint_key:
+            if epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0 or epoch == int(config["epochs"]):
+                _save_benchmark_resume_state(
+                    resume_checkpoint_path,
+                    fingerprint=resume_fingerprint_key,
+                    status="in_progress",
+                    epoch_completed=epoch,
+                    modules={
+                        "model": model,
+                        "return_head": return_head,
+                        "risk_head": risk_head,
+                    },
+                    optimizer=optim,
+                    scaler=bp_scaler,
+                    metadata=_resume_metadata(epoch),
+                    epoch_history=epoch_history,
+                )
 
     model.eval()
     return_head.eval()
@@ -2656,6 +3021,23 @@ def _benchmark_backprop_supervised_return(
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
         out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
     out["_epoch_history"] = epoch_history
+    if resume_checkpoint_path and resume_fingerprint_key:
+        _save_benchmark_resume_state(
+            resume_checkpoint_path,
+            fingerprint=resume_fingerprint_key,
+            status="completed",
+            epoch_completed=int(config["epochs"]),
+            modules={
+                "model": model,
+                "return_head": return_head,
+                "risk_head": risk_head,
+            },
+            optimizer=optim,
+            scaler=bp_scaler,
+            metadata=_resume_metadata(int(config["epochs"])),
+            result=out,
+            epoch_history=epoch_history,
+        )
     _attach_primary_metrics(out)
     return out
 
@@ -2937,6 +3319,9 @@ def main() -> int:
         "eval_neg_modes": bench_cfg.get("eval_neg_modes", []),
         "retry_safe_on_error": bool(bench_cfg.get("retry_safe_on_error", True)),
         "continue_on_mode_error": bool(bench_cfg.get("continue_on_mode_error", True)),
+        "resume_enabled": bool(bench_cfg.get("resume_enabled", True)),
+        "resume_dir": str(bench_cfg.get("resume_dir", "")),
+        "resume_save_every_epochs": int(bench_cfg.get("resume_save_every_epochs", 1)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
         "window_len": int(returns_len),
@@ -2982,6 +3367,19 @@ def main() -> int:
     modes = [_canonical_mode_name(m.strip()) for m in args.modes.split(",") if m.strip()]
     if not modes:
         modes = ["ff_layerwise", "ff_e2e", "backprop_contrastive", "backprop_supervised_return"]
+    if bool(config.get("resume_enabled", True)):
+        resume_dir_raw = str(config.get("resume_dir", "")).strip()
+        if resume_dir_raw:
+            config["resume_dir"] = str(Path(resume_dir_raw))
+        else:
+            config["resume_dir"] = str(
+                _default_benchmark_resume_dir(
+                    bench_cfg.get("out_csv", "runs/experiments/manual/metrics/benchmark.csv")
+                )
+            )
+        Path(str(config["resume_dir"])).mkdir(parents=True, exist_ok=True)
+    else:
+        config["resume_dir"] = ""
     config["econ_fwd_ret_1"] = None
     config["econ_ticker_effective"] = ""
     config["econ_ticker_source"] = ""
@@ -3289,10 +3687,32 @@ def main() -> int:
                         attempts,
                         start=1,
                     ):
+                        cfg_attempt_run = cfg_attempt.copy()
+                        if bool(config.get("resume_enabled", True)) and str(config.get("resume_dir", "")).strip():
+                            attempt_tag = "safe" if safe_mode_applied else "base"
+                            checkpoint_path = _benchmark_resume_path(
+                                resume_dir=str(config.get("resume_dir", "")),
+                                mode_name=mode,
+                                seed_run=int(seed_run),
+                                split_mode_effective="walk_forward",
+                                fold_id=int(fold.get("fold_id", -1)),
+                                attempt_tag=attempt_tag,
+                            )
+                            cfg_attempt_run["resume_checkpoint_path"] = str(checkpoint_path)
+                            cfg_attempt_run["resume_fingerprint"] = _benchmark_resume_signature(
+                                cfg_attempt_run,
+                                mode_name=mode,
+                                seed_run=int(seed_run),
+                                split_mode_effective="walk_forward",
+                                fold_id=int(fold.get("fold_id", -1)),
+                                attempt_tag=attempt_tag,
+                                train_len=len(train_idx),
+                                eval_len=len(eval_idx),
+                            )
                         try:
                             fold_res = _run_mode_impl(
                                 mode,
-                                cfg_attempt,
+                                cfg_attempt_run,
                                 train_fold,
                                 eval_fold,
                                 eval_dates_fold,
@@ -3383,10 +3803,32 @@ def main() -> int:
                     attempts,
                     start=1,
                 ):
+                    cfg_attempt_run = cfg_attempt.copy()
+                    if bool(config.get("resume_enabled", True)) and str(config.get("resume_dir", "")).strip():
+                        attempt_tag = "safe" if safe_mode_applied else "base"
+                        checkpoint_path = _benchmark_resume_path(
+                            resume_dir=str(config.get("resume_dir", "")),
+                            mode_name=mode,
+                            seed_run=int(seed_run),
+                            split_mode_effective=split_mode_mode,
+                            fold_id=None,
+                            attempt_tag=attempt_tag,
+                        )
+                        cfg_attempt_run["resume_checkpoint_path"] = str(checkpoint_path)
+                        cfg_attempt_run["resume_fingerprint"] = _benchmark_resume_signature(
+                            cfg_attempt_run,
+                            mode_name=mode,
+                            seed_run=int(seed_run),
+                            split_mode_effective=split_mode_mode,
+                            fold_id=None,
+                            attempt_tag=attempt_tag,
+                            train_len=len(tr_idx),
+                            eval_len=len(ev_idx),
+                        )
                     try:
                         mode_row = _run_mode_impl(
                             mode,
-                            cfg_attempt,
+                            cfg_attempt_run,
                             train_graphs_mode,
                             eval_graphs_mode,
                             eval_dates_mode,
