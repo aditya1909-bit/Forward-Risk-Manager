@@ -31,6 +31,15 @@ class CommandRunResult:
         return self.returncode == 0
 
 
+@dataclass(frozen=True)
+class NotebookStage:
+    step: str
+    label: str
+    required_outputs: tuple[str, ...] = ()
+    eta_s: float = 0.0
+    optional: bool = False
+
+
 def in_colab() -> bool:
     return "google.colab" in sys.modules
 
@@ -41,6 +50,24 @@ def shell_quote(value: Any) -> str:
 
 def utc_now_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    try:
+        total = int(round(float(seconds)))
+    except Exception:
+        return "unknown"
+    if total < 0:
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def resolve_repo_root(
@@ -80,6 +107,15 @@ def resolve_repo_root(
                     if path.is_dir()
                 )
             )
+
+    user_name = os.environ.get("EMORY_NETID", "").strip() or os.environ.get("USER", "").strip()
+    if user_name:
+        candidates.extend(
+            [
+                Path(f"/local/scratch/{user_name}/forward-risk-manager/repo"),
+                Path(f"/local/scratch/{user_name}/forward-risk-manager"),
+            ]
+        )
 
     candidates.extend(Path(candidate) for candidate in extra_candidates)
 
@@ -411,3 +447,156 @@ def step_is_complete(
     if not output_paths:
         return True
     return all(path.exists() for path in output_paths)
+
+
+def stage_status_rows(
+    manifest_path: str | Path,
+    stages: Sequence[NotebookStage],
+    *,
+    root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    manifest = load_json(manifest_path, default={}) or {}
+    step_rows = (manifest.get("steps") or {}) if isinstance(manifest, dict) else {}
+    root_path = Path(root).resolve() if root is not None else None
+    rows: list[dict[str, Any]] = []
+    for stage in stages:
+        step_row = step_rows.get(stage.step) or {}
+        status = str(step_row.get("status", "")).strip() or "pending"
+        metadata = step_row.get("metadata") or {}
+        elapsed_s = metadata.get("elapsed_s")
+        effective_eta = metadata.get("eta_s", stage.eta_s)
+        outputs = [Path(path) for path in stage.required_outputs]
+        if root_path is not None:
+            outputs = [path if path.is_absolute() else root_path / path for path in outputs]
+        outputs_ready = bool(outputs) and all(path.exists() for path in outputs)
+        if status == "completed" and outputs and not outputs_ready:
+            status = "stale"
+        rows.append(
+            {
+                "step": stage.step,
+                "label": stage.label,
+                "status": status,
+                "elapsed_s": elapsed_s,
+                "eta_s": effective_eta,
+                "optional": stage.optional,
+                "outputs_ready": outputs_ready if outputs else None,
+            }
+        )
+    return rows
+
+
+def remaining_eta_seconds(
+    manifest_path: str | Path,
+    stages: Sequence[NotebookStage],
+    *,
+    root: str | Path | None = None,
+) -> float:
+    rows = stage_status_rows(manifest_path, stages, root=root)
+    total = 0.0
+    for row in rows:
+        if row["status"] == "completed":
+            continue
+        eta_s = row.get("eta_s")
+        if eta_s is None:
+            continue
+        try:
+            eta_val = float(eta_s)
+        except Exception:
+            continue
+        if eta_val > 0:
+            total += eta_val
+    return total
+
+
+def run_tracked_command(
+    *,
+    step: str,
+    label: str,
+    command: str,
+    manifest_path: str | Path,
+    required_outputs: Iterable[str | Path] = (),
+    eta_s: float = 0.0,
+    optional: bool = False,
+    allow_fail: bool = False,
+    skip_if_complete: bool = True,
+    tail_lines: int = 200,
+    env_overrides: dict[str, str] | None = None,
+    log_dir: str | Path | None = None,
+    cwd: str | Path | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> CommandRunResult | None:
+    outputs = [Path(path) for path in required_outputs]
+    if skip_if_complete and step_is_complete(manifest_path, step, required_outputs=outputs):
+        print(f"Skipping {label}: outputs already exist.")
+        record_run_step(
+            manifest_path,
+            step=step,
+            command=command,
+            status="completed",
+            required_outputs=outputs,
+            metadata={
+                "skipped": True,
+                "eta_s": float(eta_s),
+                "optional": bool(optional),
+                **(metadata or {}),
+            },
+        )
+        return None
+
+    record_run_step(
+        manifest_path,
+        step=step,
+        command=command,
+        status="started",
+        required_outputs=outputs,
+        metadata={
+            "eta_s": float(eta_s),
+            "optional": bool(optional),
+            **(metadata or {}),
+        },
+    )
+    started = time.time()
+    try:
+        result = run_command(
+            command,
+            allow_fail=allow_fail,
+            tail_lines=tail_lines,
+            env_overrides=env_overrides,
+            log_dir=log_dir,
+            cwd=cwd,
+        )
+    except Exception as exc:
+        elapsed_s = time.time() - started
+        record_run_step(
+            manifest_path,
+            step=step,
+            command=command,
+            status="failed",
+            required_outputs=outputs,
+            metadata={
+                "elapsed_s": elapsed_s,
+                "eta_s": float(eta_s),
+                "optional": bool(optional),
+                "error": str(exc),
+                **(metadata or {}),
+            },
+        )
+        raise
+
+    status = "completed" if result.ok else "failed"
+    record_run_step(
+        manifest_path,
+        step=step,
+        command=command,
+        status=status,
+        log_path=result.log_path,
+        required_outputs=outputs,
+        metadata={
+            "elapsed_s": result.elapsed_s,
+            "eta_s": float(eta_s),
+            "optional": bool(optional),
+            "returncode": int(result.returncode),
+            **(metadata or {}),
+        },
+    )
+    return result

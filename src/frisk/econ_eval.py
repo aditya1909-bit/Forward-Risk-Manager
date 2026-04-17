@@ -192,6 +192,8 @@ def infer_graph_goodness(
     goodness_temp: float,
     batch_size: int = 128,
     critic=None,
+    norm: str = "none",
+    reducer: str = "logsumexp",
 ) -> np.ndarray:
     if not graphs:
         return np.asarray([], dtype=float)
@@ -214,7 +216,14 @@ def infer_graph_goodness(
             edge_weight = getattr(batch, "edge_weight", None)
             edge_type = getattr(batch, "edge_type", None)
             h = model(batch.x, batch.edge_index, edge_weight=edge_weight, edge_type=edge_type)
-            g = goodness(h, batch.batch, temperature=float(goodness_temp), critic=critic)
+            g = goodness(
+                h,
+                batch.batch,
+                temperature=float(goodness_temp),
+                critic=critic,
+                norm=str(norm).strip().lower(),
+                reducer=str(reducer).strip().lower(),
+            )
             vals.extend(g.detach().cpu().tolist())
     return np.asarray(vals, dtype=float)
 
@@ -225,6 +234,8 @@ def infer_graph_goodness_with_uncertainty(
     goodness_temp: float,
     batch_size: int = 128,
     critic=None,
+    norm: str = "none",
+    reducer: str = "logsumexp",
 ) -> tuple[np.ndarray, np.ndarray | None]:
     if not graphs:
         return np.asarray([], dtype=float), None
@@ -249,7 +260,14 @@ def infer_graph_goodness_with_uncertainty(
             edge_weight = getattr(batch, "edge_weight", None)
             edge_type = getattr(batch, "edge_type", None)
             h = model(batch.x, batch.edge_index, edge_weight=edge_weight, edge_type=edge_type)
-            g = goodness(h, batch.batch, temperature=float(goodness_temp), critic=critic)
+            g = goodness(
+                h,
+                batch.batch,
+                temperature=float(goodness_temp),
+                critic=critic,
+                norm=str(norm).strip().lower(),
+                reducer=str(reducer).strip().lower(),
+            )
             vals.extend(g.detach().cpu().tolist())
             if callable(member_graph_energy):
                 ge = member_graph_energy(h, batch.batch, temperature=float(goodness_temp))

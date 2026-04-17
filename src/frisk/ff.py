@@ -25,21 +25,44 @@ def _segment_logsumexp(
     return max_vals + torch.log(sum_vals.clamp_min(1e-12))
 
 
+def _segment_mean(
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+) -> torch.Tensor:
+    sum_vals = torch.zeros(num_segments, device=values.device, dtype=values.dtype)
+    cnt_vals = torch.zeros(num_segments, device=values.device, dtype=values.dtype)
+    sum_vals.index_add_(0, segment_ids, values)
+    cnt_vals.index_add_(0, segment_ids, torch.ones_like(values))
+    return sum_vals / cnt_vals.clamp_min(1.0)
+
+
 def goodness(
     h: torch.Tensor,
     batch: torch.Tensor,
     temperature: float = 1.0,
     critic: torch.nn.Module | None = None,
+    norm: Literal["none", "layernorm"] = "none",
+    reducer: Literal["logsumexp", "mean"] = "logsumexp",
 ) -> torch.Tensor:
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
     if h.numel() == 0:
         return torch.empty(0, device=h.device, dtype=h.dtype)
+    if norm not in {"none", "layernorm"}:
+        raise ValueError("norm must be 'none' or 'layernorm'")
+    if reducer not in {"logsumexp", "mean"}:
+        raise ValueError("reducer must be 'logsumexp' or 'mean'")
 
-    if critic is not None:
+    if norm == "layernorm":
+        h = F.layer_norm(h, (h.size(-1),))
+
+    if critic is not None and reducer == "logsumexp":
         graph_energy_fn = getattr(critic, "graph_energy", None)
         if callable(graph_energy_fn):
             return graph_energy_fn(h, batch, temperature=temperature)
+
+    if critic is not None:
         node_energy_fn = getattr(critic, "node_energy", None)
         if callable(node_energy_fn):
             node_energy = node_energy_fn(h)
@@ -55,8 +78,11 @@ def goodness(
     else:
         node_energy = (h * h).mean(dim=1)
     _, segment_ids = torch.unique(batch, sorted=True, return_inverse=True)
+    num_segments = int(segment_ids.max().item()) + 1
+    if reducer == "mean":
+        return _segment_mean(node_energy, segment_ids, num_segments)
     scaled = node_energy / temperature
-    lse = _segment_logsumexp(scaled, segment_ids, int(segment_ids.max().item()) + 1)
+    lse = _segment_logsumexp(scaled, segment_ids, num_segments)
     return temperature * lse
 
 
@@ -262,14 +288,21 @@ def ff_loss(
     margin: float = 0.0,
     margin_weight: float = 1.0,
     sample_weight: torch.Tensor | None = None,
+    loss_type: Literal["softplus_margin", "symba"] = "softplus_margin",
 ) -> torch.Tensor:
-    # Encourage g_pos > target and g_neg < target
-    loss_pos = F.softplus(target - g_pos)
-    loss_neg = F.softplus(g_neg - target)
-    loss = loss_pos + loss_neg
-    if margin > 0 and margin_weight > 0:
-        gap = g_pos - g_neg
-        loss = loss + float(margin_weight) * F.softplus(float(margin) - gap)
+    if loss_type == "symba":
+        scale = max(0.0, float(margin_weight))
+        if scale <= 0:
+            scale = 1.0
+        loss = F.softplus(scale * (g_neg - g_pos + float(margin)))
+    else:
+        # Encourage g_pos > target and g_neg < target
+        loss_pos = F.softplus(target - g_pos)
+        loss_neg = F.softplus(g_neg - target)
+        loss = loss_pos + loss_neg
+        if margin > 0 and margin_weight > 0:
+            gap = g_pos - g_neg
+            loss = loss + float(margin_weight) * F.softplus(float(margin) - gap)
     if sample_weight is not None:
         weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
         if weight.numel() != loss.numel():

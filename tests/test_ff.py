@@ -34,6 +34,32 @@ def test_goodness_matches_naive_unsorted_batch():
     assert torch.allclose(g, g_ref, atol=1e-6)
 
 
+def test_goodness_mean_reducer_matches_manual_graph_means():
+    h = torch.tensor(
+        [
+            [1.0, 3.0],
+            [2.0, 2.0],
+            [4.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    batch = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    g = goodness(h, batch, reducer="mean")
+    expected = torch.tensor([4.5, 5.0], dtype=torch.float32)
+    assert torch.allclose(g, expected, atol=1e-6)
+
+
+def test_goodness_layernorm_changes_energy_scale_but_keeps_shape():
+    torch.manual_seed(0)
+    h = torch.randn(6, 4)
+    batch = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long)
+    g_plain = goodness(h, batch, temperature=0.5)
+    g_ln = goodness(h, batch, temperature=0.5, norm="layernorm")
+    assert g_plain.shape == g_ln.shape == (2,)
+    assert not torch.allclose(g_plain, g_ln)
+
+
 def test_make_negative_shuffle_preserves_graph_membership():
     torch.manual_seed(0)
     x = torch.tensor([[1.0], [2.0], [10.0], [20.0], [100.0]])
@@ -257,6 +283,15 @@ def test_ff_loss_margin_penalizes_small_positive_negative_gap():
     base = ff_loss(g_pos, g_neg, target=1.0, margin=0.0, margin_weight=1.0)
     with_margin = ff_loss(g_pos, g_neg, target=1.0, margin=0.3, margin_weight=1.0)
     assert float(with_margin) > float(base)
+
+
+def test_ff_loss_symba_prefers_larger_positive_negative_gap():
+    g_pos = torch.tensor([2.0, 2.2, 2.1], dtype=torch.float32)
+    g_neg_close = torch.tensor([1.9, 2.0, 1.8], dtype=torch.float32)
+    g_neg_far = torch.tensor([0.2, 0.1, 0.0], dtype=torch.float32)
+    loss_close = ff_loss(g_pos, g_neg_close, loss_type="symba")
+    loss_far = ff_loss(g_pos, g_neg_far, loss_type="symba")
+    assert float(loss_close) > float(loss_far)
 
 
 def test_rank_spread_loss_smaller_when_top_bottom_gap_is_larger():

@@ -257,6 +257,46 @@ def test_ff_sweep_finance_floor_metric_falls_back_from_oos_to_in_sample():
     assert float(value_2) == 0.25
 
 
+def test_apply_mode_profile_sets_algorithmic_parity_core_defaults():
+    mod = _load_script("benchmark_training.py")
+    mode, cfg = mod._apply_mode_profile("ff_e2e_core", {"noise_std": 0.07})
+    assert mode == "ff_e2e_core"
+    assert cfg["task_family"] == "algorithmic_parity"
+    assert cfg["signal_family"] == "contrastive"
+    assert cfg["risk_head_enabled"] is False
+    assert cfg["portfolio_head_enabled"] is False
+    assert cfg["ff_loss_type"] == "softplus_margin"
+    assert cfg["goodness_norm"] == "none"
+    assert cfg["goodness_reducer"] == "logsumexp"
+
+
+def test_attach_primary_metrics_prefers_economics_for_financial_track():
+    mod = _load_script("benchmark_training.py")
+    row = {
+        "task_family": "financial_value",
+        "signal_family": "return_forecast",
+        "eval_objective": "supervised_return",
+        "econ_oos_sharpe_uplift_min": 0.12,
+        "eval_return_corr": 0.35,
+    }
+    mod._attach_primary_metrics(row)
+    assert row["primary_eval_metric_name"] == "econ_oos_sharpe_uplift_min"
+    assert float(row["primary_eval_metric"]) == 0.12
+    assert row["primary_metric_family"] == "economics"
+
+
+def test_regression_eval_metrics_reports_finite_regression_outputs():
+    mod = _load_script("benchmark_training.py")
+    out = mod._regression_eval_metrics(
+        pred=[0.1, 0.2, 0.3, 0.4],
+        target=[0.12, 0.18, 0.31, 0.38],
+    )
+    assert out["eval_return_mse"] >= 0.0
+    assert out["eval_return_mae"] >= 0.0
+    assert out["eval_return_corr"] > 0.9
+    assert out["eval_return_rank_corr"] > 0.9
+
+
 def test_ff_sweep_build_econ_payload_falls_back_to_inference(monkeypatch):
     mod = _load_script("ff_sweep.py")
     eval_dates = ["2024-01-01", "2024-01-02", "2024-01-03"]
@@ -572,7 +612,7 @@ def test_retry_safe_and_continue_records_failed_mode_row_and_keeps_success():
             set(df.columns)
         )
         fail = df[df["mode"] == "ff_layerwise"].iloc[0]
-        ok = df[df["mode"] == "backprop"].iloc[0]
+        ok = df[df["mode"] == "backprop_contrastive"].iloc[0]
         assert str(fail["status"]) == "failed"
         assert str(ok["status"]) == "ok"
 

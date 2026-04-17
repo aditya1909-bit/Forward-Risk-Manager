@@ -9,6 +9,7 @@ NOTEBOOKS = [
     ROOT / "notebooks" / "colab_setup.ipynb",
     ROOT / "notebooks" / "end_to_end_repo_runbook.ipynb",
     ROOT / "notebooks" / "graph_factory_colab.ipynb",
+    ROOT / "notebooks" / "preliminary_paper_colab.ipynb",
     ROOT / "notebooks" / "paper_final_benchmark_colab.ipynb",
     ROOT / "notebooks" / "recovery_ablation_runbook.ipynb",
 ]
@@ -33,6 +34,7 @@ def test_core_notebooks_import_shared_runtime():
         ROOT / "notebooks" / "colab_setup.ipynb",
         ROOT / "notebooks" / "end_to_end_repo_runbook.ipynb",
         ROOT / "notebooks" / "graph_factory_colab.ipynb",
+        ROOT / "notebooks" / "preliminary_paper_colab.ipynb",
         ROOT / "notebooks" / "paper_final_benchmark_colab.ipynb",
     }
     for path in required:

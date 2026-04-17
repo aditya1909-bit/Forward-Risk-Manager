@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import itertools
 import math
 import random
@@ -14,7 +13,6 @@ import tomllib
 import numpy as np
 import pandas as pd
 import torch
-from torch.optim import Adam
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_mean_pool
 from tqdm import tqdm
@@ -23,11 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import (
-    CompositeEnergyCritic,
-    EnergyCritic,
-    EnergyCriticEnsemble,
     GCNEncoder,
-    SequenceEnergyCritic,
 )
 from frisk.ff import (
     ff_loss,
@@ -39,17 +33,40 @@ from frisk.ff import (
     self_contrastive_retrieval_accuracy,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
-from frisk.device import resolve_device, sync_device
+from frisk.cluster_runtime import ensure_safe_cluster_path
+from frisk.device import resolve_device
+from frisk.distributed_runtime import (
+    barrier as _dist_barrier,
+    cleanup_distributed as _cleanup_distributed,
+    dataloader_kwargs_with_sampler as _dataloader_kwargs_with_sampler,
+    init_distributed_context as _init_distributed_context,
+    maybe_make_sampler as _maybe_make_sampler,
+    maybe_wrap_ddp as _maybe_wrap_ddp,
+    set_sampler_epoch as _set_sampler_epoch,
+    unwrap_module as _unwrap_module,
+)
 from frisk.graph_artifact import load_graph_artifact
 from frisk.eval_metrics import ff_binary_metrics
 from frisk.econ_eval import (
     evaluate_goodness_strategy,
-    infer_graph_goodness,
     infer_graph_goodness_with_uncertainty,
     load_forward_returns_from_prices,
     resolve_price_ticker,
 )
 from frisk.splits import is_walk_forward_mode, simple_split_indices, walk_forward_splits
+from frisk.benchmarking.semantics import (
+    attach_primary_metrics as _attach_primary_metrics,
+    objective_track as _objective_track,
+)
+from frisk.training.critics import build_critic as _build_critic
+from frisk.training.runtime import (
+    autocast_if_needed as _autocast_if_needed,
+    build_optimizer as _build_optimizer,
+    make_scaler as _make_scaler,
+    optimizer_step as _optimizer_step,
+    parse_amp_dtype as _parse_amp_dtype,
+    sync as _sync,
+)
 
 _GRAPH_CACHE: dict[str, tuple[list, list]] = {}
 _NEG_AUG_MODES = {
@@ -96,131 +113,6 @@ def _set_seed(seed: int) -> None:
 
 def _choose_device(device: str) -> torch.device:
     return resolve_device(device)
-
-
-def _parse_amp_dtype(value) -> torch.dtype:
-    name = str(value).strip().lower()
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float16
-
-
-def _build_optimizer(params, lr: float, device: torch.device, use_fused: bool):
-    params = tuple(params)
-    if not params:
-        raise ValueError("optimizer got an empty parameter list")
-    kwargs = {}
-    if device.type == "cuda":
-        kwargs["foreach"] = True
-        if use_fused:
-            kwargs["fused"] = True
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("fused", None)
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("foreach", None)
-        return Adam(params, lr=lr, **kwargs)
-
-
-def _make_scaler(enabled: bool):
-    if not enabled:
-        return None
-    try:
-        return torch.amp.GradScaler("cuda", enabled=True)
-    except Exception:
-        return torch.cuda.amp.GradScaler(enabled=True)
-
-
-def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
-    if not enabled:
-        return contextlib.nullcontext()
-    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
-
-
-def _optimizer_step(optim, loss: torch.Tensor, grad_clip: float, clip_params, scaler) -> None:
-    optim.zero_grad(set_to_none=True)
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        if grad_clip > 0:
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-        scaler.step(optim)
-        scaler.update()
-        return
-    loss.backward()
-    if grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-    optim.step()
-
-
-def _sync(device: torch.device) -> None:
-    sync_device(device)
-
-
-def _build_critic(cfg: dict, hidden_dim: int, device: torch.device):
-    critic_hidden_dim = max(1, int(cfg.get("critic_hidden_dim", hidden_dim)))
-    critic_num_layers = max(1, int(cfg.get("critic_num_layers", 2)))
-    critic_dropout = max(0.0, float(cfg.get("critic_dropout", cfg.get("dropout", 0.1))))
-    critic_positive = str(cfg.get("critic_positive_activation", "softplus")).strip().lower()
-    if critic_positive not in {"softplus", "square"}:
-        critic_positive = "softplus"
-
-    ensemble_size = max(1, int(cfg.get("critic_ensemble_size", 1)))
-    seed_base = int(cfg.get("seed", 7))
-    seed_stride = max(1, int(cfg.get("critic_ensemble_seed_stride", 1009)))
-    critics = []
-    for i in range(ensemble_size):
-        if ensemble_size > 1:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(seed_base + i * seed_stride)
-                member = EnergyCritic(
-                    in_dim=hidden_dim,
-                    hidden_dim=critic_hidden_dim,
-                    num_layers=critic_num_layers,
-                    dropout=critic_dropout,
-                    positive_activation=critic_positive,
-                )
-        else:
-            member = EnergyCritic(
-                in_dim=hidden_dim,
-                hidden_dim=critic_hidden_dim,
-                num_layers=critic_num_layers,
-                dropout=critic_dropout,
-                positive_activation=critic_positive,
-            )
-        critics.append(member.to(device))
-
-    if len(critics) == 1:
-        base_critic = critics[0]
-    else:
-        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
-
-    seq_enabled = bool(cfg.get("sequence_critic_enabled", False))
-    if not seq_enabled:
-        return base_critic
-
-    seq_hidden = max(1, int(cfg.get("sequence_critic_hidden_dim", hidden_dim)))
-    seq_layers = max(1, int(cfg.get("sequence_critic_num_layers", 1)))
-    seq_dropout = max(0.0, float(cfg.get("sequence_critic_dropout", 0.0)))
-    seq_positive = str(cfg.get("sequence_critic_positive_activation", "softplus")).strip().lower()
-    if seq_positive not in {"softplus", "square"}:
-        seq_positive = "softplus"
-    seq_weight = float(cfg.get("sequence_critic_weight", 0.0))
-    seq_critic = SequenceEnergyCritic(
-        in_dim=hidden_dim,
-        hidden_dim=seq_hidden,
-        num_layers=seq_layers,
-        dropout=seq_dropout,
-        positive_activation=seq_positive,
-    ).to(device)
-    return CompositeEnergyCritic(
-        base_critic=base_critic,
-        sequence_critic=seq_critic,
-        sequence_weight=seq_weight,
-    ).to(device)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -390,15 +282,11 @@ def _finance_floor_metric(result: dict) -> tuple[str, float]:
     return "econ_oos_sharpe_uplift_min", float("nan")
 
 
-def _objective_track(objective: str) -> str:
-    obj = str(objective).strip().lower()
-    if obj == "self_contrastive":
-        return "encoder"
-    if obj in {"ff", "forward_forward", "forward-forward"} or obj.startswith("ff_"):
-        return "critic"
-    if obj in {"bce", "backprop"}:
-        return "classifier"
-    return "unknown"
+def _dist_ctx(cfg: dict):
+    return cfg.get("distributed_ctx") or _init_distributed_context(
+        requested_device="cpu",
+        distributed=False,
+    )
 
 
 def _uniq_values(values, *, as_int: bool = False) -> list:
@@ -916,56 +804,6 @@ def _metric_value_or_none(row: dict, key: str):
     return float(value)
 
 
-def _objective_primary_metric(row: dict) -> tuple[str, float]:
-    objective = str(row.get("eval_objective", "")).strip().lower()
-    if objective == "self_contrastive":
-        for key in ("eval_sc_gap", "eval_sep", "eval_sc_acc", "eval_acc"):
-            value = _metric_value_or_none(row, key)
-            if value is not None:
-                return key, value
-    if objective in {"bce", "backprop"}:
-        for key in ("eval_auroc", "eval_auprc", "eval_sep", "eval_acc"):
-            value = _metric_value_or_none(row, key)
-            if value is not None:
-                return key, value
-    for key in ("eval_sep", "eval_auroc", "eval_auprc", "eval_acc"):
-        value = _metric_value_or_none(row, key)
-        if value is not None:
-            return key, value
-    return "none", float("nan")
-
-
-def _objective_primary_metric_robust(row: dict) -> tuple[str, float]:
-    objective = str(row.get("eval_objective", "")).strip().lower()
-    if objective == "self_contrastive":
-        for key in ("eval_sc_gap", "eval_sep_agg_min", "eval_sep_agg_mean", "eval_sep"):
-            value = _metric_value_or_none(row, key)
-            if value is not None:
-                return key, value
-        return _objective_primary_metric(row)
-    if objective in {"bce", "backprop"}:
-        for key in ("eval_auroc_agg_min", "eval_auroc_agg_mean", "eval_auroc", "eval_auprc"):
-            value = _metric_value_or_none(row, key)
-            if value is not None:
-                return key, value
-        return _objective_primary_metric(row)
-    for key in ("eval_sep_agg_min", "eval_sep_agg_mean", "eval_sep", "eval_auroc_agg_min", "eval_auroc"):
-        value = _metric_value_or_none(row, key)
-        if value is not None:
-            return key, value
-    return _objective_primary_metric(row)
-
-
-def _attach_primary_metrics(row: dict) -> None:
-    metric_name, metric_value = _objective_primary_metric(row)
-    robust_name, robust_value = _objective_primary_metric_robust(row)
-    row["objective_track"] = _objective_track(row.get("eval_objective", ""))
-    row["primary_eval_metric_name"] = metric_name
-    row["primary_eval_metric"] = metric_value
-    row["primary_eval_metric_robust_name"] = robust_name
-    row["primary_eval_metric_robust"] = robust_value
-
-
 def _mean_std(values: list[float]) -> tuple[float, float]:
     if not values:
         return float("nan"), float("nan")
@@ -1032,10 +870,13 @@ def _aggregate_fold_rows(rows: list[dict]) -> dict:
         "eval_objective",
         "objective_track",
         "primary_eval_metric_name",
+        "primary_metric_family",
         "primary_eval_metric_robust_name",
         "neg_mode_effective",
         "eval_neg_mode_effective",
         "risk_head_enabled_effective",
+        "task_family",
+        "signal_family",
     ):
         if key in first:
             out[key] = first[key]
@@ -1213,6 +1054,7 @@ def _run_ff_trial(
     eval_graphs=None,
     eval_dates_override=None,
 ):
+    dist_ctx = _dist_ctx(cfg)
     if (
         train_graphs is None
         and eval_graphs is None
@@ -1281,7 +1123,8 @@ def _run_ff_trial(
         mp_ctx = cfg.get("multiprocessing_context", "")
         if mp_ctx:
             loader_kwargs["multiprocessing_context"] = mp_ctx
-    loader = DataLoader(train_graphs, **loader_kwargs)
+    train_sampler = _maybe_make_sampler(train_graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+    loader = DataLoader(train_graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, train_sampler))
     eval_batch_size = max(1, int(cfg.get("eval_batch_size", cfg["batch_size"])))
     eval_loader_workers = max(0, int(cfg.get("eval_loader_workers", cfg.get("loader_workers", 0))))
     eval_loader_kwargs = {
@@ -1321,6 +1164,8 @@ def _run_ff_trial(
         residual_edge_detach_features=bool(cfg.get("residual_edge_detach_features", True)),
     ).to(device)
     critic = _build_critic(cfg, hidden_dim=int(cfg["hidden_dim"]), device=device)
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    critic = _maybe_wrap_ddp(critic, dist_ctx)
     optim = _build_optimizer(
         list(model.parameters()) + list(critic.parameters()),
         lr=cfg["lr"],
@@ -1465,6 +1310,7 @@ def _run_ff_trial(
 
     epoch_times = []
     for epoch in range(1, cfg["epochs"] + 1):
+        _set_sampler_epoch(train_sampler, epoch)
         model.train()
         critic.train()
         t0 = time.perf_counter()
@@ -2000,15 +1846,33 @@ def main() -> int:
         default="sweep",
         help="Config section to use (default: sweep, e.g., sweep_layerwise)",
     )
+    parser.add_argument("--distributed", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--backend", default=argparse.SUPPRESS)
+    parser.add_argument("--local-rank", type=int, default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     train_cfg = cfg.get("train", {})
     sweep_cfg = cfg.get(args.section, {})
     build_cfg = cfg.get("build_graphs", {})
+    cluster_cfg = cfg.get("cluster", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
     device_str = str(train_cfg.get("device", "auto"))
+    distributed_enabled = bool(sweep_cfg.get("distributed", False))
+    if hasattr(args, "distributed"):
+        distributed_enabled = bool(getattr(args, "distributed"))
+    distributed_backend = str(sweep_cfg.get("distributed_backend", "nccl"))
+    if hasattr(args, "backend") and str(getattr(args, "backend", "")).strip():
+        distributed_backend = str(getattr(args, "backend"))
+    local_rank = getattr(args, "local_rank", None) if hasattr(args, "local_rank") else None
+    dist_ctx = _init_distributed_context(
+        requested_device=device_str,
+        distributed=distributed_enabled,
+        backend=distributed_backend,
+        local_rank=local_rank,
+    )
+    device_str = dist_ctx.device.type
 
     neg_mode_val = sweep_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))
     if isinstance(neg_mode_val, list):
@@ -2210,6 +2074,9 @@ def main() -> int:
         "econ_regime_high_quantile": float(sweep_cfg.get("econ_regime_high_quantile", 0.67)),
         "econ_loader_batch_size": int(sweep_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(sweep_cfg.get("econ_trading_days", 252)),
+        "distributed": bool(distributed_enabled),
+        "distributed_backend": str(distributed_backend),
+        "distributed_ctx": dist_ctx,
     }
     walk_forward_cap_applied = False
     wf_cap = int(sweep_cfg.get("walk_forward_max_folds_cap", 3))
@@ -3049,17 +2916,27 @@ def main() -> int:
                 r.pop(k, None)
 
     out_path = Path(sweep_cfg.get("out_csv", "runs/experiments/manual/metrics/ff_sweep.csv"))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    for label, path_value in (
+        ("train.graphs", graphs_path),
+        ("sweep.out_csv", out_path),
+        ("train.risk_cache_dir", train_cfg.get("risk_cache_dir", "")),
+        ("train.portfolio_cache_dir", train_cfg.get("portfolio_cache_dir", "")),
+        ("build_graphs.prices", build_cfg.get("prices", "")),
+    ):
+        if str(path_value).strip():
+            ensure_safe_cluster_path(path_value, cluster_cfg=cluster_cfg, label=label)
     import csv
 
-    keys = sorted({k for r in results for k in r.keys()})
-    with out_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in results:
-            w.writerow(r)
+    if dist_ctx.is_primary:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        keys = sorted({k for r in results for k in r.keys()})
+        with out_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for r in results:
+                w.writerow(r)
 
-    if results:
+    if results and dist_ctx.is_primary:
         best = max(results, key=lambda r: _to_float(r.get("rank_value"), float("-inf")))
         best_score = max(results, key=lambda r: r.get("score", float("-inf")))
         top_k = int(sweep_cfg.get("top_k", 10))
@@ -3078,8 +2955,10 @@ def main() -> int:
         print(f"Top {top_k} by composite score:")
         for r in ranked_score[:top_k]:
             print(r)
-    else:
+    elif dist_ctx.is_primary:
         print("No sweep results produced.")
+    _dist_barrier(dist_ctx)
+    _cleanup_distributed()
     return 0
 
 

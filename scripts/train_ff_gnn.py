@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 from pathlib import Path
 import random
@@ -15,7 +14,6 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_mean_pool
 from tqdm import tqdm
@@ -24,11 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from frisk.models import (
-    CompositeEnergyCritic,
-    EnergyCritic,
-    EnergyCriticEnsemble,
     GCNEncoder,
-    SequenceEnergyCritic,
 )
 from frisk.ff import (
     ff_loss,
@@ -40,12 +34,51 @@ from frisk.ff import (
     self_contrastive_loss,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.cluster_runtime import ensure_safe_cluster_path
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
+from frisk.distributed_runtime import (
+    barrier as _dist_barrier,
+    checkpoint_due as _checkpoint_due,
+    cleanup_distributed as _cleanup_distributed,
+    dataloader_kwargs_with_sampler as _dataloader_kwargs_with_sampler,
+    init_distributed_context as _init_distributed_context,
+    install_signal_checkpoint_controller as _install_signal_checkpoint_controller,
+    maybe_make_sampler as _maybe_make_sampler,
+    maybe_wrap_ddp as _maybe_wrap_ddp,
+    reduce_sum as _reduce_sum,
+    set_sampler_epoch as _set_sampler_epoch,
+    unwrap_module as _unwrap_module,
+)
 from frisk.graph_artifact import GraphIndexSequence, load_graph_artifact
 from frisk.econ_eval import resolve_price_ticker
+from frisk.resume import (
+    capture_rng_state,
+    load_module_state_for_resume,
+    load_resume_payload,
+    module_state_for_resume,
+    move_optimizer_state_to_device,
+    restore_rng_state,
+    resume_fingerprint,
+    save_resume_payload,
+)
 from frisk.targets import (
     compute_forward_return_targets_cached,
     compute_risk_targets_cached,
+)
+from frisk.training.critics import build_critic as _build_critic
+from frisk.training.objectives import (
+    compute_multi_horizon_risk_loss as _compute_multi_horizon_risk_loss,
+    compute_portfolio_head_loss as _compute_portfolio_head_loss,
+)
+from frisk.training.runtime import (
+    autocast_if_needed as _autocast_if_needed,
+    build_optimizer as _build_optimizer,
+    configure_cuda_runtime as _configure_cuda_runtime,
+    forward_encoder as _forward_encoder,
+    make_scaler as _make_scaler,
+    optimizer_step as _optimizer_step,
+    parse_amp_dtype as _parse_amp_dtype,
+    state_dict_for_save as _state_dict_for_save,
 )
 
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
@@ -111,6 +144,17 @@ def _load_state_dict_compat(path: str):
     return state
 
 
+def _default_resume_state_path(*candidates) -> str:
+    for candidate in candidates:
+        raw = str(candidate).strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        parent = path if not path.suffix else path.parent
+        return str(parent / "train_resume.pt")
+    return "runs/checkpoints/train_resume.pt"
+
+
 def _is_oom(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "out of memory" in msg or "oom" in msg
@@ -142,13 +186,6 @@ def _to_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
-
-
-def _parse_amp_dtype(value) -> torch.dtype:
-    name = str(value).strip().lower()
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float16
 
 
 def _autotune_cache_key(parts: dict) -> str:
@@ -190,92 +227,6 @@ def _save_autotune_cache(path: str | None, cache: dict[str, int]) -> None:
         cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
     except Exception:
         return
-
-
-def _build_optimizer(params, lr: float, device: torch.device, use_fused: bool):
-    params = tuple(params)
-    if not params:
-        raise ValueError("optimizer got an empty parameter list")
-    kwargs = {}
-    if device.type == "cuda":
-        kwargs["foreach"] = True
-        if use_fused:
-            kwargs["fused"] = True
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("fused", None)
-    try:
-        return Adam(params, lr=lr, **kwargs)
-    except (TypeError, RuntimeError):
-        kwargs.pop("foreach", None)
-        return Adam(params, lr=lr, **kwargs)
-
-
-def _make_scaler(enabled: bool):
-    if not enabled:
-        return None
-    try:
-        return torch.amp.GradScaler("cuda", enabled=True)
-    except Exception:
-        return torch.cuda.amp.GradScaler(enabled=True)
-
-
-def _autocast_if_needed(enabled: bool, dtype: torch.dtype):
-    if not enabled:
-        return contextlib.nullcontext()
-    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
-
-
-def _configure_cuda_runtime(device: torch.device) -> None:
-    if device.type != "cuda":
-        return
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    except Exception:
-        pass
-
-
-def _state_dict_for_save(module: torch.nn.Module):
-    inner = getattr(module, "_orig_mod", module)
-    return inner.state_dict()
-
-
-def _forward_encoder(model, *args, **kwargs):
-    compiler_ns = getattr(torch, "compiler", None)
-    mark_step = (
-        getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
-    )
-    if callable(mark_step):
-        mark_step()
-    return model(*args, **kwargs)
-
-
-def _optimizer_step(
-    optim: torch.optim.Optimizer,
-    loss: torch.Tensor,
-    grad_clip: float,
-    clip_params,
-    scaler,
-) -> None:
-    optim.zero_grad(set_to_none=True)
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        if grad_clip and grad_clip > 0:
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-        scaler.step(optim)
-        scaler.update()
-        return
-    loss.backward()
-    if grad_clip and grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
-    optim.step()
 
 
 def _parse_positive_int_list(value, fallback: int) -> list[int]:
@@ -570,18 +521,6 @@ def _batch_regime_loss_weights(
     return weight / weight.mean().clamp_min(torch.finfo(weight.dtype).eps)
 
 
-def _weighted_mean_loss(loss: torch.Tensor, sample_weight: torch.Tensor | None) -> torch.Tensor:
-    if sample_weight is None:
-        return loss.mean()
-    weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape(-1)
-    val = loss.reshape(-1)
-    if weight.numel() != val.numel():
-        raise ValueError(
-            f"sample_weight shape mismatch: expected {val.numel()} values, got {weight.numel()}"
-        )
-    return (val * weight).sum() / weight.sum().clamp_min(1e-12)
-
-
 def _epoch_graph_subset(
     graphs,
     epoch: int,
@@ -815,122 +754,6 @@ def _compute_forward_return_targets(
     )
 
 
-def _compute_portfolio_head_loss(
-    portfolio_head: torch.nn.Module,
-    embeddings: torch.Tensor,
-    graph_idx,
-    portfolio_targets: list[float | None],
-    device: torch.device,
-    loss_type: str,
-    sample_weight: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    if not portfolio_targets:
-        return None
-    if torch.is_tensor(graph_idx):
-        idx_list = graph_idx.detach().cpu().tolist()
-    elif isinstance(graph_idx, (list, tuple)):
-        idx_list = list(graph_idx)
-    else:
-        idx_list = [int(graph_idx)]
-    target_vals = []
-    for gi in idx_list:
-        if 0 <= gi < len(portfolio_targets):
-            tv = portfolio_targets[gi]
-        else:
-            tv = None
-        target_vals.append(float(tv) if tv is not None else float("nan"))
-    target = torch.tensor(target_vals, dtype=torch.float32, device=device)
-    mask = torch.isfinite(target)
-    if not mask.any():
-        return None
-
-    pred_raw = portfolio_head(embeddings)
-    if pred_raw.ndim == 2 and pred_raw.size(1) == 1:
-        pred_raw = pred_raw.squeeze(1)
-    if pred_raw.ndim != 1:
-        raise RuntimeError(f"portfolio head output shape mismatch: {tuple(pred_raw.shape)}")
-    pred = torch.tanh(pred_raw)
-    weight = None
-    if sample_weight is not None:
-        weight = sample_weight.to(device=device, dtype=pred.dtype).reshape(-1)
-
-    loss_mode = str(loss_type).strip().lower()
-    if loss_mode == "mse":
-        err = (pred[mask] - target[mask]).pow(2)
-        if weight is None:
-            return err.mean()
-        return _weighted_mean_loss(err, weight[mask])
-
-    pnl = pred[mask] * target[mask]
-    if pnl.numel() == 0:
-        return None
-    if pnl.numel() == 1:
-        return -pnl.mean()
-    if weight is None:
-        mean = pnl.mean()
-        std = pnl.std(unbiased=False) + 1e-6
-    else:
-        w = weight[mask]
-        w = w / w.sum().clamp_min(1e-12)
-        mean = (pnl * w).sum()
-        std = torch.sqrt(((pnl - mean).pow(2) * w).sum() + 1e-6)
-    return -(mean / std)
-
-
-def _compute_multi_horizon_risk_loss(
-    risk_head: torch.nn.Module,
-    embeddings: torch.Tensor,
-    graph_idx,
-    risk_targets_by_horizon: list[list[float | None]],
-    device: torch.device,
-    risk_loss_type: str,
-    sample_weight: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    if not risk_targets_by_horizon:
-        return None
-
-    if torch.is_tensor(graph_idx):
-        idx_list = graph_idx.detach().cpu().tolist()
-    elif isinstance(graph_idx, (list, tuple)):
-        idx_list = list(graph_idx)
-    else:
-        idx_list = [int(graph_idx)]
-
-    target_rows = []
-    for gi in idx_list:
-        row = []
-        for horizon_targets in risk_targets_by_horizon:
-            if 0 <= gi < len(horizon_targets):
-                t = horizon_targets[gi]
-            else:
-                t = None
-            row.append(float(t) if t is not None else float("nan"))
-        target_rows.append(row)
-
-    target = torch.tensor(target_rows, dtype=torch.float32, device=device)
-    mask = torch.isfinite(target)
-    if not mask.any():
-        return None
-
-    pred = risk_head(embeddings)
-    if pred.ndim == 1:
-        pred = pred.unsqueeze(-1)
-    if pred.shape != target.shape:
-        raise RuntimeError(
-            f"risk head output shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}"
-        )
-    row_weight = None
-    if sample_weight is not None:
-        row_weight = sample_weight.to(device=device, dtype=pred.dtype).reshape(-1, 1).expand_as(pred)
-    if risk_loss_type == "mse":
-        err = (pred - target).pow(2)
-    else:
-        err = F.smooth_l1_loss(pred, target, reduction="none")
-    if row_weight is None:
-        return err[mask].mean()
-    return _weighted_mean_loss(err[mask], row_weight[mask])
-
-
 def _self_contrastive_batch_loss(
     h_pos: torch.Tensor,
     h_view: torch.Tensor,
@@ -1093,69 +916,6 @@ def _make_negatives(
         factor_start_idx=factor_start_idx,
         factor_dim=factor_dim,
     )
-
-
-def _build_critic(config: dict, hidden_dim: int, device: torch.device):
-    critic_hidden_dim = max(1, int(config.get("critic_hidden_dim", hidden_dim)))
-    critic_num_layers = max(1, int(config.get("critic_num_layers", 2)))
-    critic_dropout = max(0.0, float(config.get("critic_dropout", config.get("dropout", 0.1))))
-    critic_positive = str(config.get("critic_positive_activation", "softplus")).strip().lower()
-    if critic_positive not in {"softplus", "square"}:
-        critic_positive = "softplus"
-
-    ensemble_size = max(1, int(config.get("critic_ensemble_size", 1)))
-    seed_base = int(config.get("seed", 7))
-    seed_stride = max(1, int(config.get("critic_ensemble_seed_stride", 1009)))
-    critics = []
-    for i in range(ensemble_size):
-        if ensemble_size > 1:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(seed_base + i * seed_stride)
-                member = EnergyCritic(
-                    in_dim=hidden_dim,
-                    hidden_dim=critic_hidden_dim,
-                    num_layers=critic_num_layers,
-                    dropout=critic_dropout,
-                    positive_activation=critic_positive,
-                )
-        else:
-            member = EnergyCritic(
-                in_dim=hidden_dim,
-                hidden_dim=critic_hidden_dim,
-                num_layers=critic_num_layers,
-                dropout=critic_dropout,
-                positive_activation=critic_positive,
-            )
-        critics.append(member.to(device))
-
-    if len(critics) == 1:
-        base_critic = critics[0]
-    else:
-        base_critic = EnergyCriticEnsemble(critics=critics).to(device)
-
-    seq_enabled = bool(config.get("sequence_critic_enabled", False))
-    if not seq_enabled:
-        return base_critic
-
-    seq_hidden = max(1, int(config.get("sequence_critic_hidden_dim", hidden_dim)))
-    seq_layers = max(1, int(config.get("sequence_critic_num_layers", 1)))
-    seq_dropout = max(0.0, float(config.get("sequence_critic_dropout", 0.0)))
-    seq_positive = str(config.get("sequence_critic_positive_activation", "softplus")).strip().lower()
-    if seq_positive not in {"softplus", "square"}:
-        seq_positive = "softplus"
-    seq_weight = float(config.get("sequence_critic_weight", 0.0))
-    seq_critic = SequenceEnergyCritic(
-        in_dim=hidden_dim,
-        hidden_dim=seq_hidden,
-        num_layers=seq_layers,
-        dropout=seq_dropout,
-        positive_activation=seq_positive,
-    ).to(device)
-    return CompositeEnergyCritic(
-        base_critic=base_critic,
-        sequence_critic=seq_critic,
-        sequence_weight=seq_weight,
-    ).to(device)
 
 
 def _make_self_contrastive_view(
@@ -1630,6 +1390,13 @@ def main() -> int:
     parser.add_argument("--critic-checkpoint-in", default=argparse.SUPPRESS)
     parser.add_argument("--save-encoder", default=argparse.SUPPRESS)
     parser.add_argument("--save-critic", default=argparse.SUPPRESS)
+    parser.add_argument("--resume-enabled", dest="resume_enabled", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-resume", dest="resume_enabled", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument("--resume-state-path", default=argparse.SUPPRESS)
+    parser.add_argument("--resume-save-every-epochs", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--resume-save-every-minutes", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--resume-on-signal", dest="resume_on_signal", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-resume-on-signal", dest="resume_on_signal", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--critic-hidden-dim", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-num-layers", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-dropout", type=float, default=argparse.SUPPRESS)
@@ -1641,11 +1408,16 @@ def main() -> int:
     parser.add_argument("--torch-compile", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-torch-compile", action="store_true", default=False)
     parser.add_argument("--torch-compile-mode", default=argparse.SUPPRESS)
+    parser.add_argument("--distributed", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--backend", default=argparse.SUPPRESS)
+    parser.add_argument("--nproc-per-node", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--local-rank", type=int, default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     section = cfg.get("train", {})
     build_cfg = cfg.get("build_graphs", {})
+    cluster_cfg = cfg.get("cluster", {})
 
     graphs_path = _get_setting(args, section, "graphs", None)
     if not graphs_path:
@@ -1693,6 +1465,9 @@ def main() -> int:
     neg_mode = _get_setting(args, section, "neg_mode", "shuffle")
     noise_std = _get_setting(args, section, "noise_std", 0.05)
     device_choice = _get_setting(args, section, "device", "auto")
+    distributed_enabled = _to_bool(_get_setting(args, section, "distributed", False))
+    distributed_backend = str(_get_setting(args, section, "distributed_backend", "nccl"))
+    local_rank = getattr(args, "local_rank", None) if hasattr(args, "local_rank") else None
     seed = _get_setting(args, section, "seed", 7)
     loader_workers = _get_setting(args, section, "loader_workers", 0)
     dataloader_persistent = _get_setting(args, section, "dataloader_persistent_workers", True)
@@ -1706,6 +1481,11 @@ def main() -> int:
     save_model = _get_setting(args, section, "save_model", "")
     save_encoder = _get_setting(args, section, "save_encoder", save_model)
     save_critic = _get_setting(args, section, "save_critic", "")
+    resume_enabled = _to_bool(_get_setting(args, section, "resume_enabled", True))
+    resume_state_path = _get_setting(args, section, "resume_state_path", "")
+    resume_save_every_epochs = max(1, int(_get_setting(args, section, "resume_save_every_epochs", 1)))
+    resume_save_every_minutes = float(_get_setting(args, section, "resume_save_every_minutes", 55.0))
+    resume_on_signal = _to_bool(_get_setting(args, section, "resume_on_signal", True))
     encoder_checkpoint_in = _get_setting(args, section, "encoder_checkpoint_in", "")
     critic_checkpoint_in = _get_setting(args, section, "critic_checkpoint_in", "")
     strict_component_split = _to_bool(
@@ -2084,6 +1864,20 @@ def main() -> int:
     )
     if epoch_graph_mode not in {"rotate", "random", "recent_bias"}:
         epoch_graph_mode = "rotate"
+    if not str(resume_state_path).strip():
+        resume_state_path = _default_resume_state_path(
+            save_encoder,
+            save_model,
+            save_critic,
+            log_csv,
+            plot_path,
+        )
+    if str(resume_state_path).strip():
+        ensure_safe_cluster_path(
+            resume_state_path,
+            cluster_cfg=cluster_cfg,
+            label="train.resume_state_path",
+        )
 
     if strict_component_split and neg_mode == "self_contrastive":
         if "time_flip" in self_contrastive_view_mode:
@@ -2250,12 +2044,19 @@ def main() -> int:
             adversarial_hub_weight_scale=hall_attack_hub_weight_scale,
         )
 
+    dist_ctx = _init_distributed_context(
+        requested_device=device_choice,
+        distributed=distributed_enabled,
+        backend=distributed_backend,
+        local_rank=local_rank,
+    )
+    seed = int(seed) + int(dist_ctx.rank)
     set_seed(seed)
     if torch_num_threads:
         torch.set_num_threads(int(torch_num_threads))
     if torch_num_interop_threads:
         torch.set_num_interop_threads(int(torch_num_interop_threads))
-    device = resolve_device(device_choice)
+    device = dist_ctx.device
     _configure_cuda_runtime(device)
     amp_dtype = _parse_amp_dtype(amp_dtype_raw)
     amp_enabled = bool(amp_requested and device.type == "cuda")
@@ -2726,10 +2527,38 @@ def main() -> int:
             print(f"goodness_temp={t} -> mean_goodness={g:.4f}")
         return 0
 
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    critic = _maybe_wrap_ddp(critic, dist_ctx)
+    if risk_head is not None:
+        risk_head = _maybe_wrap_ddp(risk_head, dist_ctx)
+    if portfolio_head is not None:
+        portfolio_head = _maybe_wrap_ddp(portfolio_head, dist_ctx)
+
     hall_cfg = _hall_cfg_for_epoch(hall_curr_start if hall_curr_enabled else 1)
     train_shuffle = True
     if bool(sequence_critic_enabled) and bool(sequence_critic_force_chrono):
         train_shuffle = False
+
+    for label, path_value in (
+        ("train.graphs", graphs_path),
+        ("train.log_csv", log_csv),
+        ("train.plot_path", plot_path),
+        ("train.save_model", save_model),
+        ("train.save_encoder", save_encoder),
+        ("train.save_critic", save_critic),
+        ("train.resume_state_path", resume_state_path),
+        ("train.risk_cache_dir", risk_cache_dir),
+        ("train.portfolio_cache_dir", portfolio_cache_dir),
+        ("train.auto_tune_cache_path", auto_tune_cache_path),
+        ("build_graphs.prices", build_cfg.get("prices", "")),
+    ):
+        if str(path_value).strip():
+            ensure_safe_cluster_path(path_value, cluster_cfg=cluster_cfg, label=label)
+
+    if dist_ctx.enabled and auto_tune:
+        if dist_ctx.is_primary:
+            print("auto_tune_batch disabled for distributed runs; using configured batch_size.")
+        auto_tune = False
 
     if auto_tune and device.type in ("cuda", "mps"):
         best_bs = None
@@ -2870,8 +2699,10 @@ def main() -> int:
         if dataloader_mp_context:
             loader_kwargs["multiprocessing_context"] = dataloader_mp_context
     base_loader = None
+    base_sampler = None
     if epoch_graph_fraction >= 1.0:
-        base_loader = DataLoader(graphs, **loader_kwargs)
+        base_sampler = _maybe_make_sampler(graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+        base_loader = DataLoader(graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, base_sampler))
     optim_params = [p for p in model.parameters() if p.requires_grad]
     optim_params.extend(p for p in critic.parameters() if p.requires_grad)
     if risk_head is not None:
@@ -2882,31 +2713,171 @@ def main() -> int:
         raise ValueError("No trainable parameters. Check freeze_encoder/freeze_critic settings.")
     optim = _build_optimizer(optim_params, lr=lr, device=device, use_fused=fused_optimizer)
 
-    if log_csv:
+    resume_state_path = str(Path(str(resume_state_path)).expanduser()) if resume_enabled else ""
+    resume_sig = {
+        "script": "train_ff_gnn",
+        "graphs_path": str(graphs_path),
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+        "graph_stride": int(graph_stride),
+        "graph_limit": int(graph_limit),
+        "graph_limit_keep_recent": bool(graph_limit_keep_recent),
+        "epoch_graph_fraction": float(epoch_graph_fraction),
+        "epoch_graph_min": int(epoch_graph_min),
+        "epoch_graph_mode": str(epoch_graph_mode),
+        "seed": int(seed),
+        "hidden_dim": int(hidden_dim),
+        "num_layers": int(num_layers),
+        "dropout": float(dropout),
+        "lr": float(lr),
+        "neg_mode": str(neg_mode),
+        "ff_layerwise": bool(ff_layerwise),
+        "ff_blockwise": bool(ff_blockwise),
+        "ff_block_size": int(ff_block_size),
+        "ff_multiscale": bool(ff_multiscale),
+        "risk_head_enabled": bool(risk_head is not None),
+        "portfolio_head_enabled": bool(portfolio_head is not None),
+        "encoder_checkpoint_in": str(encoder_checkpoint_in),
+        "critic_checkpoint_in": str(critic_checkpoint_in),
+    }
+    resume_key = resume_fingerprint(resume_sig)
+    resume_payload = (
+        load_resume_payload(resume_state_path, expected_fingerprint=resume_key)
+        if resume_enabled and resume_state_path
+        else None
+    )
+    start_epoch = 1
+    if resume_enabled and resume_state_path:
+        print(f"resume_state_path: {resume_state_path}")
+
+    def _resume_metadata(epoch_completed: int) -> dict:
+        return {
+            "epoch_completed": int(epoch_completed),
+            "goodness_target": float(goodness_target),
+            "neg_mix_end": float(neg_mix_end),
+            "neg_gate_margin": float(neg_gate_margin),
+            "hall_steps": int(hall_steps),
+            "hall_lr": float(hall_lr),
+            "hall_l2": float(hall_l2),
+            "hall_mean": float(hall_mean),
+            "hall_std": float(hall_std),
+            "hall_corr": float(hall_corr),
+            "hall_node_fraction": float(hall_node_fraction),
+            "hall_node_min": int(hall_node_min),
+            "hall_min_delta": float(hall_min_delta),
+            "ff_dual_neg_every_n_batches": int(ff_dual_neg_every_n_batches),
+        }
+
+    def _save_train_resume(status: str, epoch_completed: int) -> None:
+        if not resume_enabled or not resume_state_path or not dist_ctx.is_primary:
+            return
+        model_states = {
+            "model": module_state_for_resume(_unwrap_module(model)),
+            "critic": module_state_for_resume(_unwrap_module(critic)),
+        }
+        if risk_head is not None:
+            model_states["risk_head"] = module_state_for_resume(_unwrap_module(risk_head))
+        if portfolio_head is not None:
+            model_states["portfolio_head"] = module_state_for_resume(_unwrap_module(portfolio_head))
+        save_resume_payload(
+            resume_state_path,
+            fingerprint=resume_key,
+            status=status,
+            epoch_completed=int(epoch_completed),
+            model_states=model_states,
+            optimizer_state=optim.state_dict(),
+            scaler_state=scaler.state_dict() if scaler is not None else None,
+            metadata=_resume_metadata(epoch_completed),
+            rng_state=capture_rng_state(),
+        )
+
+    if resume_payload:
+        model_states = resume_payload.get("model_states", {})
+        if isinstance(model_states, dict):
+            if "model" in model_states:
+                load_module_state_for_resume(_unwrap_module(model), model_states["model"])
+            if "critic" in model_states:
+                try:
+                    load_module_state_for_resume(_unwrap_module(critic), model_states["critic"], strict=True)
+                except Exception:
+                    load_module_state_for_resume(_unwrap_module(critic), model_states["critic"], strict=False)
+            if risk_head is not None and "risk_head" in model_states:
+                load_module_state_for_resume(_unwrap_module(risk_head), model_states["risk_head"], strict=False)
+            if portfolio_head is not None and "portfolio_head" in model_states:
+                load_module_state_for_resume(
+                    _unwrap_module(portfolio_head),
+                    model_states["portfolio_head"],
+                    strict=False,
+                )
+        optim_state = resume_payload.get("optimizer_state")
+        if isinstance(optim_state, dict):
+            optim.load_state_dict(optim_state)
+            move_optimizer_state_to_device(optim, device)
+        scaler_state = resume_payload.get("scaler_state")
+        if scaler is not None and isinstance(scaler_state, dict):
+            scaler.load_state_dict(scaler_state)
+        resume_meta = resume_payload.get("metadata", {}) if isinstance(resume_payload.get("metadata"), dict) else {}
+        goodness_target = float(resume_meta.get("goodness_target", goodness_target))
+        neg_mix_end = float(resume_meta.get("neg_mix_end", neg_mix_end))
+        neg_gate_margin = float(resume_meta.get("neg_gate_margin", neg_gate_margin))
+        hall_steps = int(resume_meta.get("hall_steps", hall_steps))
+        hall_lr = float(resume_meta.get("hall_lr", hall_lr))
+        hall_l2 = float(resume_meta.get("hall_l2", hall_l2))
+        hall_mean = float(resume_meta.get("hall_mean", hall_mean))
+        hall_std = float(resume_meta.get("hall_std", hall_std))
+        hall_corr = float(resume_meta.get("hall_corr", hall_corr))
+        hall_node_fraction = float(resume_meta.get("hall_node_fraction", hall_node_fraction))
+        hall_node_min = int(resume_meta.get("hall_node_min", hall_node_min))
+        hall_min_delta = float(resume_meta.get("hall_min_delta", hall_min_delta))
+        ff_dual_neg_every_n_batches = int(
+            resume_meta.get("ff_dual_neg_every_n_batches", ff_dual_neg_every_n_batches)
+        )
+        _sync_hall_curriculum_end()
+        restore_rng_state(resume_payload.get("rng_state"))
+        saved_epoch = max(0, int(resume_payload.get("epoch_completed", 0)))
+        resume_status = str(resume_payload.get("status", "in_progress")).strip().lower()
+        start_epoch = saved_epoch + 1
+        if resume_status == "completed":
+            start_epoch = int(epochs) + 1
+        print(
+            f"resume: status={resume_status} epoch_completed={saved_epoch} "
+            f"next_epoch={min(start_epoch, int(epochs) + 1)}"
+        )
+
+    signal_controller = _install_signal_checkpoint_controller(enabled=resume_enabled and resume_on_signal)
+    last_resume_save_at = time.time() if resume_payload is not None else None
+
+    if log_csv and dist_ctx.is_primary:
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w") as f:
-            f.write(
-                "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
-                "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
-                "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
-                "hall_node_fraction_used,rank_aux_loss,"
-                "rank_corr_loss,"
-                "dual_neg_every_n_batches_used,dual_neg_ratio,regime_weight_mean,"
-                "time_neg_gen_share,time_hallucinate_share,time_forward_pos_share,time_forward_neg_share,"
-                "time_loss_terms_share,time_optimizer_share,"
-                "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
-                "time_loss_terms_s,time_optimizer_s\n"
-            )
+        should_init_log = True
+        if resume_payload is not None and log_path.exists() and int(resume_payload.get("epoch_completed", 0)) > 0:
+            should_init_log = False
+        if should_init_log:
+            with log_path.open("w") as f:
+                f.write(
+                    "epoch,loss,g_pos,g_neg,hallucinate_ratio,gate_ratio,hall_hardness,"
+                    "hall_close_ratio,energy_penalty,risk_loss,portfolio_loss,dist_forward_loss,goodness_target_used,"
+                    "neg_mix_end_used,neg_gate_margin_used,hall_lr_used,hall_steps_used,"
+                    "hall_node_fraction_used,rank_aux_loss,"
+                    "rank_corr_loss,"
+                    "dual_neg_every_n_batches_used,dual_neg_ratio,regime_weight_mean,"
+                    "time_neg_gen_share,time_hallucinate_share,time_forward_pos_share,time_forward_neg_share,"
+                    "time_loss_terms_share,time_optimizer_share,"
+                    "time_neg_gen_s,time_hallucinate_s,time_forward_pos_s,time_forward_neg_s,"
+                    "time_loss_terms_s,time_optimizer_s\n"
+                )
 
     epoch_iter = tqdm(
-        range(1, epochs + 1),
+        range(start_epoch, epochs + 1),
         desc="Training",
         unit="epoch",
         dynamic_ncols=True,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        disable=not dist_ctx.is_primary,
     )
     for epoch in epoch_iter:
+        _set_sampler_epoch(base_sampler, epoch)
         model.train()
         critic_train_mode = any(p.requires_grad for p in critic.parameters()) or bool(
             sequence_critic_enabled
@@ -2979,9 +2950,18 @@ def main() -> int:
                 regime_change_boost=epoch_graph_regime_change_boost,
                 seed=int(seed) + int(epoch) * 1009,
             )
-            epoch_loader = DataLoader(epoch_graphs, **loader_kwargs)
+            epoch_sampler = _maybe_make_sampler(epoch_graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+            _set_sampler_epoch(epoch_sampler, epoch)
+            epoch_loader = DataLoader(
+                epoch_graphs,
+                **_dataloader_kwargs_with_sampler(loader_kwargs, epoch_sampler),
+            )
 
+        stop_after_epoch = False
         for batch in epoch_loader:
+            if signal_controller.requested:
+                stop_after_epoch = True
+                break
             try:
                 batch = batch.to(device)
             except Exception as exc:
@@ -4160,17 +4140,42 @@ def main() -> int:
         hall_close_ratio = hall_close_count / hall_close_total if hall_close_total else 0.0
         hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
         energy_penalty_epoch = energy_penalty_sum / batches if batches else 0.0
-        risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
-        portfolio_loss_epoch = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
-        dist_forward_epoch = dist_forward_sum / batches if batches else 0.0
-        rank_aux_epoch = rank_aux_sum / batches if batches else 0.0
-        rank_corr_epoch = rank_corr_sum / batches if batches else 0.0
-        time_neg_gen_epoch = timing_totals["neg_gen"] / batches if batches else 0.0
-        time_hall_epoch = timing_totals["hallucinate"] / batches if batches else 0.0
-        time_fwd_pos_epoch = timing_totals["forward_pos"] / batches if batches else 0.0
-        time_fwd_neg_epoch = timing_totals["forward_neg"] / batches if batches else 0.0
-        time_loss_epoch = timing_totals["loss_terms"] / batches if batches else 0.0
-        time_opt_epoch = timing_totals["optimizer"] / batches if batches else 0.0
+        global_batches = max(1.0, _reduce_sum(batches, dist_ctx))
+        global_risk_batches = _reduce_sum(risk_batches, dist_ctx)
+        global_portfolio_batches = _reduce_sum(portfolio_batches, dist_ctx)
+        total_loss = _reduce_sum(total_loss, dist_ctx)
+        total_pos = _reduce_sum(total_pos, dist_ctx)
+        total_neg = _reduce_sum(total_neg, dist_ctx)
+        risk_loss_sum = _reduce_sum(risk_loss_sum, dist_ctx)
+        portfolio_loss_sum = _reduce_sum(portfolio_loss_sum, dist_ctx)
+        dist_forward_sum = _reduce_sum(dist_forward_sum, dist_ctx)
+        rank_aux_sum = _reduce_sum(rank_aux_sum, dist_ctx)
+        rank_corr_sum = _reduce_sum(rank_corr_sum, dist_ctx)
+        regime_weight_sum = _reduce_sum(regime_weight_sum, dist_ctx)
+        dual_neg_batches = _reduce_sum(dual_neg_batches, dist_ctx)
+        hall_used = _reduce_sum(hall_used, dist_ctx)
+        total_used = _reduce_sum(total_used, dist_ctx)
+        hall_gated = _reduce_sum(hall_gated, dist_ctx)
+        hall_close_count = _reduce_sum(hall_close_count, dist_ctx)
+        hall_close_total = _reduce_sum(hall_close_total, dist_ctx)
+        hall_hardness_sum = _reduce_sum(hall_hardness_sum, dist_ctx)
+        hall_hardness_count = _reduce_sum(hall_hardness_count, dist_ctx)
+        for timing_key in timing_totals:
+            timing_totals[timing_key] = _reduce_sum(timing_totals[timing_key], dist_ctx)
+
+        risk_loss_epoch = risk_loss_sum / global_risk_batches if global_risk_batches else 0.0
+        portfolio_loss_epoch = (
+            portfolio_loss_sum / global_portfolio_batches if global_portfolio_batches else 0.0
+        )
+        dist_forward_epoch = dist_forward_sum / global_batches if global_batches else 0.0
+        rank_aux_epoch = rank_aux_sum / global_batches if global_batches else 0.0
+        rank_corr_epoch = rank_corr_sum / global_batches if global_batches else 0.0
+        time_neg_gen_epoch = timing_totals["neg_gen"] / global_batches if global_batches else 0.0
+        time_hall_epoch = timing_totals["hallucinate"] / global_batches if global_batches else 0.0
+        time_fwd_pos_epoch = timing_totals["forward_pos"] / global_batches if global_batches else 0.0
+        time_fwd_neg_epoch = timing_totals["forward_neg"] / global_batches if global_batches else 0.0
+        time_loss_epoch = timing_totals["loss_terms"] / global_batches if global_batches else 0.0
+        time_opt_epoch = timing_totals["optimizer"] / global_batches if global_batches else 0.0
         timing_total_epoch = sum(max(0.0, float(v)) for v in timing_totals.values())
         time_neg_gen_share = timing_totals["neg_gen"] / timing_total_epoch if timing_total_epoch else 0.0
         time_hall_share = timing_totals["hallucinate"] / timing_total_epoch if timing_total_epoch else 0.0
@@ -4178,15 +4183,15 @@ def main() -> int:
         time_fwd_neg_share = timing_totals["forward_neg"] / timing_total_epoch if timing_total_epoch else 0.0
         time_loss_share = timing_totals["loss_terms"] / timing_total_epoch if timing_total_epoch else 0.0
         time_opt_share = timing_totals["optimizer"] / timing_total_epoch if timing_total_epoch else 0.0
-        dual_neg_ratio = dual_neg_batches / batches if batches else 0.0
-        regime_weight_mean_epoch = regime_weight_sum / batches if batches else 0.0
-        epoch_loss = total_loss / batches if batches else 0.0
-        epoch_pos = total_pos / batches if batches else 0.0
-        epoch_neg = total_neg / batches if batches else 0.0
+        dual_neg_ratio = dual_neg_batches / global_batches if global_batches else 0.0
+        regime_weight_mean_epoch = regime_weight_sum / global_batches if global_batches else 0.0
+        epoch_loss = total_loss / global_batches if global_batches else 0.0
+        epoch_pos = total_pos / global_batches if global_batches else 0.0
+        epoch_neg = total_neg / global_batches if global_batches else 0.0
         epoch_sep = epoch_pos - epoch_neg
 
         target_updated = False
-        if adaptive_target_enabled and batches and epoch >= adaptive_target_warmup:
+        if adaptive_target_enabled and global_batches and epoch >= adaptive_target_warmup:
             midpoint = 0.5 * (epoch_pos + epoch_neg) + adaptive_target_margin
             new_target = _clamp(
                 (1.0 - adaptive_target_alpha) * goodness_target
@@ -4327,7 +4332,7 @@ def main() -> int:
             adapt_tokens.append("target")
         if dual_neg_event:
             adapt_tokens.append(dual_neg_event)
-        if adapt_tokens:
+        if adapt_tokens and dist_ctx.is_primary:
             print(
                 f"epoch {epoch}: adapt={','.join(adapt_tokens)} "
                 f"target={goodness_target:.3f} mix_end={neg_mix_end:.3f} "
@@ -4335,20 +4340,21 @@ def main() -> int:
                 f"hall_lr={hall_lr:.4f} hall_node_fraction={hall_node_fraction:.2f} "
                 f"dual_neg_every={ff_dual_neg_every_n_batches}"
             )
-        print(
+        if dist_ctx.is_primary:
+            print(
             f"epoch {epoch} timing: neg_gen={time_neg_gen_share:.1%} "
             f"fwd_pos={time_fwd_pos_share:.1%} fwd_neg={time_fwd_neg_share:.1%} "
             f"loss={time_loss_share:.1%} opt={time_opt_share:.1%} "
             f"dual_neg_ratio={dual_neg_ratio:.2f} dual_neg_every={epoch_dual_neg_every}"
-        )
-        epoch_iter.set_postfix(
-            loss=f"{epoch_loss:.3f}",
-            sep=f"{epoch_sep:.3f}",
-            dneg=f"{epoch_dual_neg_every}",
-            nshare=f"{time_fwd_neg_share:.0%}",
-        )
+            )
+            epoch_iter.set_postfix(
+                loss=f"{epoch_loss:.3f}",
+                sep=f"{epoch_sep:.3f}",
+                dneg=f"{epoch_dual_neg_every}",
+                nshare=f"{time_fwd_neg_share:.0%}",
+            )
 
-        if log_csv:
+        if log_csv and dist_ctx.is_primary:
             with Path(log_csv).open("a") as f:
                 f.write(
                     f"{epoch},{epoch_loss:.6f},"
@@ -4368,22 +4374,41 @@ def main() -> int:
                     f"{time_loss_epoch:.6f},{time_opt_epoch:.6f}\n"
                 )
 
-    if save_encoder:
+        if (
+            epoch % resume_save_every_epochs == 0
+            or epoch == epochs
+            or _checkpoint_due(
+                last_saved_at=last_resume_save_at,
+                every_minutes=resume_save_every_minutes,
+                signal_controller=signal_controller,
+            )
+        ):
+            _save_train_resume("in_progress", epoch)
+            last_resume_save_at = time.time()
+        if stop_after_epoch:
+            _save_train_resume("interrupted", max(0, epoch - 1))
+            break
+
+    if not signal_controller.requested:
+        _save_train_resume("completed", epochs)
+    _dist_barrier(dist_ctx)
+
+    if save_encoder and dist_ctx.is_primary:
         save_path = Path(str(save_encoder))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(_state_dict_for_save(model), save_path)
-    elif save_model:
+        torch.save(_state_dict_for_save(_unwrap_module(model)), save_path)
+    elif save_model and dist_ctx.is_primary:
         # Backward-compat: if only save_model is provided, treat it as encoder checkpoint output.
         save_path = Path(str(save_model))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(_state_dict_for_save(model), save_path)
+        torch.save(_state_dict_for_save(_unwrap_module(model)), save_path)
 
-    if save_critic:
+    if save_critic and dist_ctx.is_primary:
         save_path = Path(str(save_critic))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(_state_dict_for_save(critic), save_path)
+        torch.save(_state_dict_for_save(_unwrap_module(critic)), save_path)
 
-    if log_csv and plot_path:
+    if log_csv and plot_path and dist_ctx.is_primary:
         try:
             import matplotlib.pyplot as plt
             import pandas as pd
@@ -4422,7 +4447,10 @@ def main() -> int:
         except Exception as exc:
             print(f"Plotting failed: {exc}")
 
-    return 0
+    exit_code = 0 if not signal_controller.requested else 2
+    _dist_barrier(dist_ctx)
+    _cleanup_distributed()
+    return exit_code
 
 
 if __name__ == "__main__":

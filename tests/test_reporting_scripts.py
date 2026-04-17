@@ -68,6 +68,20 @@ def test_dual_score_primary_metric_uses_robust_metric_when_present():
     assert value == pytest.approx(0.86)
 
 
+def test_dual_score_primary_metric_prefers_econ_metric_for_financial_track():
+    mod = _load_script("dual_score_report.py")
+    metric, value = mod._primary_metric(
+        {
+            "task_family": "financial_value",
+            "primary_metric_family": "economics",
+            "econ_oos_sharpe_uplift_min": "0.21",
+            "eval_return_corr": "0.44",
+        }
+    )
+    assert metric == "econ_oos_sharpe_uplift_min"
+    assert value == pytest.approx(0.21)
+
+
 def test_promote_auto_rank_prefers_robust_metric():
     mod = _load_script("promote_sweep_best.py")
     rows = [
