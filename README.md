@@ -218,6 +218,72 @@ The notebooks are now intentionally thin wrappers over shared helpers in `src/fr
 - streamed shell execution with per-command logs
 - TOML runtime-config overlay writing
 - CSV merge helpers for per-mode benchmark outputs
+
+## Emory Turing Workflow
+Use Turing as a scratch-first, Slurm-first environment. Do not run jobs from `/home/<netid>`.
+
+Recommended scratch layout:
+- `/local/scratch/<netid>/forward-risk-manager/repo`
+- `/local/scratch/<netid>/forward-risk-manager/data`
+- `/local/scratch/<netid>/forward-risk-manager/runs`
+- `/local/scratch/<netid>/forward-risk-manager/.cache`
+- `/local/scratch/<netid>/forward-risk-manager/logs`
+
+One-time environment setup on Turing:
+```bash
+mkdir -p /local/scratch/<netid>/forward-risk-manager/{repo,data,runs,.cache,logs}
+cd /local/scratch/<netid>/forward-risk-manager/repo
+git clone <your-remote-url> .
+python3 -m venv /local/scratch/<netid>/forward-risk-manager/venv
+source /local/scratch/<netid>/forward-risk-manager/venv/bin/activate
+export XDG_CACHE_HOME=/local/scratch/<netid>/forward-risk-manager/.cache
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+pip install -e .
+```
+
+Stage the graph artifact directly to scratch:
+```bash
+scp -J <netid>@lab0z.mathcs.emory.edu \
+  /path/to/local/graphs_master_ff_rich.pt \
+  <netid>@turinglogin.mathcs.emory.edu:/local/scratch/<netid>/forward-risk-manager/data/processed/
+```
+
+Prepare a scratch-local runtime config:
+```bash
+python scripts/prepare_turing_run.py \
+  --base-config configs/default.toml \
+  --cluster-config configs/turing.toml \
+  --runtime-config /local/scratch/<netid>/forward-risk-manager/runs/runtime_turing.toml \
+  --netid <netid>
+```
+
+Shard the graph once on-cluster if needed:
+```bash
+sbatch slurm/shard_graph.sbatch
+```
+
+Run a smoke test:
+```bash
+sbatch slurm/smoke_test.sbatch
+```
+
+Run the main 2-GPU jobs:
+```bash
+sbatch slurm/train_2gpu.sbatch
+sbatch slurm/benchmark_2gpu.sbatch
+sbatch slurm/sweep_2gpu.sbatch
+```
+
+Monitor jobs:
+```bash
+squeue -u <netid>
+sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS
+tail -f /local/scratch/<netid>/forward-risk-manager/logs/slurm-<jobid>.out
+```
+
+Optional lightweight notebook/viewer on Turing:
+- `notebooks/turing_remote_runbook.ipynb`
 - source fingerprinting and run-step manifest helpers
 
 Notebook hygiene is handled with:

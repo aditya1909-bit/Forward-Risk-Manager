@@ -33,7 +33,18 @@ from frisk.ff import (
     self_contrastive_retrieval_accuracy,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.cluster_runtime import ensure_safe_cluster_path
 from frisk.device import resolve_device
+from frisk.distributed_runtime import (
+    barrier as _dist_barrier,
+    cleanup_distributed as _cleanup_distributed,
+    dataloader_kwargs_with_sampler as _dataloader_kwargs_with_sampler,
+    init_distributed_context as _init_distributed_context,
+    maybe_make_sampler as _maybe_make_sampler,
+    maybe_wrap_ddp as _maybe_wrap_ddp,
+    set_sampler_epoch as _set_sampler_epoch,
+    unwrap_module as _unwrap_module,
+)
 from frisk.graph_artifact import load_graph_artifact
 from frisk.eval_metrics import ff_binary_metrics
 from frisk.econ_eval import (
@@ -269,6 +280,13 @@ def _finance_floor_metric(result: dict) -> tuple[str, float]:
         if np.isfinite(val):
             return key, val
     return "econ_oos_sharpe_uplift_min", float("nan")
+
+
+def _dist_ctx(cfg: dict):
+    return cfg.get("distributed_ctx") or _init_distributed_context(
+        requested_device="cpu",
+        distributed=False,
+    )
 
 
 def _uniq_values(values, *, as_int: bool = False) -> list:
@@ -1036,6 +1054,7 @@ def _run_ff_trial(
     eval_graphs=None,
     eval_dates_override=None,
 ):
+    dist_ctx = _dist_ctx(cfg)
     if (
         train_graphs is None
         and eval_graphs is None
@@ -1104,7 +1123,8 @@ def _run_ff_trial(
         mp_ctx = cfg.get("multiprocessing_context", "")
         if mp_ctx:
             loader_kwargs["multiprocessing_context"] = mp_ctx
-    loader = DataLoader(train_graphs, **loader_kwargs)
+    train_sampler = _maybe_make_sampler(train_graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+    loader = DataLoader(train_graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, train_sampler))
     eval_batch_size = max(1, int(cfg.get("eval_batch_size", cfg["batch_size"])))
     eval_loader_workers = max(0, int(cfg.get("eval_loader_workers", cfg.get("loader_workers", 0))))
     eval_loader_kwargs = {
@@ -1144,6 +1164,8 @@ def _run_ff_trial(
         residual_edge_detach_features=bool(cfg.get("residual_edge_detach_features", True)),
     ).to(device)
     critic = _build_critic(cfg, hidden_dim=int(cfg["hidden_dim"]), device=device)
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    critic = _maybe_wrap_ddp(critic, dist_ctx)
     optim = _build_optimizer(
         list(model.parameters()) + list(critic.parameters()),
         lr=cfg["lr"],
@@ -1288,6 +1310,7 @@ def _run_ff_trial(
 
     epoch_times = []
     for epoch in range(1, cfg["epochs"] + 1):
+        _set_sampler_epoch(train_sampler, epoch)
         model.train()
         critic.train()
         t0 = time.perf_counter()
@@ -1823,15 +1846,33 @@ def main() -> int:
         default="sweep",
         help="Config section to use (default: sweep, e.g., sweep_layerwise)",
     )
+    parser.add_argument("--distributed", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--backend", default=argparse.SUPPRESS)
+    parser.add_argument("--local-rank", type=int, default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     train_cfg = cfg.get("train", {})
     sweep_cfg = cfg.get(args.section, {})
     build_cfg = cfg.get("build_graphs", {})
+    cluster_cfg = cfg.get("cluster", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
     device_str = str(train_cfg.get("device", "auto"))
+    distributed_enabled = bool(sweep_cfg.get("distributed", False))
+    if hasattr(args, "distributed"):
+        distributed_enabled = bool(getattr(args, "distributed"))
+    distributed_backend = str(sweep_cfg.get("distributed_backend", "nccl"))
+    if hasattr(args, "backend") and str(getattr(args, "backend", "")).strip():
+        distributed_backend = str(getattr(args, "backend"))
+    local_rank = getattr(args, "local_rank", None) if hasattr(args, "local_rank") else None
+    dist_ctx = _init_distributed_context(
+        requested_device=device_str,
+        distributed=distributed_enabled,
+        backend=distributed_backend,
+        local_rank=local_rank,
+    )
+    device_str = dist_ctx.device.type
 
     neg_mode_val = sweep_cfg.get("neg_mode", train_cfg.get("neg_mode", "shuffle"))
     if isinstance(neg_mode_val, list):
@@ -2033,6 +2074,9 @@ def main() -> int:
         "econ_regime_high_quantile": float(sweep_cfg.get("econ_regime_high_quantile", 0.67)),
         "econ_loader_batch_size": int(sweep_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(sweep_cfg.get("econ_trading_days", 252)),
+        "distributed": bool(distributed_enabled),
+        "distributed_backend": str(distributed_backend),
+        "distributed_ctx": dist_ctx,
     }
     walk_forward_cap_applied = False
     wf_cap = int(sweep_cfg.get("walk_forward_max_folds_cap", 3))
@@ -2872,17 +2916,27 @@ def main() -> int:
                 r.pop(k, None)
 
     out_path = Path(sweep_cfg.get("out_csv", "runs/experiments/manual/metrics/ff_sweep.csv"))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    for label, path_value in (
+        ("train.graphs", graphs_path),
+        ("sweep.out_csv", out_path),
+        ("train.risk_cache_dir", train_cfg.get("risk_cache_dir", "")),
+        ("train.portfolio_cache_dir", train_cfg.get("portfolio_cache_dir", "")),
+        ("build_graphs.prices", build_cfg.get("prices", "")),
+    ):
+        if str(path_value).strip():
+            ensure_safe_cluster_path(path_value, cluster_cfg=cluster_cfg, label=label)
     import csv
 
-    keys = sorted({k for r in results for k in r.keys()})
-    with out_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in results:
-            w.writerow(r)
+    if dist_ctx.is_primary:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        keys = sorted({k for r in results for k in r.keys()})
+        with out_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for r in results:
+                w.writerow(r)
 
-    if results:
+    if results and dist_ctx.is_primary:
         best = max(results, key=lambda r: _to_float(r.get("rank_value"), float("-inf")))
         best_score = max(results, key=lambda r: r.get("score", float("-inf")))
         top_k = int(sweep_cfg.get("top_k", 10))
@@ -2901,8 +2955,10 @@ def main() -> int:
         print(f"Top {top_k} by composite score:")
         for r in ranked_score[:top_k]:
             print(r)
-    else:
+    elif dist_ctx.is_primary:
         print("No sweep results produced.")
+    _dist_barrier(dist_ctx)
+    _cleanup_distributed()
     return 0
 
 

@@ -34,7 +34,20 @@ from frisk.ff import (
     self_contrastive_retrieval_accuracy,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.cluster_runtime import ensure_safe_cluster_path
 from frisk.device import resolve_device
+from frisk.distributed_runtime import (
+    barrier as _dist_barrier,
+    checkpoint_due as _checkpoint_due,
+    cleanup_distributed as _cleanup_distributed,
+    dataloader_kwargs_with_sampler as _dataloader_kwargs_with_sampler,
+    init_distributed_context as _init_distributed_context,
+    install_signal_checkpoint_controller as _install_signal_checkpoint_controller,
+    maybe_make_sampler as _maybe_make_sampler,
+    maybe_wrap_ddp as _maybe_wrap_ddp,
+    set_sampler_epoch as _set_sampler_epoch,
+    unwrap_module as _unwrap_module,
+)
 from frisk.eval_metrics import (
     binary_auprc,
     binary_auroc,
@@ -661,6 +674,13 @@ def _aggregate_seed_results(
     out["retry_applied"] = bool(any(bool(r.get("retry_applied", False)) for r in successful_rows))
     out["safe_mode_applied"] = bool(any(bool(r.get("safe_mode_applied", False)) for r in successful_rows))
     return out
+
+
+def _dist_ctx(config: dict):
+    return config.get("distributed_ctx") or _init_distributed_context(
+        requested_device="cpu",
+        distributed=False,
+    )
 
 
 def _compute_econ_metrics_for_eval(
@@ -1337,6 +1357,7 @@ def _benchmark_ff(
     eval_graphs=None,
     eval_dates=None,
 ):
+    dist_ctx = _dist_ctx(config)
     if train_graphs is None or eval_graphs is None:
         train_graphs, eval_graphs = _split_graphs(
             graphs,
@@ -1365,7 +1386,8 @@ def _benchmark_ff(
         mp_ctx = config.get("multiprocessing_context", "")
         if mp_ctx:
             loader_kwargs["multiprocessing_context"] = mp_ctx
-    loader = DataLoader(train_graphs, **loader_kwargs)
+    train_sampler = _maybe_make_sampler(train_graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+    loader = DataLoader(train_graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, train_sampler))
     eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
 
     model = GCNEncoder(
@@ -1407,6 +1429,12 @@ def _benchmark_ff(
     portfolio_head = None
     if portfolio_head_active:
         portfolio_head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    critic = _maybe_wrap_ddp(critic, dist_ctx)
+    if risk_head is not None:
+        risk_head = _maybe_wrap_ddp(risk_head, dist_ctx)
+    if portfolio_head is not None:
+        portfolio_head = _maybe_wrap_ddp(portfolio_head, dist_ctx)
     optim_params = list(model.parameters())
     optim_params.extend(list(critic.parameters()))
     if risk_head is not None:
@@ -1484,16 +1512,20 @@ def _benchmark_ff(
     resume_fingerprint_key = str(config.get("resume_fingerprint", "")).strip()
     resume_payload = None
     resume_meta: dict = {}
+    signal_controller = _install_signal_checkpoint_controller(
+        enabled=bool(config.get("resume_enabled", True) and config.get("resume_on_signal", True))
+    )
+    last_resume_save_at = time.time()
     if resume_checkpoint_path and resume_fingerprint_key:
         resume_payload, resume_meta = _load_benchmark_resume_state(
             checkpoint_path=resume_checkpoint_path,
             fingerprint=resume_fingerprint_key,
             device=device,
             modules={
-                "model": model,
-                "critic": critic,
-                "risk_head": risk_head,
-                "portfolio_head": portfolio_head,
+                "model": _unwrap_module(model),
+                "critic": _unwrap_module(critic),
+                "risk_head": _unwrap_module(risk_head),
+                "portfolio_head": _unwrap_module(portfolio_head),
             },
             optimizer=optim,
             scaler=scaler,
@@ -1580,6 +1612,7 @@ def _benchmark_ff(
         dynamic_ncols=True,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ):
+        _set_sampler_epoch(train_sampler, epoch)
         model.train()
         critic.train()
         t0 = time.perf_counter()
@@ -1587,6 +1620,8 @@ def _benchmark_ff(
         total_loss = 0.0
         loss_updates = 0
         for batch_idx, batch in enumerate(loader, start=1):
+            if signal_controller.requested:
+                break
             batch = batch.to(device)
             x = batch.x
             edge_weight = getattr(batch, "edge_weight", None)
@@ -2023,24 +2058,33 @@ def _benchmark_ff(
                 "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
             }
         )
-        if resume_checkpoint_path and resume_fingerprint_key:
-            if epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0 or epoch == int(config["epochs"]):
+        if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
+            if (
+                epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0
+                or epoch == int(config["epochs"])
+                or _checkpoint_due(
+                    last_saved_at=last_resume_save_at,
+                    every_minutes=config.get("resume_save_every_minutes", 55.0),
+                    signal_controller=signal_controller,
+                )
+            ):
                 _save_benchmark_resume_state(
                     resume_checkpoint_path,
                     fingerprint=resume_fingerprint_key,
                     status="in_progress",
                     epoch_completed=epoch,
                     modules={
-                        "model": model,
-                        "critic": critic,
-                        "risk_head": risk_head,
-                        "portfolio_head": portfolio_head,
+                        "model": _unwrap_module(model),
+                        "critic": _unwrap_module(critic),
+                        "risk_head": _unwrap_module(risk_head),
+                        "portfolio_head": _unwrap_module(portfolio_head),
                     },
                     optimizer=optim,
                     scaler=scaler,
                     metadata=_resume_metadata(epoch),
                     epoch_history=epoch_history,
                 )
+                last_resume_save_at = time.time()
 
     target_eval = float(config["goodness_target"])
     target_cal_acc = float("nan")
@@ -2177,17 +2221,17 @@ def _benchmark_ff(
         if skipped:
             out["eval_neg_modes_skipped"] = ",".join(skipped)
     out["_epoch_history"] = epoch_history
-    if resume_checkpoint_path and resume_fingerprint_key:
+    if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
         _save_benchmark_resume_state(
             resume_checkpoint_path,
             fingerprint=resume_fingerprint_key,
             status="completed",
             epoch_completed=int(config["epochs"]),
             modules={
-                "model": model,
-                "critic": critic,
-                "risk_head": risk_head,
-                "portfolio_head": portfolio_head,
+                "model": _unwrap_module(model),
+                "critic": _unwrap_module(critic),
+                "risk_head": _unwrap_module(risk_head),
+                "portfolio_head": _unwrap_module(portfolio_head),
             },
             optimizer=optim,
             scaler=scaler,
@@ -2207,6 +2251,7 @@ def _benchmark_backprop(
     eval_graphs=None,
     eval_dates=None,
 ):
+    dist_ctx = _dist_ctx(config)
     if train_graphs is None or eval_graphs is None:
         train_graphs, eval_graphs = _split_graphs(
             graphs,
@@ -2230,7 +2275,8 @@ def _benchmark_backprop(
         mp_ctx = config.get("multiprocessing_context", "")
         if mp_ctx:
             loader_kwargs["multiprocessing_context"] = mp_ctx
-    loader = DataLoader(train_graphs, **loader_kwargs)
+    train_sampler = _maybe_make_sampler(train_graphs, dist_ctx, shuffle=True, drop_last=False)
+    loader = DataLoader(train_graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, train_sampler))
     eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
 
     model = GCNEncoder(
@@ -2257,6 +2303,12 @@ def _benchmark_backprop(
     portfolio_head = None
     if bool(config.get("portfolio_head_enabled", False)) and portfolio_targets:
         portfolio_head = torch.nn.Linear(config["hidden_dim"], 1).to(device)
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    head = _maybe_wrap_ddp(head, dist_ctx)
+    if risk_head is not None:
+        risk_head = _maybe_wrap_ddp(risk_head, dist_ctx)
+    if portfolio_head is not None:
+        portfolio_head = _maybe_wrap_ddp(portfolio_head, dist_ctx)
     optim_params = list(model.parameters()) + list(head.parameters())
     if risk_head is not None:
         optim_params.extend(list(risk_head.parameters()))
@@ -2281,16 +2333,20 @@ def _benchmark_backprop(
     resume_fingerprint_key = str(config.get("resume_fingerprint", "")).strip()
     resume_payload = None
     resume_meta: dict = {}
+    signal_controller = _install_signal_checkpoint_controller(
+        enabled=bool(config.get("resume_enabled", True) and config.get("resume_on_signal", True))
+    )
+    last_resume_save_at = time.time()
     if resume_checkpoint_path and resume_fingerprint_key:
         resume_payload, resume_meta = _load_benchmark_resume_state(
             checkpoint_path=resume_checkpoint_path,
             fingerprint=resume_fingerprint_key,
             device=device,
             modules={
-                "model": model,
-                "head": head,
-                "risk_head": risk_head,
-                "portfolio_head": portfolio_head,
+                "model": _unwrap_module(model),
+                "head": _unwrap_module(head),
+                "risk_head": _unwrap_module(risk_head),
+                "portfolio_head": _unwrap_module(portfolio_head),
             },
             optimizer=optim,
             scaler=bp_scaler,
@@ -2388,12 +2444,15 @@ def _benchmark_backprop(
         dynamic_ncols=True,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ):
+        _set_sampler_epoch(train_sampler, epoch)
         model.train()
         t0 = time.perf_counter()
         graphs_seen = 0
         total_loss = 0.0
         loss_updates = 0
         for batch in loader:
+            if signal_controller.requested:
+                break
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
             x = batch.x
@@ -2527,24 +2586,33 @@ def _benchmark_backprop(
                 "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
             }
         )
-        if resume_checkpoint_path and resume_fingerprint_key:
-            if epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0 or epoch == int(config["epochs"]):
+        if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
+            if (
+                epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0
+                or epoch == int(config["epochs"])
+                or _checkpoint_due(
+                    last_saved_at=last_resume_save_at,
+                    every_minutes=config.get("resume_save_every_minutes", 55.0),
+                    signal_controller=signal_controller,
+                )
+            ):
                 _save_benchmark_resume_state(
                     resume_checkpoint_path,
                     fingerprint=resume_fingerprint_key,
                     status="in_progress",
                     epoch_completed=epoch,
                     modules={
-                        "model": model,
-                        "head": head,
-                        "risk_head": risk_head,
-                        "portfolio_head": portfolio_head,
+                        "model": _unwrap_module(model),
+                        "head": _unwrap_module(head),
+                        "risk_head": _unwrap_module(risk_head),
+                        "portfolio_head": _unwrap_module(portfolio_head),
                     },
                     optimizer=optim,
                     scaler=bp_scaler,
                     metadata=_resume_metadata(epoch),
                     epoch_history=epoch_history,
                 )
+                last_resume_save_at = time.time()
 
     # eval accuracy
     model.eval()
@@ -2706,17 +2774,17 @@ def _benchmark_backprop(
         out.update(econ)
         out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
     out["_epoch_history"] = epoch_history
-    if resume_checkpoint_path and resume_fingerprint_key:
+    if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
         _save_benchmark_resume_state(
             resume_checkpoint_path,
             fingerprint=resume_fingerprint_key,
             status="completed",
             epoch_completed=int(config["epochs"]),
             modules={
-                "model": model,
-                "head": head,
-                "risk_head": risk_head,
-                "portfolio_head": portfolio_head,
+                "model": _unwrap_module(model),
+                "head": _unwrap_module(head),
+                "risk_head": _unwrap_module(risk_head),
+                "portfolio_head": _unwrap_module(portfolio_head),
             },
             optimizer=optim,
             scaler=bp_scaler,
@@ -2736,6 +2804,7 @@ def _benchmark_backprop_supervised_return(
     eval_graphs=None,
     eval_dates=None,
 ):
+    dist_ctx = _dist_ctx(config)
     if train_graphs is None or eval_graphs is None:
         train_graphs, eval_graphs = _split_graphs(
             graphs,
@@ -2763,7 +2832,8 @@ def _benchmark_backprop_supervised_return(
         mp_ctx = config.get("multiprocessing_context", "")
         if mp_ctx:
             loader_kwargs["multiprocessing_context"] = mp_ctx
-    loader = DataLoader(train_graphs, **loader_kwargs)
+    train_sampler = _maybe_make_sampler(train_graphs, dist_ctx, shuffle=True, drop_last=False)
+    loader = DataLoader(train_graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, train_sampler))
     eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
 
     model = GCNEncoder(
@@ -2788,6 +2858,10 @@ def _benchmark_backprop_supervised_return(
     if bool(config.get("risk_head_enabled", False)) and risk_targets_by_horizon:
         risk_head = torch.nn.Linear(config["hidden_dim"], len(risk_horizons_effective)).to(device)
 
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    return_head = _maybe_wrap_ddp(return_head, dist_ctx)
+    if risk_head is not None:
+        risk_head = _maybe_wrap_ddp(risk_head, dist_ctx)
     optim_params = list(model.parameters()) + list(return_head.parameters())
     if risk_head is not None:
         optim_params.extend(list(risk_head.parameters()))
@@ -2808,15 +2882,19 @@ def _benchmark_backprop_supervised_return(
     resume_fingerprint_key = str(config.get("resume_fingerprint", "")).strip()
     resume_payload = None
     resume_meta: dict = {}
+    signal_controller = _install_signal_checkpoint_controller(
+        enabled=bool(config.get("resume_enabled", True) and config.get("resume_on_signal", True))
+    )
+    last_resume_save_at = time.time()
     if resume_checkpoint_path and resume_fingerprint_key:
         resume_payload, resume_meta = _load_benchmark_resume_state(
             checkpoint_path=resume_checkpoint_path,
             fingerprint=resume_fingerprint_key,
             device=device,
             modules={
-                "model": model,
-                "return_head": return_head,
-                "risk_head": risk_head,
+                "model": _unwrap_module(model),
+                "return_head": _unwrap_module(return_head),
+                "risk_head": _unwrap_module(risk_head),
             },
             optimizer=optim,
             scaler=bp_scaler,
@@ -2867,6 +2945,7 @@ def _benchmark_backprop_supervised_return(
         dynamic_ncols=True,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ):
+        _set_sampler_epoch(train_sampler, epoch)
         model.train()
         return_head.train()
         if risk_head is not None:
@@ -2876,6 +2955,8 @@ def _benchmark_backprop_supervised_return(
         total_loss = 0.0
         loss_updates = 0
         for batch in loader:
+            if signal_controller.requested:
+                break
             batch = batch.to(device)
             edge_weight = getattr(batch, "edge_weight", None)
             batch_t0 = time.perf_counter()
@@ -2942,23 +3023,32 @@ def _benchmark_backprop_supervised_return(
                 "graphs_per_s_epoch": float(graphs_seen / dt) if dt > 0 else float("nan"),
             }
         )
-        if resume_checkpoint_path and resume_fingerprint_key:
-            if epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0 or epoch == int(config["epochs"]):
+        if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
+            if (
+                epoch % max(1, int(config.get("resume_save_every_epochs", 1))) == 0
+                or epoch == int(config["epochs"])
+                or _checkpoint_due(
+                    last_saved_at=last_resume_save_at,
+                    every_minutes=config.get("resume_save_every_minutes", 55.0),
+                    signal_controller=signal_controller,
+                )
+            ):
                 _save_benchmark_resume_state(
                     resume_checkpoint_path,
                     fingerprint=resume_fingerprint_key,
                     status="in_progress",
                     epoch_completed=epoch,
                     modules={
-                        "model": model,
-                        "return_head": return_head,
-                        "risk_head": risk_head,
+                        "model": _unwrap_module(model),
+                        "return_head": _unwrap_module(return_head),
+                        "risk_head": _unwrap_module(risk_head),
                     },
                     optimizer=optim,
                     scaler=bp_scaler,
                     metadata=_resume_metadata(epoch),
                     epoch_history=epoch_history,
                 )
+                last_resume_save_at = time.time()
 
     model.eval()
     return_head.eval()
@@ -3021,16 +3111,16 @@ def _benchmark_backprop_supervised_return(
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
         out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
     out["_epoch_history"] = epoch_history
-    if resume_checkpoint_path and resume_fingerprint_key:
+    if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
         _save_benchmark_resume_state(
             resume_checkpoint_path,
             fingerprint=resume_fingerprint_key,
             status="completed",
             epoch_completed=int(config["epochs"]),
             modules={
-                "model": model,
-                "return_head": return_head,
-                "risk_head": risk_head,
+                "model": _unwrap_module(model),
+                "return_head": _unwrap_module(return_head),
+                "risk_head": _unwrap_module(risk_head),
             },
             optimizer=optim,
             scaler=bp_scaler,
@@ -3053,12 +3143,16 @@ def main() -> int:
             "ff_accurate,backprop_contrastive,backprop_contrastive_core,backprop_supervised_return"
         ),
     )
+    parser.add_argument("--distributed", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--backend", default=argparse.SUPPRESS)
+    parser.add_argument("--local-rank", type=int, default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     train_cfg = cfg.get("train", {})
     bench_cfg = cfg.get("benchmark", {})
     build_cfg = cfg.get("build_graphs", {})
+    cluster_cfg = cfg.get("cluster", {})
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
     artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
@@ -3068,8 +3162,21 @@ def main() -> int:
         graph_dates = []
     print(f"graph artifact: {artifact.path} (format={artifact.format})")
 
-    device = _choose_device(train_cfg.get("device", "auto"))
-    _set_seed(int(train_cfg.get("seed", 7)))
+    distributed_enabled = bool(bench_cfg.get("distributed", False))
+    if hasattr(args, "distributed"):
+        distributed_enabled = bool(getattr(args, "distributed"))
+    distributed_backend = str(bench_cfg.get("distributed_backend", "nccl"))
+    if hasattr(args, "backend") and str(getattr(args, "backend", "")).strip():
+        distributed_backend = str(getattr(args, "backend"))
+    local_rank = getattr(args, "local_rank", None) if hasattr(args, "local_rank") else None
+    dist_ctx = _init_distributed_context(
+        requested_device=train_cfg.get("device", "auto"),
+        distributed=distributed_enabled,
+        backend=distributed_backend,
+        local_rank=local_rank,
+    )
+    device = dist_ctx.device
+    _set_seed(int(train_cfg.get("seed", 7)) + int(dist_ctx.rank))
     if train_cfg.get("torch_num_threads"):
         torch.set_num_threads(int(train_cfg["torch_num_threads"]))
     if train_cfg.get("torch_num_interop_threads"):
@@ -3322,6 +3429,8 @@ def main() -> int:
         "resume_enabled": bool(bench_cfg.get("resume_enabled", True)),
         "resume_dir": str(bench_cfg.get("resume_dir", "")),
         "resume_save_every_epochs": int(bench_cfg.get("resume_save_every_epochs", 1)),
+        "resume_save_every_minutes": float(bench_cfg.get("resume_save_every_minutes", 55.0)),
+        "resume_on_signal": bool(bench_cfg.get("resume_on_signal", True)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
         "window_len": int(returns_len),
@@ -3363,6 +3472,9 @@ def main() -> int:
         "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
         "task_family": "custom",
         "signal_family": "custom",
+        "distributed": bool(distributed_enabled),
+        "distributed_backend": str(distributed_backend),
+        "distributed_ctx": dist_ctx,
     }
     modes = [_canonical_mode_name(m.strip()) for m in args.modes.split(",") if m.strip()]
     if not modes:
@@ -3383,6 +3495,22 @@ def main() -> int:
     config["econ_fwd_ret_1"] = None
     config["econ_ticker_effective"] = ""
     config["econ_ticker_source"] = ""
+
+    for label, path_value in (
+        ("train.graphs", graphs_path),
+        ("benchmark.resume_dir", config.get("resume_dir", "")),
+        ("benchmark.out_csv", bench_cfg.get("out_csv", "")),
+        ("benchmark.baseline_out_csv", bench_cfg.get("baseline_out_csv", "")),
+        ("benchmark.walk_forward_out_csv", bench_cfg.get("walk_forward_out_csv", "")),
+        ("benchmark.history_out_csv", bench_cfg.get("history_out_csv", "")),
+        ("benchmark.plot_path", bench_cfg.get("plot_path", "")),
+        ("benchmark.bar_plot_path", bench_cfg.get("bar_plot_path", "")),
+        ("train.risk_cache_dir", config.get("risk_cache_dir", "")),
+        ("train.portfolio_cache_dir", config.get("portfolio_cache_dir", "")),
+        ("build_graphs.prices", build_cfg.get("prices", "")),
+    ):
+        if str(path_value).strip():
+            ensure_safe_cluster_path(path_value, cluster_cfg=cluster_cfg, label=label)
     config["econ_ticker_rows"] = 0
     if bool(config.get("econ_enabled", False)):
         prices_path = str(bench_cfg.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv")))
@@ -3909,8 +4037,8 @@ def main() -> int:
 
     all_modes_failed = bool(modes) and not any(mode_success_map.values())
 
+    dist_ctx = _dist_ctx(config)
     out_path = Path(bench_cfg.get("out_csv", "runs/experiments/manual/metrics/benchmark.csv"))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     import csv
 
     baseline_check_failed = False
@@ -3955,13 +4083,14 @@ def main() -> int:
         "safe_mode_applied",
     }
     keys = sorted(base_cols | {k for r in results for k in r.keys()})
-    with out_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in results:
-            w.writerow(r)
-
-    print(f"Wrote {out_path}")
+    if dist_ctx.is_primary:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for r in results:
+                w.writerow(r)
+        print(f"Wrote {out_path}")
     baseline_out = str(bench_cfg.get("baseline_out_csv", "")).strip()
     baseline_path = (
         Path(baseline_out)
@@ -3990,14 +4119,15 @@ def main() -> int:
                 "baseline_batch_size": r.get("baseline_batch_size"),
             }
         )
-    baseline_path.parent.mkdir(parents=True, exist_ok=True)
-    with baseline_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(baseline_rows[0].keys()) if baseline_rows else ["mode"])
-        w.writeheader()
-        for row in baseline_rows:
-            w.writerow(row)
-    print(f"Wrote {baseline_path}")
-    if use_walk_forward or str(bench_cfg.get("walk_forward_out_csv", "")).strip():
+    if dist_ctx.is_primary:
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        with baseline_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(baseline_rows[0].keys()) if baseline_rows else ["mode"])
+            w.writeheader()
+            for row in baseline_rows:
+                w.writerow(row)
+        print(f"Wrote {baseline_path}")
+    if dist_ctx.is_primary and (use_walk_forward or str(bench_cfg.get("walk_forward_out_csv", "")).strip()):
         fold_out = str(bench_cfg.get("walk_forward_out_csv", "")).strip()
         fold_out_path = (
             Path(fold_out)
@@ -4024,7 +4154,7 @@ def main() -> int:
                 w.writerow(r)
         print(f"Wrote {fold_out_path}")
     history_out = str(bench_cfg.get("history_out_csv", "")).strip()
-    if history_rows or history_out:
+    if dist_ctx.is_primary and (history_rows or history_out):
         history_out_path = (
             Path(history_out)
             if history_out
@@ -4049,12 +4179,15 @@ def main() -> int:
             for r in history_rows:
                 w.writerow(r)
         print(f"Wrote {history_out_path}")
-    for r in results:
-        print(r)
+    if dist_ctx.is_primary:
+        for r in results:
+            print(r)
 
     plot_path = bench_cfg.get("plot_path", "runs/experiments/manual/plots/benchmark_speed_sep.png")
     bar_plot_path = bench_cfg.get("bar_plot_path", "runs/experiments/manual/plots/benchmark.png")
     try:
+        if not dist_ctx.is_primary:
+            raise RuntimeError("skip_plots_non_primary")
         import matplotlib.pyplot as plt
 
         plot_rows = [
@@ -4126,7 +4259,8 @@ def main() -> int:
         plt.close(fig)
         print(f"Wrote {bar_plot_path}")
     except Exception as exc:
-        print(f"Plotting failed: {exc}")
+        if str(exc) != "skip_plots_non_primary":
+            print(f"Plotting failed: {exc}")
     exit_code = 0
     if baseline_check_failed:
         exit_code = 1
@@ -4135,6 +4269,8 @@ def main() -> int:
     if all_modes_failed:
         exit_code = 1
         print("warning: all benchmark modes failed; outputs were written with failure metadata.")
+    _dist_barrier(dist_ctx)
+    _cleanup_distributed()
     return exit_code
 
 

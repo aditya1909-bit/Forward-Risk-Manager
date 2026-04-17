@@ -111,6 +111,13 @@ plot_path = "runs/experiments/default/plots/ff_train.png"
 save_model = "runs/experiments/default/models/ff_model.pt"
 save_encoder = "runs/experiments/default/models/encoder.pt"
 save_critic = "runs/experiments/default/models/critic.pt"
+resume_enabled = true
+resume_state_path = "runs/experiments/default/models/train_resume.pt"
+resume_save_every_epochs = 1
+resume_save_every_minutes = 55
+resume_on_signal = true
+distributed = false
+distributed_backend = "nccl"
 encoder_checkpoint_in = ""
 critic_checkpoint_in = ""
 strict_component_split = false
@@ -280,6 +287,13 @@ econ_regime_high_quantile = 0.67
 out_csv = "runs/experiments/default/metrics/benchmark.csv"
 plot_path = "runs/experiments/default/plots/benchmark_speed_sep.png"
 bar_plot_path = "runs/experiments/default/plots/benchmark.png"
+resume_enabled = true
+resume_dir = "runs/experiments/default/models/benchmark_resume"
+resume_save_every_epochs = 1
+resume_save_every_minutes = 55
+resume_on_signal = true
+distributed = false
+distributed_backend = "nccl"
 
 [sweep]
 epochs = 3
@@ -377,6 +391,8 @@ parallel_force_cpu = false
 worker_torch_threads = 1
 worker_torch_interop_threads = 1
 worker_loader_workers = 0
+distributed = false
+distributed_backend = "nccl"
 
 [sweep_layerwise]
 epochs = 3
@@ -466,3 +482,15 @@ strict_component_split = true
 freeze_encoder = true
 encoder_checkpoint_in = "runs/experiments/default/models/encoder.pt"
 save_critic = "runs/experiments/default/models/critic.pt"
+
+[cluster]
+enabled = false
+netid = ""
+scratch_root = "/local/scratch/<netid>/forward-risk-manager"
+repo_root = "/local/scratch/<netid>/forward-risk-manager/repo"
+data_root = "/local/scratch/<netid>/forward-risk-manager/data"
+runs_root = "/local/scratch/<netid>/forward-risk-manager/runs"
+cache_root = "/local/scratch/<netid>/forward-risk-manager/.cache"
+logs_root = "/local/scratch/<netid>/forward-risk-manager/logs"
+stage_graphs_to_local_nvme = false
+sync_back_enabled = false

@@ -108,6 +108,15 @@ def resolve_repo_root(
                 )
             )
 
+    user_name = os.environ.get("EMORY_NETID", "").strip() or os.environ.get("USER", "").strip()
+    if user_name:
+        candidates.extend(
+            [
+                Path(f"/local/scratch/{user_name}/forward-risk-manager/repo"),
+                Path(f"/local/scratch/{user_name}/forward-risk-manager"),
+            ]
+        )
+
     candidates.extend(Path(candidate) for candidate in extra_candidates)
 
     seen: set[Path] = set()

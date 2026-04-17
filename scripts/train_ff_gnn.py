@@ -34,7 +34,21 @@ from frisk.ff import (
     self_contrastive_loss,
 )
 from frisk.hallucinate import HallucinationConfig, hallucinate_negative
+from frisk.cluster_runtime import ensure_safe_cluster_path
 from frisk.device import collect_device_diagnostics, empty_device_cache, resolve_device
+from frisk.distributed_runtime import (
+    barrier as _dist_barrier,
+    checkpoint_due as _checkpoint_due,
+    cleanup_distributed as _cleanup_distributed,
+    dataloader_kwargs_with_sampler as _dataloader_kwargs_with_sampler,
+    init_distributed_context as _init_distributed_context,
+    install_signal_checkpoint_controller as _install_signal_checkpoint_controller,
+    maybe_make_sampler as _maybe_make_sampler,
+    maybe_wrap_ddp as _maybe_wrap_ddp,
+    reduce_sum as _reduce_sum,
+    set_sampler_epoch as _set_sampler_epoch,
+    unwrap_module as _unwrap_module,
+)
 from frisk.graph_artifact import GraphIndexSequence, load_graph_artifact
 from frisk.econ_eval import resolve_price_ticker
 from frisk.resume import (
@@ -1380,6 +1394,9 @@ def main() -> int:
     parser.add_argument("--no-resume", dest="resume_enabled", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--resume-state-path", default=argparse.SUPPRESS)
     parser.add_argument("--resume-save-every-epochs", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--resume-save-every-minutes", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--resume-on-signal", dest="resume_on_signal", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-resume-on-signal", dest="resume_on_signal", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--critic-hidden-dim", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-num-layers", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--critic-dropout", type=float, default=argparse.SUPPRESS)
@@ -1391,11 +1408,16 @@ def main() -> int:
     parser.add_argument("--torch-compile", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-torch-compile", action="store_true", default=False)
     parser.add_argument("--torch-compile-mode", default=argparse.SUPPRESS)
+    parser.add_argument("--distributed", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--backend", default=argparse.SUPPRESS)
+    parser.add_argument("--nproc-per-node", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--local-rank", type=int, default=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     section = cfg.get("train", {})
     build_cfg = cfg.get("build_graphs", {})
+    cluster_cfg = cfg.get("cluster", {})
 
     graphs_path = _get_setting(args, section, "graphs", None)
     if not graphs_path:
@@ -1443,6 +1465,9 @@ def main() -> int:
     neg_mode = _get_setting(args, section, "neg_mode", "shuffle")
     noise_std = _get_setting(args, section, "noise_std", 0.05)
     device_choice = _get_setting(args, section, "device", "auto")
+    distributed_enabled = _to_bool(_get_setting(args, section, "distributed", False))
+    distributed_backend = str(_get_setting(args, section, "distributed_backend", "nccl"))
+    local_rank = getattr(args, "local_rank", None) if hasattr(args, "local_rank") else None
     seed = _get_setting(args, section, "seed", 7)
     loader_workers = _get_setting(args, section, "loader_workers", 0)
     dataloader_persistent = _get_setting(args, section, "dataloader_persistent_workers", True)
@@ -1459,6 +1484,8 @@ def main() -> int:
     resume_enabled = _to_bool(_get_setting(args, section, "resume_enabled", True))
     resume_state_path = _get_setting(args, section, "resume_state_path", "")
     resume_save_every_epochs = max(1, int(_get_setting(args, section, "resume_save_every_epochs", 1)))
+    resume_save_every_minutes = float(_get_setting(args, section, "resume_save_every_minutes", 55.0))
+    resume_on_signal = _to_bool(_get_setting(args, section, "resume_on_signal", True))
     encoder_checkpoint_in = _get_setting(args, section, "encoder_checkpoint_in", "")
     critic_checkpoint_in = _get_setting(args, section, "critic_checkpoint_in", "")
     strict_component_split = _to_bool(
@@ -1845,6 +1872,12 @@ def main() -> int:
             log_csv,
             plot_path,
         )
+    if str(resume_state_path).strip():
+        ensure_safe_cluster_path(
+            resume_state_path,
+            cluster_cfg=cluster_cfg,
+            label="train.resume_state_path",
+        )
 
     if strict_component_split and neg_mode == "self_contrastive":
         if "time_flip" in self_contrastive_view_mode:
@@ -2011,12 +2044,19 @@ def main() -> int:
             adversarial_hub_weight_scale=hall_attack_hub_weight_scale,
         )
 
+    dist_ctx = _init_distributed_context(
+        requested_device=device_choice,
+        distributed=distributed_enabled,
+        backend=distributed_backend,
+        local_rank=local_rank,
+    )
+    seed = int(seed) + int(dist_ctx.rank)
     set_seed(seed)
     if torch_num_threads:
         torch.set_num_threads(int(torch_num_threads))
     if torch_num_interop_threads:
         torch.set_num_interop_threads(int(torch_num_interop_threads))
-    device = resolve_device(device_choice)
+    device = dist_ctx.device
     _configure_cuda_runtime(device)
     amp_dtype = _parse_amp_dtype(amp_dtype_raw)
     amp_enabled = bool(amp_requested and device.type == "cuda")
@@ -2487,10 +2527,38 @@ def main() -> int:
             print(f"goodness_temp={t} -> mean_goodness={g:.4f}")
         return 0
 
+    model = _maybe_wrap_ddp(model, dist_ctx)
+    critic = _maybe_wrap_ddp(critic, dist_ctx)
+    if risk_head is not None:
+        risk_head = _maybe_wrap_ddp(risk_head, dist_ctx)
+    if portfolio_head is not None:
+        portfolio_head = _maybe_wrap_ddp(portfolio_head, dist_ctx)
+
     hall_cfg = _hall_cfg_for_epoch(hall_curr_start if hall_curr_enabled else 1)
     train_shuffle = True
     if bool(sequence_critic_enabled) and bool(sequence_critic_force_chrono):
         train_shuffle = False
+
+    for label, path_value in (
+        ("train.graphs", graphs_path),
+        ("train.log_csv", log_csv),
+        ("train.plot_path", plot_path),
+        ("train.save_model", save_model),
+        ("train.save_encoder", save_encoder),
+        ("train.save_critic", save_critic),
+        ("train.resume_state_path", resume_state_path),
+        ("train.risk_cache_dir", risk_cache_dir),
+        ("train.portfolio_cache_dir", portfolio_cache_dir),
+        ("train.auto_tune_cache_path", auto_tune_cache_path),
+        ("build_graphs.prices", build_cfg.get("prices", "")),
+    ):
+        if str(path_value).strip():
+            ensure_safe_cluster_path(path_value, cluster_cfg=cluster_cfg, label=label)
+
+    if dist_ctx.enabled and auto_tune:
+        if dist_ctx.is_primary:
+            print("auto_tune_batch disabled for distributed runs; using configured batch_size.")
+        auto_tune = False
 
     if auto_tune and device.type in ("cuda", "mps"):
         best_bs = None
@@ -2631,8 +2699,10 @@ def main() -> int:
         if dataloader_mp_context:
             loader_kwargs["multiprocessing_context"] = dataloader_mp_context
     base_loader = None
+    base_sampler = None
     if epoch_graph_fraction >= 1.0:
-        base_loader = DataLoader(graphs, **loader_kwargs)
+        base_sampler = _maybe_make_sampler(graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+        base_loader = DataLoader(graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, base_sampler))
     optim_params = [p for p in model.parameters() if p.requires_grad]
     optim_params.extend(p for p in critic.parameters() if p.requires_grad)
     if risk_head is not None:
@@ -2699,16 +2769,16 @@ def main() -> int:
         }
 
     def _save_train_resume(status: str, epoch_completed: int) -> None:
-        if not resume_enabled or not resume_state_path:
+        if not resume_enabled or not resume_state_path or not dist_ctx.is_primary:
             return
         model_states = {
-            "model": module_state_for_resume(model),
-            "critic": module_state_for_resume(critic),
+            "model": module_state_for_resume(_unwrap_module(model)),
+            "critic": module_state_for_resume(_unwrap_module(critic)),
         }
         if risk_head is not None:
-            model_states["risk_head"] = module_state_for_resume(risk_head)
+            model_states["risk_head"] = module_state_for_resume(_unwrap_module(risk_head))
         if portfolio_head is not None:
-            model_states["portfolio_head"] = module_state_for_resume(portfolio_head)
+            model_states["portfolio_head"] = module_state_for_resume(_unwrap_module(portfolio_head))
         save_resume_payload(
             resume_state_path,
             fingerprint=resume_key,
@@ -2725,16 +2795,20 @@ def main() -> int:
         model_states = resume_payload.get("model_states", {})
         if isinstance(model_states, dict):
             if "model" in model_states:
-                load_module_state_for_resume(model, model_states["model"])
+                load_module_state_for_resume(_unwrap_module(model), model_states["model"])
             if "critic" in model_states:
                 try:
-                    load_module_state_for_resume(critic, model_states["critic"], strict=True)
+                    load_module_state_for_resume(_unwrap_module(critic), model_states["critic"], strict=True)
                 except Exception:
-                    load_module_state_for_resume(critic, model_states["critic"], strict=False)
+                    load_module_state_for_resume(_unwrap_module(critic), model_states["critic"], strict=False)
             if risk_head is not None and "risk_head" in model_states:
-                load_module_state_for_resume(risk_head, model_states["risk_head"], strict=False)
+                load_module_state_for_resume(_unwrap_module(risk_head), model_states["risk_head"], strict=False)
             if portfolio_head is not None and "portfolio_head" in model_states:
-                load_module_state_for_resume(portfolio_head, model_states["portfolio_head"], strict=False)
+                load_module_state_for_resume(
+                    _unwrap_module(portfolio_head),
+                    model_states["portfolio_head"],
+                    strict=False,
+                )
         optim_state = resume_payload.get("optimizer_state")
         if isinstance(optim_state, dict):
             optim.load_state_dict(optim_state)
@@ -2770,7 +2844,10 @@ def main() -> int:
             f"next_epoch={min(start_epoch, int(epochs) + 1)}"
         )
 
-    if log_csv:
+    signal_controller = _install_signal_checkpoint_controller(enabled=resume_enabled and resume_on_signal)
+    last_resume_save_at = time.time() if resume_payload is not None else None
+
+    if log_csv and dist_ctx.is_primary:
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         should_init_log = True
@@ -2797,8 +2874,10 @@ def main() -> int:
         unit="epoch",
         dynamic_ncols=True,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        disable=not dist_ctx.is_primary,
     )
     for epoch in epoch_iter:
+        _set_sampler_epoch(base_sampler, epoch)
         model.train()
         critic_train_mode = any(p.requires_grad for p in critic.parameters()) or bool(
             sequence_critic_enabled
@@ -2871,9 +2950,18 @@ def main() -> int:
                 regime_change_boost=epoch_graph_regime_change_boost,
                 seed=int(seed) + int(epoch) * 1009,
             )
-            epoch_loader = DataLoader(epoch_graphs, **loader_kwargs)
+            epoch_sampler = _maybe_make_sampler(epoch_graphs, dist_ctx, shuffle=train_shuffle, drop_last=False)
+            _set_sampler_epoch(epoch_sampler, epoch)
+            epoch_loader = DataLoader(
+                epoch_graphs,
+                **_dataloader_kwargs_with_sampler(loader_kwargs, epoch_sampler),
+            )
 
+        stop_after_epoch = False
         for batch in epoch_loader:
+            if signal_controller.requested:
+                stop_after_epoch = True
+                break
             try:
                 batch = batch.to(device)
             except Exception as exc:
@@ -4052,17 +4140,42 @@ def main() -> int:
         hall_close_ratio = hall_close_count / hall_close_total if hall_close_total else 0.0
         hall_hardness = hall_hardness_sum / hall_hardness_count if hall_hardness_count else 0.0
         energy_penalty_epoch = energy_penalty_sum / batches if batches else 0.0
-        risk_loss_epoch = risk_loss_sum / risk_batches if risk_batches else 0.0
-        portfolio_loss_epoch = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
-        dist_forward_epoch = dist_forward_sum / batches if batches else 0.0
-        rank_aux_epoch = rank_aux_sum / batches if batches else 0.0
-        rank_corr_epoch = rank_corr_sum / batches if batches else 0.0
-        time_neg_gen_epoch = timing_totals["neg_gen"] / batches if batches else 0.0
-        time_hall_epoch = timing_totals["hallucinate"] / batches if batches else 0.0
-        time_fwd_pos_epoch = timing_totals["forward_pos"] / batches if batches else 0.0
-        time_fwd_neg_epoch = timing_totals["forward_neg"] / batches if batches else 0.0
-        time_loss_epoch = timing_totals["loss_terms"] / batches if batches else 0.0
-        time_opt_epoch = timing_totals["optimizer"] / batches if batches else 0.0
+        global_batches = max(1.0, _reduce_sum(batches, dist_ctx))
+        global_risk_batches = _reduce_sum(risk_batches, dist_ctx)
+        global_portfolio_batches = _reduce_sum(portfolio_batches, dist_ctx)
+        total_loss = _reduce_sum(total_loss, dist_ctx)
+        total_pos = _reduce_sum(total_pos, dist_ctx)
+        total_neg = _reduce_sum(total_neg, dist_ctx)
+        risk_loss_sum = _reduce_sum(risk_loss_sum, dist_ctx)
+        portfolio_loss_sum = _reduce_sum(portfolio_loss_sum, dist_ctx)
+        dist_forward_sum = _reduce_sum(dist_forward_sum, dist_ctx)
+        rank_aux_sum = _reduce_sum(rank_aux_sum, dist_ctx)
+        rank_corr_sum = _reduce_sum(rank_corr_sum, dist_ctx)
+        regime_weight_sum = _reduce_sum(regime_weight_sum, dist_ctx)
+        dual_neg_batches = _reduce_sum(dual_neg_batches, dist_ctx)
+        hall_used = _reduce_sum(hall_used, dist_ctx)
+        total_used = _reduce_sum(total_used, dist_ctx)
+        hall_gated = _reduce_sum(hall_gated, dist_ctx)
+        hall_close_count = _reduce_sum(hall_close_count, dist_ctx)
+        hall_close_total = _reduce_sum(hall_close_total, dist_ctx)
+        hall_hardness_sum = _reduce_sum(hall_hardness_sum, dist_ctx)
+        hall_hardness_count = _reduce_sum(hall_hardness_count, dist_ctx)
+        for timing_key in timing_totals:
+            timing_totals[timing_key] = _reduce_sum(timing_totals[timing_key], dist_ctx)
+
+        risk_loss_epoch = risk_loss_sum / global_risk_batches if global_risk_batches else 0.0
+        portfolio_loss_epoch = (
+            portfolio_loss_sum / global_portfolio_batches if global_portfolio_batches else 0.0
+        )
+        dist_forward_epoch = dist_forward_sum / global_batches if global_batches else 0.0
+        rank_aux_epoch = rank_aux_sum / global_batches if global_batches else 0.0
+        rank_corr_epoch = rank_corr_sum / global_batches if global_batches else 0.0
+        time_neg_gen_epoch = timing_totals["neg_gen"] / global_batches if global_batches else 0.0
+        time_hall_epoch = timing_totals["hallucinate"] / global_batches if global_batches else 0.0
+        time_fwd_pos_epoch = timing_totals["forward_pos"] / global_batches if global_batches else 0.0
+        time_fwd_neg_epoch = timing_totals["forward_neg"] / global_batches if global_batches else 0.0
+        time_loss_epoch = timing_totals["loss_terms"] / global_batches if global_batches else 0.0
+        time_opt_epoch = timing_totals["optimizer"] / global_batches if global_batches else 0.0
         timing_total_epoch = sum(max(0.0, float(v)) for v in timing_totals.values())
         time_neg_gen_share = timing_totals["neg_gen"] / timing_total_epoch if timing_total_epoch else 0.0
         time_hall_share = timing_totals["hallucinate"] / timing_total_epoch if timing_total_epoch else 0.0
@@ -4070,15 +4183,15 @@ def main() -> int:
         time_fwd_neg_share = timing_totals["forward_neg"] / timing_total_epoch if timing_total_epoch else 0.0
         time_loss_share = timing_totals["loss_terms"] / timing_total_epoch if timing_total_epoch else 0.0
         time_opt_share = timing_totals["optimizer"] / timing_total_epoch if timing_total_epoch else 0.0
-        dual_neg_ratio = dual_neg_batches / batches if batches else 0.0
-        regime_weight_mean_epoch = regime_weight_sum / batches if batches else 0.0
-        epoch_loss = total_loss / batches if batches else 0.0
-        epoch_pos = total_pos / batches if batches else 0.0
-        epoch_neg = total_neg / batches if batches else 0.0
+        dual_neg_ratio = dual_neg_batches / global_batches if global_batches else 0.0
+        regime_weight_mean_epoch = regime_weight_sum / global_batches if global_batches else 0.0
+        epoch_loss = total_loss / global_batches if global_batches else 0.0
+        epoch_pos = total_pos / global_batches if global_batches else 0.0
+        epoch_neg = total_neg / global_batches if global_batches else 0.0
         epoch_sep = epoch_pos - epoch_neg
 
         target_updated = False
-        if adaptive_target_enabled and batches and epoch >= adaptive_target_warmup:
+        if adaptive_target_enabled and global_batches and epoch >= adaptive_target_warmup:
             midpoint = 0.5 * (epoch_pos + epoch_neg) + adaptive_target_margin
             new_target = _clamp(
                 (1.0 - adaptive_target_alpha) * goodness_target
@@ -4219,7 +4332,7 @@ def main() -> int:
             adapt_tokens.append("target")
         if dual_neg_event:
             adapt_tokens.append(dual_neg_event)
-        if adapt_tokens:
+        if adapt_tokens and dist_ctx.is_primary:
             print(
                 f"epoch {epoch}: adapt={','.join(adapt_tokens)} "
                 f"target={goodness_target:.3f} mix_end={neg_mix_end:.3f} "
@@ -4227,20 +4340,21 @@ def main() -> int:
                 f"hall_lr={hall_lr:.4f} hall_node_fraction={hall_node_fraction:.2f} "
                 f"dual_neg_every={ff_dual_neg_every_n_batches}"
             )
-        print(
+        if dist_ctx.is_primary:
+            print(
             f"epoch {epoch} timing: neg_gen={time_neg_gen_share:.1%} "
             f"fwd_pos={time_fwd_pos_share:.1%} fwd_neg={time_fwd_neg_share:.1%} "
             f"loss={time_loss_share:.1%} opt={time_opt_share:.1%} "
             f"dual_neg_ratio={dual_neg_ratio:.2f} dual_neg_every={epoch_dual_neg_every}"
-        )
-        epoch_iter.set_postfix(
-            loss=f"{epoch_loss:.3f}",
-            sep=f"{epoch_sep:.3f}",
-            dneg=f"{epoch_dual_neg_every}",
-            nshare=f"{time_fwd_neg_share:.0%}",
-        )
+            )
+            epoch_iter.set_postfix(
+                loss=f"{epoch_loss:.3f}",
+                sep=f"{epoch_sep:.3f}",
+                dneg=f"{epoch_dual_neg_every}",
+                nshare=f"{time_fwd_neg_share:.0%}",
+            )
 
-        if log_csv:
+        if log_csv and dist_ctx.is_primary:
             with Path(log_csv).open("a") as f:
                 f.write(
                     f"{epoch},{epoch_loss:.6f},"
@@ -4260,27 +4374,41 @@ def main() -> int:
                     f"{time_loss_epoch:.6f},{time_opt_epoch:.6f}\n"
                 )
 
-        if epoch % resume_save_every_epochs == 0 or epoch == epochs:
+        if (
+            epoch % resume_save_every_epochs == 0
+            or epoch == epochs
+            or _checkpoint_due(
+                last_saved_at=last_resume_save_at,
+                every_minutes=resume_save_every_minutes,
+                signal_controller=signal_controller,
+            )
+        ):
             _save_train_resume("in_progress", epoch)
+            last_resume_save_at = time.time()
+        if stop_after_epoch:
+            _save_train_resume("interrupted", max(0, epoch - 1))
+            break
 
-    _save_train_resume("completed", epochs)
+    if not signal_controller.requested:
+        _save_train_resume("completed", epochs)
+    _dist_barrier(dist_ctx)
 
-    if save_encoder:
+    if save_encoder and dist_ctx.is_primary:
         save_path = Path(str(save_encoder))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(_state_dict_for_save(model), save_path)
-    elif save_model:
+        torch.save(_state_dict_for_save(_unwrap_module(model)), save_path)
+    elif save_model and dist_ctx.is_primary:
         # Backward-compat: if only save_model is provided, treat it as encoder checkpoint output.
         save_path = Path(str(save_model))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(_state_dict_for_save(model), save_path)
+        torch.save(_state_dict_for_save(_unwrap_module(model)), save_path)
 
-    if save_critic:
+    if save_critic and dist_ctx.is_primary:
         save_path = Path(str(save_critic))
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(_state_dict_for_save(critic), save_path)
+        torch.save(_state_dict_for_save(_unwrap_module(critic)), save_path)
 
-    if log_csv and plot_path:
+    if log_csv and plot_path and dist_ctx.is_primary:
         try:
             import matplotlib.pyplot as plt
             import pandas as pd
@@ -4319,7 +4447,10 @@ def main() -> int:
         except Exception as exc:
             print(f"Plotting failed: {exc}")
 
-    return 0
+    exit_code = 0 if not signal_controller.requested else 2
+    _dist_barrier(dist_ctx)
+    _cleanup_distributed()
+    return exit_code
 
 
 if __name__ == "__main__":

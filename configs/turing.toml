@@ -1,0 +1,59 @@
+[cluster]
+enabled = true
+netid = "<netid>"
+scratch_root = "/local/scratch/<netid>/forward-risk-manager"
+repo_root = "/local/scratch/<netid>/forward-risk-manager/repo"
+data_root = "/local/scratch/<netid>/forward-risk-manager/data"
+runs_root = "/local/scratch/<netid>/forward-risk-manager/runs"
+cache_root = "/local/scratch/<netid>/forward-risk-manager/.cache"
+logs_root = "/local/scratch/<netid>/forward-risk-manager/logs"
+stage_graphs_to_local_nvme = false
+sync_back_enabled = false
+
+[build_graphs]
+prices = "/local/scratch/<netid>/forward-risk-manager/data/processed/prices.csv"
+constituents = "/local/scratch/<netid>/forward-risk-manager/data/processed/constituents.csv"
+out = "/local/scratch/<netid>/forward-risk-manager/data/processed/graphs_master_ff_rich.pt"
+workers = 8
+
+[train]
+graphs = "/local/scratch/<netid>/forward-risk-manager/data/processed/graphs_master_ff_rich.pt.sharded"
+device = "cuda"
+loader_workers = 4
+dataloader_pin_memory = true
+dataloader_persistent_workers = true
+torch_compile = true
+resume_enabled = true
+resume_save_every_epochs = 1
+resume_save_every_minutes = 55
+resume_on_signal = true
+distributed = true
+distributed_backend = "nccl"
+risk_cache_dir = "/local/scratch/<netid>/forward-risk-manager/.cache/risk"
+portfolio_cache_dir = "/local/scratch/<netid>/forward-risk-manager/.cache/portfolio"
+auto_tune_cache_path = "/local/scratch/<netid>/forward-risk-manager/.cache/auto_tune_batch.json"
+log_csv = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/metrics/ff_train.csv"
+plot_path = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/plots/ff_train.png"
+save_encoder = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/models/encoder.pt"
+save_critic = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/models/critic.pt"
+resume_state_path = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/models/train_resume.pt"
+
+[benchmark]
+torch_compile = false
+resume_enabled = true
+resume_save_every_epochs = 1
+resume_save_every_minutes = 55
+resume_on_signal = true
+distributed = true
+distributed_backend = "nccl"
+out_csv = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/metrics/benchmark.csv"
+baseline_out_csv = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/metrics/benchmark_baseline.csv"
+walk_forward_out_csv = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/metrics/benchmark_walk_forward_folds.csv"
+plot_path = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/plots/benchmark_speed_sep.png"
+bar_plot_path = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/plots/benchmark_bar.png"
+resume_dir = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/models/benchmark_resume"
+
+[sweep]
+distributed = true
+distributed_backend = "nccl"
+out_csv = "/local/scratch/<netid>/forward-risk-manager/runs/experiments/turing_default/metrics/ff_sweep.csv"
