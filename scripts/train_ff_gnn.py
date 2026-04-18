@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 import random
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import hashlib
 import math
 import time

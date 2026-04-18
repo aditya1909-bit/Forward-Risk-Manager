@@ -8,7 +8,10 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 import numpy as np
 import pandas as pd
