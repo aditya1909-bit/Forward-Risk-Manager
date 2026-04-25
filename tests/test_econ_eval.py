@@ -68,6 +68,28 @@ def test_evaluate_goodness_strategy_slippage_reduces_strategy_returns():
     assert with_slip["econ_strategy_total_return"] <= no_slip["econ_strategy_total_return"] + 1e-9
 
 
+def test_evaluate_goodness_strategy_reports_exposure_adjusted_baseline():
+    dates = pd.date_range("2020-01-01", periods=120, freq="D")
+    goodness = np.linspace(-1.0, 1.0, num=120)
+    fwd = pd.Series(0.002 + 0.004 * np.sin(np.linspace(0, 8, num=120)), index=dates)
+
+    out = evaluate_goodness_strategy(
+        dates=dates,
+        goodness_scores=goodness,
+        fwd_ret_1=fwd,
+        signal_window=30,
+        signal_quantile=0.6,
+        turnover_cost_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert np.isfinite(out["econ_exposure_benchmark_exposure"])
+    assert 0.0 <= out["econ_exposure_benchmark_exposure"] <= 1.0
+    assert np.isfinite(out["econ_exposure_benchmark_ann_return"])
+    assert np.isfinite(out["econ_exposure_adjusted_ann_return_uplift"])
+    assert np.isfinite(out["econ_exposure_adjusted_sharpe_uplift"])
+
+
 def test_load_forward_returns_from_prices_uses_close_and_dedups(tmp_path):
     csv_path = tmp_path / "prices.csv"
     df = pd.DataFrame(

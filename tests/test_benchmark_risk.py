@@ -66,6 +66,39 @@ def test_compute_multi_horizon_risk_loss_returns_none_for_all_missing_targets():
     assert loss is None
 
 
+def test_select_calibrated_goodness_target_falls_back_for_all_nan():
+    mod = _load_script("benchmark_training.py")
+    out = mod._select_calibrated_goodness_target(
+        torch.tensor([float("nan"), float("inf")]),
+        torch.tensor([float("nan"), float("-inf")]),
+        default_target=2.0,
+        quantiles=7,
+    )
+
+    assert out["target"] == 2.0
+    assert out["valid"] == 0
+    assert out["num_pos"] == 0
+    assert out["num_neg"] == 0
+    assert out["reason"] == "insufficient_finite_goodness"
+
+
+def test_select_calibrated_goodness_target_reports_valid_diagnostics():
+    mod = _load_script("benchmark_training.py")
+    out = mod._select_calibrated_goodness_target(
+        torch.tensor([2.0, 3.0, float("nan")]),
+        torch.tensor([-1.0, 0.0, float("inf")]),
+        default_target=1.0,
+        quantiles=9,
+    )
+
+    assert torch.isfinite(torch.tensor(float(out["target"])))
+    assert out["valid"] == 1
+    assert out["num_pos"] == 2
+    assert out["num_neg"] == 2
+    assert out["reason"] == "ok"
+    assert float(out["acc"]) >= 0.5
+
+
 def test_aggregate_fold_results_preserves_objective_metadata():
     mod = _load_script("benchmark_training.py")
     fold_rows = [

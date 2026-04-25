@@ -2259,13 +2259,15 @@ def main() -> int:
         base["loader_workers"] = worker_loader_workers
 
     if parallel_workers <= 1:
-        # serial execution; load graphs once
-        try:
-            payload = torch.load(graphs_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(graphs_path, map_location="cpu")
-        graphs = payload["graphs"] if isinstance(payload, dict) else payload
-        graph_dates = payload.get("dates", []) if isinstance(payload, dict) else []
+        # Serial execution; load graphs once, including sharded artifacts used on Turing.
+        artifact = load_graph_artifact(
+            graphs_path,
+            include_tickers=False,
+            prefer_lazy=True,
+            prefer_sharded=True,
+        )
+        graphs = artifact.graphs
+        graph_dates = artifact.dates
         if graph_dates and len(graph_dates) != len(graphs):
             graph_dates = []
         if not graphs:

@@ -372,6 +372,28 @@ def evaluate_goodness_strategy(
         "econ_strategy_var_95_daily": float("nan"),
         "econ_strategy_cvar_95_daily": float("nan"),
         "econ_strategy_hit_rate_daily": float("nan"),
+        "econ_exposure_benchmark_exposure": float("nan"),
+        "econ_exposure_benchmark_total_return": float("nan"),
+        "econ_exposure_benchmark_ann_return": float("nan"),
+        "econ_exposure_benchmark_ann_vol": float("nan"),
+        "econ_exposure_benchmark_sharpe": float("nan"),
+        "econ_exposure_benchmark_sortino": float("nan"),
+        "econ_exposure_benchmark_calmar": float("nan"),
+        "econ_exposure_benchmark_max_drawdown": float("nan"),
+        "econ_exposure_benchmark_max_drawdown_duration_days": float("nan"),
+        "econ_exposure_benchmark_var_95_daily": float("nan"),
+        "econ_exposure_benchmark_cvar_95_daily": float("nan"),
+        "econ_exposure_benchmark_hit_rate_daily": float("nan"),
+        "econ_exposure_adjusted_total_return_uplift": float("nan"),
+        "econ_exposure_adjusted_ann_return_uplift": float("nan"),
+        "econ_exposure_adjusted_sharpe_uplift": float("nan"),
+        "econ_exposure_adjusted_sortino_uplift": float("nan"),
+        "econ_exposure_adjusted_calmar_uplift": float("nan"),
+        "econ_exposure_adjusted_max_drawdown_delta": float("nan"),
+        "econ_exposure_adjusted_max_drawdown_duration_delta": float("nan"),
+        "econ_exposure_adjusted_var_95_daily_delta": float("nan"),
+        "econ_exposure_adjusted_cvar_95_daily_delta": float("nan"),
+        "econ_exposure_adjusted_hit_rate_delta": float("nan"),
         "econ_ann_return_uplift": float("nan"),
         "econ_sharpe_uplift": float("nan"),
         "econ_sortino_uplift": float("nan"),
@@ -581,6 +603,16 @@ def evaluate_goodness_strategy(
         effective = "high"
 
     exposure, strat_ret_1, turnover, borrow_cost_rate, st = candidates[effective]
+    exposure_benchmark_weight = (
+        float(np.nanmean(np.abs(exposure))) if exposure.size and np.isfinite(exposure).any() else 0.6
+    )
+    exposure_benchmark_weight = float(np.clip(exposure_benchmark_weight, 0.0, max(0.0, max_exposure)))
+    exposure_benchmark_ret_1 = exposure_benchmark_weight * bench_ret_1
+    exposure_benchmark = strategy_stats(
+        "exposure_adjusted_buy_and_hold",
+        exposure_benchmark_ret_1,
+        trading_days=trading_days,
+    )
     out["econ_signal_polarity_effective"] = effective
     out["econ_regime_exposure_mean"] = float(np.nanmean(exposure)) if exposure.size else float("nan")
     out.update(
@@ -608,6 +640,60 @@ def evaluate_goodness_strategy(
             "econ_strategy_var_95_daily": float(st["var_95_daily"]),
             "econ_strategy_cvar_95_daily": float(st["cvar_95_daily"]),
             "econ_strategy_hit_rate_daily": float(st["hit_rate_daily"]),
+            "econ_exposure_benchmark_exposure": exposure_benchmark_weight,
+            "econ_exposure_benchmark_total_return": float(exposure_benchmark["total_return"]),
+            "econ_exposure_benchmark_ann_return": float(exposure_benchmark["ann_return"]),
+            "econ_exposure_benchmark_ann_vol": float(exposure_benchmark["ann_vol"]),
+            "econ_exposure_benchmark_sharpe": float(exposure_benchmark["sharpe"]),
+            "econ_exposure_benchmark_sortino": float(exposure_benchmark["sortino"]),
+            "econ_exposure_benchmark_calmar": float(exposure_benchmark["calmar"]),
+            "econ_exposure_benchmark_max_drawdown": float(exposure_benchmark["max_drawdown"]),
+            "econ_exposure_benchmark_max_drawdown_duration_days": float(
+                exposure_benchmark["max_drawdown_duration_days"]
+            ),
+            "econ_exposure_benchmark_var_95_daily": float(exposure_benchmark["var_95_daily"]),
+            "econ_exposure_benchmark_cvar_95_daily": float(exposure_benchmark["cvar_95_daily"]),
+            "econ_exposure_benchmark_hit_rate_daily": float(exposure_benchmark["hit_rate_daily"]),
+            "econ_exposure_adjusted_total_return_uplift": _nan_sub(
+                float(st["total_return"]),
+                float(exposure_benchmark["total_return"]),
+            ),
+            "econ_exposure_adjusted_ann_return_uplift": _nan_sub(
+                float(st["ann_return"]),
+                float(exposure_benchmark["ann_return"]),
+            ),
+            "econ_exposure_adjusted_sharpe_uplift": _nan_sub(
+                float(st["sharpe"]),
+                float(exposure_benchmark["sharpe"]),
+            ),
+            "econ_exposure_adjusted_sortino_uplift": _nan_sub(
+                float(st["sortino"]),
+                float(exposure_benchmark["sortino"]),
+            ),
+            "econ_exposure_adjusted_calmar_uplift": _nan_sub(
+                float(st["calmar"]),
+                float(exposure_benchmark["calmar"]),
+            ),
+            "econ_exposure_adjusted_max_drawdown_delta": _nan_sub(
+                float(st["max_drawdown"]),
+                float(exposure_benchmark["max_drawdown"]),
+            ),
+            "econ_exposure_adjusted_max_drawdown_duration_delta": _nan_sub(
+                float(st["max_drawdown_duration_days"]),
+                float(exposure_benchmark["max_drawdown_duration_days"]),
+            ),
+            "econ_exposure_adjusted_var_95_daily_delta": _nan_sub(
+                float(st["var_95_daily"]),
+                float(exposure_benchmark["var_95_daily"]),
+            ),
+            "econ_exposure_adjusted_cvar_95_daily_delta": _nan_sub(
+                float(st["cvar_95_daily"]),
+                float(exposure_benchmark["cvar_95_daily"]),
+            ),
+            "econ_exposure_adjusted_hit_rate_delta": _nan_sub(
+                float(st["hit_rate_daily"]),
+                float(exposure_benchmark["hit_rate_daily"]),
+            ),
             "econ_ann_return_uplift": _nan_sub(float(st["ann_return"]), float(bh["ann_return"])),
             "econ_sharpe_uplift": _nan_sub(float(st["sharpe"]), float(bh["sharpe"])),
             "econ_sortino_uplift": _nan_sub(float(st["sortino"]), float(bh["sortino"])),

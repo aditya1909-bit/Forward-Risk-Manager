@@ -1256,9 +1256,26 @@ def _calibrate_goodness_target(
     quantiles: int = 31,
     goodness_kwargs: dict | None = None,
 ):
+    def _fallback(reason: str, pos_n: int = 0, neg_n: int = 0):
+        return {
+            "target": float(default_target),
+            "acc": 0.0,
+            "valid": 0,
+            "num_pos": int(pos_n),
+            "num_neg": int(neg_n),
+            "reason": reason,
+        }
+
     goodness_kwargs = goodness_kwargs or {}
     if str(neg_mode).strip().lower() == "self_contrastive":
-        return float(default_target), float("nan")
+        return {
+            "target": float(default_target),
+            "acc": float("nan"),
+            "valid": 0,
+            "num_pos": 0,
+            "num_neg": 0,
+            "reason": "self_contrastive_uses_default",
+        }
     model.eval()
     pos_vals = []
     neg_vals = []
@@ -1325,16 +1342,51 @@ def _calibrate_goodness_target(
         neg_vals.append(g_neg.detach().cpu())
 
     if not pos_vals or not neg_vals:
-        return float(default_target), 0.0
+        return _fallback("no_calibration_batches")
 
     pos_all = torch.cat(pos_vals)
     neg_all = torch.cat(neg_vals)
+    return _select_calibrated_goodness_target(
+        pos_all,
+        neg_all,
+        default_target=default_target,
+        quantiles=quantiles,
+    )
+
+
+def _select_calibrated_goodness_target(
+    pos_all,
+    neg_all,
+    *,
+    default_target,
+    quantiles: int = 31,
+):
+    pos_all = torch.as_tensor(pos_all, dtype=torch.float32).flatten()
+    neg_all = torch.as_tensor(neg_all, dtype=torch.float32).flatten()
+    pos_all = pos_all[torch.isfinite(pos_all)]
+    neg_all = neg_all[torch.isfinite(neg_all)]
+    pos_n = int(pos_all.numel())
+    neg_n = int(neg_all.numel())
+
+    def _fallback(reason: str):
+        return {
+            "target": float(default_target),
+            "acc": 0.0,
+            "valid": 0,
+            "num_pos": pos_n,
+            "num_neg": neg_n,
+            "reason": reason,
+        }
+
+    if pos_n < 1 or neg_n < 1:
+        return _fallback("insufficient_finite_goodness")
+
     vals = torch.cat([pos_all, neg_all])
     qn = max(5, int(quantiles))
     qs = torch.linspace(0.02, 0.98, steps=qn)
     cands = torch.quantile(vals, qs).unique()
     if cands.numel() == 0:
-        return float(default_target), 0.0
+        return _fallback("no_candidate_quantiles")
 
     best_target = float(default_target)
     best_acc = -1.0
@@ -1348,7 +1400,16 @@ def _calibrate_goodness_target(
             best_acc = acc
             best_target = t
 
-    return best_target, best_acc
+    if not np.isfinite(best_target) or not np.isfinite(best_acc):
+        return _fallback("nonfinite_calibration_result")
+    return {
+        "target": float(best_target),
+        "acc": float(best_acc),
+        "valid": 1,
+        "num_pos": pos_n,
+        "num_neg": neg_n,
+        "reason": "ok",
+    }
 
 
 def _benchmark_ff(
@@ -2091,11 +2152,15 @@ def _benchmark_ff(
 
     target_eval = float(config["goodness_target"])
     target_cal_acc = float("nan")
+    target_calibration_valid = 0
+    target_calibration_num_pos = 0
+    target_calibration_num_neg = 0
+    target_calibration_reason = "not_run"
     if bool(config.get("calibrate_target", True)) and eval_mode != "self_contrastive":
         calib_loader = DataLoader(
             train_graphs, batch_size=config["batch_size"], shuffle=False
         )
-        target_eval, target_cal_acc = _calibrate_goodness_target(
+        target_calibration = _calibrate_goodness_target(
             model,
             critic,
             calib_loader,
@@ -2110,9 +2175,16 @@ def _benchmark_ff(
             quantiles=int(config.get("calibrate_quantiles", 31)),
             goodness_kwargs=goodness_kwargs,
         )
+        target_eval = float(target_calibration["target"])
+        target_cal_acc = float(target_calibration["acc"])
+        target_calibration_valid = int(target_calibration["valid"])
+        target_calibration_num_pos = int(target_calibration["num_pos"])
+        target_calibration_num_neg = int(target_calibration["num_neg"])
+        target_calibration_reason = str(target_calibration["reason"])
         print(
             "calibrated goodness_target="
-            f"{target_eval:.4f} (train-cal acc={target_cal_acc:.4f})"
+            f"{target_eval:.4f} (train-cal acc={target_cal_acc:.4f}, "
+            f"valid={target_calibration_valid}, reason={target_calibration_reason})"
         )
 
     eval_metrics = _eval_ff_metrics(
@@ -2154,6 +2226,10 @@ def _benchmark_ff(
         "time_to_target_metric": float("nan"),
         "goodness_target_eval": target_eval,
         "target_cal_acc": target_cal_acc,
+        "target_calibration_valid": target_calibration_valid,
+        "target_calibration_num_pos": target_calibration_num_pos,
+        "target_calibration_num_neg": target_calibration_num_neg,
+        "target_calibration_reason": target_calibration_reason,
         "neg_mode_effective": train_neg_mode,
         "eval_neg_mode_effective": eval_mode,
         "task_family": str(config.get("task_family", "custom")),

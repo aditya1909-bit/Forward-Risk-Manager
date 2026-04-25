@@ -1,0 +1,60 @@
+[cluster]
+enabled = true
+netid = "asdutta"
+scratch_root = "/local/scratch/asdutta/forward-risk-manager"
+repo_root = "/local/scratch/asdutta/forward-risk-manager/repo"
+data_root = "/local/scratch/asdutta/forward-risk-manager/data"
+runs_root = "/local/scratch/asdutta/forward-risk-manager/runs"
+cache_root = "/local/scratch/asdutta/forward-risk-manager/.cache"
+logs_root = "/local/scratch/asdutta/forward-risk-manager/logs"
+stage_graphs_to_local_nvme = false
+sync_back_enabled = false
+
+[train]
+graphs = "/local/scratch/asdutta/forward-risk-manager/data/processed/graphs_master_ff_rich.pt.sharded"
+device = "cuda"
+loader_workers = 4
+dataloader_pin_memory = true
+dataloader_persistent_workers = true
+torch_compile = false
+distributed = false
+risk_head_enabled = true
+risk_ticker = "SPY"
+portfolio_head_enabled = true
+portfolio_ticker = "SPY"
+resume_enabled = true
+resume_save_every_epochs = 1
+resume_save_every_minutes = 55
+resume_on_signal = true
+risk_cache_dir = "/local/scratch/asdutta/forward-risk-manager/.cache/risk"
+portfolio_cache_dir = "/local/scratch/asdutta/forward-risk-manager/.cache/portfolio"
+auto_tune_cache_path = "/local/scratch/asdutta/forward-risk-manager/.cache/auto_tune_batch.json"
+log_csv = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/metrics/ff_train.csv"
+plot_path = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/plots/ff_train.png"
+save_encoder = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/models/encoder.pt"
+save_critic = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/models/critic.pt"
+resume_state_path = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/models/train_resume.pt"
+
+[benchmark]
+torch_compile = false
+distributed = false
+enable_risk_head = true
+enable_portfolio_head = true
+econ_enabled = true
+econ_ticker = "SPY"
+resume_enabled = true
+resume_save_every_epochs = 1
+resume_save_every_minutes = 55
+resume_on_signal = true
+out_csv = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/metrics/benchmark.csv"
+baseline_out_csv = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/metrics/benchmark_baseline.csv"
+walk_forward_out_csv = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/metrics/benchmark_walk_forward_folds.csv"
+plot_path = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/plots/benchmark_speed_sep.png"
+bar_plot_path = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/plots/benchmark.png"
+resume_dir = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/models/benchmark_resume"
+seeds = [7, 17, 27]
+walk_forward_max_folds = 0
+
+[sweep]
+distributed = false
+out_csv = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ/metrics/ff_sweep.csv"
