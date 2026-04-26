@@ -6,7 +6,10 @@ import csv
 import math
 import time
 from pathlib import Path
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 
 def _load_config(path: Path) -> dict:

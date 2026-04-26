@@ -31,4 +31,4 @@ python scripts/prepare_turing_run.py \
 
 python scripts/benchmark_training.py \
   --config "${RUNTIME_CFG}" \
-  --modes ff_financial,backprop_supervised_return
+  --modes ff_e2e,backprop_supervised_return

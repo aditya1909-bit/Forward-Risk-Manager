@@ -35,6 +35,19 @@ save_encoder = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/tur
 save_critic = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ_large/models/critic.pt"
 resume_state_path = "/local/scratch/asdutta/forward-risk-manager/runs/experiments/turing_econ_large/models/train_resume.pt"
 
+goodness_target = 2.2
+goodness_temp = 0.2
+neg_mode = "shuffle+noise"
+neg_mix_end = 0.75
+hallucinate_steps = 3
+hallucinate_lr = 0.025
+hallucinate_node_fraction = 0.35
+layerwise_neg_mode = "shuffle+noise"
+layerwise_noise_std = 0.12
+layerwise_hall_corr = 0.0
+layerwise_hall_mean = 0.01
+layerwise_hall_std = 0.01
+ff_layerwise = false
 [benchmark]
 epochs = 20
 batch_size = 32
