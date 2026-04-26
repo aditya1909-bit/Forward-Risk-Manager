@@ -62,7 +62,7 @@ def _strip_prefix(path: str, prefix: str) -> str:
 
 
 def _rewrite_path(raw: str, *, section: str, key: str, layout) -> str:
-    text = str(raw).strip()
+    text = str(raw).strip().replace("<netid>", layout.netid).replace("{netid}", layout.netid)
     if not text:
         return text
     value = Path(text).expanduser()
@@ -93,12 +93,15 @@ def _rewrite_path(raw: str, *, section: str, key: str, layout) -> str:
     return text
 
 
-def _merge_cluster_config(base_cfg: dict, overlay_cfg: dict) -> dict:
+def _merge_overlay_config(base_cfg: dict, overlay_cfg: dict) -> dict:
     out = dict(base_cfg)
-    overlay_cluster = dict(overlay_cfg.get("cluster", {}))
-    base_cluster = dict(out.get("cluster", {}))
-    base_cluster.update(overlay_cluster)
-    out["cluster"] = base_cluster
+    for section_name, overlay_section in overlay_cfg.items():
+        if isinstance(overlay_section, dict) and isinstance(out.get(section_name), dict):
+            merged_section = dict(out[section_name])
+            merged_section.update(overlay_section)
+            out[section_name] = merged_section
+        else:
+            out[section_name] = overlay_section
     return out
 
 
@@ -131,9 +134,10 @@ def main() -> int:
 
     base_path = Path(args.base_config).expanduser().resolve()
     runtime_path = Path(args.runtime_config).expanduser().resolve()
-    cfg = _load_config(base_path)
+    base_cfg = _load_config(base_path)
+    cfg = base_cfg
     if args.cluster_config:
-        cfg = _merge_cluster_config(cfg, _load_config(Path(args.cluster_config).expanduser().resolve()))
+        cfg = _merge_overlay_config(cfg, _load_config(Path(args.cluster_config).expanduser().resolve()))
 
     cluster_cfg = dict(cfg.get("cluster", {}))
     if args.netid.strip():
@@ -147,6 +151,17 @@ def main() -> int:
         cluster_cfg["logs_root"] = str(Path(args.scratch_root).expanduser() / "logs")
     cluster_cfg["enabled"] = True
     layout = resolve_cluster_layout(cluster_cfg)
+    cluster_cfg.update(
+        {
+            "netid": layout.netid,
+            "scratch_root": str(layout.scratch_root),
+            "repo_root": str(layout.repo_root),
+            "data_root": str(layout.data_root),
+            "runs_root": str(layout.runs_root),
+            "cache_root": str(layout.cache_root),
+            "logs_root": str(layout.logs_root),
+        }
+    )
 
     overrides: dict[str, dict[str, object]] = {"cluster": cluster_cfg}
     for root in (
@@ -162,12 +177,17 @@ def main() -> int:
     for section_name, section in cfg.items():
         if not isinstance(section, dict) or section_name == "cluster":
             continue
+        base_section = base_cfg.get(section_name, {})
+        if not isinstance(base_section, dict):
+            base_section = {}
         section_overrides: dict[str, object] = {}
         for key, value in section.items():
             if not isinstance(value, str):
+                if base_section.get(key) != value:
+                    section_overrides[key] = value
                 continue
             rewritten = _rewrite_path(value, section=section_name, key=key, layout=layout)
-            if rewritten != value:
+            if rewritten != base_section.get(key):
                 section_overrides[key] = rewritten
         if section_name == "train" and args.graph_source.strip():
             section_overrides["graphs"] = str(Path(args.graph_source).expanduser().resolve())

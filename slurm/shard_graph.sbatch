@@ -14,7 +14,7 @@ SCRATCH_ROOT="/local/scratch/${NETID}/forward-risk-manager"
 REPO_ROOT="${SCRATCH_ROOT}/repo"
 
 cd "${REPO_ROOT}"
-source "${SCRATCH_ROOT}/venv/bin/activate"
+source "/local/scratch/$USER/venv/bin/activate"
 export XDG_CACHE_HOME="${SCRATCH_ROOT}/.cache"
 
 python scripts/shard_graph_artifact.py \
