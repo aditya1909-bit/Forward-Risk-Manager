@@ -1,0 +1,5 @@
+model,mode,primary_metric,primary_eval_metric,econ_ls_oos_sharpe_uplift_min,econ_ls_sharpe_uplift,econ_exposure_adjusted_sharpe_uplift,econ_oos_sharpe_uplift_min,econ_sharpe_uplift,graphs_per_s,time_tracked_step_s,avg_epoch_s,resume_loaded_completed,resume_schema_version,status
+Supervised Return,backprop_supervised_return,Exposure-adjusted Sharpe uplift,-0.1005156179493511,,,-0.1005156179493511,,-0.0855977404628065,30.245538529457917,0.0631475449838028,245.76918955257284,True,2,ok
+FF Bootstrap Rank,ff_bootstrap_rank,Long/short Sharpe uplift,-0.5481162875215632,,-0.5481162875215632,-0.1689468242123892,,-0.1538442944122679,29.88137345059845,0.2564853428293833,248.19181325439123,True,2,ok
+FF Accurate,ff_accurate,Long/short Sharpe uplift,-0.6638573131724647,,-0.6638573131724647,-0.1913046960657723,,-0.1767908513886495,30.401321786020983,0.1463019681506467,244.69792692723263,True,2,ok
+FF Financial,ff_financial,Long/short Sharpe uplift,-0.717321781025574,,-0.717321781025574,-0.1421732995191535,,-0.1272686291691877,30.12092089888928,0.1382050988267359,246.517833598628,True,2,ok
