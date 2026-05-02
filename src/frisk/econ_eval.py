@@ -7,6 +7,7 @@ import re
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from frisk.ff import goodness
@@ -112,6 +113,33 @@ def load_forward_returns_from_prices(
     fwd_ret_1 = fwd_ret_1.dropna()
     fwd_ret_1.name = "fwd_ret_1"
     return fwd_ret_1.astype(float)
+
+
+def load_forward_returns_panel_from_prices(
+    prices_path: str | Path,
+    max_abs_logret: float = 0.5,
+) -> pd.DataFrame:
+    prices = pd.read_csv(prices_path)
+    prices["date"] = pd.to_datetime(prices["date"])
+    if "ticker" not in prices.columns:
+        raise ValueError(f"Ticker column not found in prices file: {prices_path}")
+    price_col = "adj_close" if "adj_close" in prices.columns else "close"
+    prices = prices[["date", "ticker", price_col]].copy()
+    prices["ticker"] = prices["ticker"].astype(str).str.upper().str.strip()
+    prices[price_col] = pd.to_numeric(prices[price_col], errors="coerce")
+    prices = prices.replace([np.inf, -np.inf], np.nan).dropna(subset=["date", "ticker", price_col])
+    prices = prices[prices[price_col] > 0]
+    if prices.empty:
+        raise ValueError(f"No valid prices found in {prices_path}")
+
+    panel = prices.pivot_table(index="date", columns="ticker", values=price_col, aggfunc="median")
+    panel = panel.sort_index()
+    logret = np.log(panel).diff()
+    if max_abs_logret and float(max_abs_logret) > 0:
+        logret = logret.clip(lower=-float(max_abs_logret), upper=float(max_abs_logret))
+    fwd = np.exp(logret.shift(-1)) - 1.0
+    fwd = fwd.dropna(how="all")
+    return fwd.astype(float)
 
 
 def _ticker_row_counts(prices_path: str | Path) -> dict[str, int]:
@@ -282,10 +310,80 @@ def infer_graph_goodness_with_uncertainty(
     return g_np, None
 
 
+def infer_node_goodness_with_uncertainty(
+    model,
+    graphs,
+    goodness_temp: float,
+    batch_size: int = 32,
+    critic=None,
+    norm: str = "none",
+) -> tuple[list[np.ndarray], list[np.ndarray | None]]:
+    if not graphs:
+        return [], []
+    model.eval()
+    loader = DataLoader(
+        graphs,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        drop_last=False,
+    )
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    norm_mode = str(norm).strip().lower()
+    out_scores: list[np.ndarray] = []
+    out_unc: list[np.ndarray | None] = []
+    member_node_energy = getattr(critic, "member_node_energy", None) if critic is not None else None
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            edge_weight = getattr(batch, "edge_weight", None)
+            edge_type = getattr(batch, "edge_type", None)
+            h = model(batch.x, batch.edge_index, edge_weight=edge_weight, edge_type=edge_type)
+            if norm_mode == "layernorm":
+                h = F.layer_norm(h, (h.size(-1),))
+            if critic is not None:
+                node_scores = critic.node_energy(h)
+                member_scores = member_node_energy(h) if callable(member_node_energy) else None
+            else:
+                node_scores = (h * h).mean(dim=1)
+                member_scores = None
+
+            _, segment_ids = torch.unique(batch.batch, sorted=True, return_inverse=True)
+            num_segments = int(segment_ids.max().item()) + 1 if segment_ids.numel() else 0
+            for gid in range(num_segments):
+                mask = segment_ids == gid
+                out_scores.append(np.asarray(node_scores[mask].detach().cpu().tolist(), dtype=float))
+                if member_scores is not None and member_scores.ndim == 2 and member_scores.size(0) > 1:
+                    std = member_scores[:, mask].std(dim=0, unbiased=False)
+                    out_unc.append(np.asarray(std.detach().cpu().tolist(), dtype=float))
+                else:
+                    out_unc.append(None)
+    return out_scores, out_unc
+
+
 def _nan_sub(a: float, b: float) -> float:
     if not (np.isfinite(a) and np.isfinite(b)):
         return float("nan")
     return float(a - b)
+
+
+def _weighted_turnover(
+    prev_weights: pd.Series | None,
+    next_weights: pd.Series,
+) -> float:
+    if prev_weights is None or prev_weights.empty:
+        return 0.0
+    aligned = pd.concat(
+        [
+            prev_weights.rename("prev"),
+            next_weights.rename("next"),
+        ],
+        axis=1,
+    ).fillna(0.0)
+    return float(0.5 * np.abs(aligned["next"] - aligned["prev"]).sum())
 
 
 def _rolling_regime_quantile(
@@ -771,4 +869,332 @@ def evaluate_goodness_strategy(
         if ann_uplifts:
             out["econ_oos_ann_return_uplift_mean"] = float(np.mean(ann_uplifts))
             out["econ_oos_ann_return_uplift_min"] = float(np.min(ann_uplifts))
+    return out
+
+
+def evaluate_cross_sectional_goodness_strategy(
+    dates,
+    node_tickers,
+    node_scores,
+    forward_returns: pd.DataFrame,
+    top_k: int | None = None,
+    bottom_k: int | None = None,
+    top_frac: float = 0.2,
+    bottom_frac: float = 0.2,
+    signal_polarity: str = "high",
+    turnover_cost_bps: float = 0.0,
+    short_borrow_bps: float = 0.0,
+    max_gross_exposure: float = 1.0,
+    trading_days: int = 252,
+    min_names: int = 4,
+    oos_folds: int = 4,
+    oos_min_fold_days: int = 63,
+    uncertainty_scores: list[np.ndarray | None] | None = None,
+    uncertainty_scale: float = 0.0,
+) -> dict[str, float | str]:
+    polarity_requested = str(signal_polarity or "high").strip().lower()
+    if polarity_requested not in {"high", "low", "auto"}:
+        polarity_requested = "high"
+    out = {
+        "econ_ls_num_days": 0.0,
+        "econ_ls_strategy_total_return": float("nan"),
+        "econ_ls_strategy_ann_return": float("nan"),
+        "econ_ls_strategy_ann_vol": float("nan"),
+        "econ_ls_strategy_sharpe": float("nan"),
+        "econ_ls_strategy_sortino": float("nan"),
+        "econ_ls_strategy_calmar": float("nan"),
+        "econ_ls_strategy_max_drawdown": float("nan"),
+        "econ_ls_strategy_max_drawdown_duration_days": float("nan"),
+        "econ_ls_strategy_var_95_daily": float("nan"),
+        "econ_ls_strategy_cvar_95_daily": float("nan"),
+        "econ_ls_strategy_hit_rate_daily": float("nan"),
+        "econ_ls_equal_weight_total_return": float("nan"),
+        "econ_ls_equal_weight_ann_return": float("nan"),
+        "econ_ls_equal_weight_ann_vol": float("nan"),
+        "econ_ls_equal_weight_sharpe": float("nan"),
+        "econ_ls_equal_weight_sortino": float("nan"),
+        "econ_ls_equal_weight_calmar": float("nan"),
+        "econ_ls_equal_weight_max_drawdown": float("nan"),
+        "econ_ls_equal_weight_max_drawdown_duration_days": float("nan"),
+        "econ_ls_equal_weight_var_95_daily": float("nan"),
+        "econ_ls_equal_weight_cvar_95_daily": float("nan"),
+        "econ_ls_equal_weight_hit_rate_daily": float("nan"),
+        "econ_ls_ann_return_uplift": float("nan"),
+        "econ_ls_sharpe_uplift": float("nan"),
+        "econ_ls_sortino_uplift": float("nan"),
+        "econ_ls_calmar_uplift": float("nan"),
+        "econ_ls_max_drawdown_delta": float("nan"),
+        "econ_ls_max_drawdown_duration_delta": float("nan"),
+        "econ_ls_var_95_daily_delta": float("nan"),
+        "econ_ls_cvar_95_daily_delta": float("nan"),
+        "econ_ls_hit_rate_delta": float("nan"),
+        "econ_ls_turnover_mean_daily": float("nan"),
+        "econ_ls_avg_cost_bps_applied": float("nan"),
+        "econ_ls_avg_borrow_bps_applied": float("nan"),
+        "econ_ls_signal_polarity_requested": polarity_requested,
+        "econ_ls_signal_polarity_effective": "high",
+        "econ_ls_top_frac": float(top_frac),
+        "econ_ls_bottom_frac": float(bottom_frac),
+        "econ_ls_top_k": float(top_k or 0),
+        "econ_ls_bottom_k": float(bottom_k or 0),
+        "econ_ls_min_names": float(max(2, int(min_names))),
+        "econ_ls_max_gross_exposure": float(max_gross_exposure),
+        "econ_ls_uncertainty_scale": float(uncertainty_scale),
+        "econ_ls_avg_names": float("nan"),
+        "econ_ls_avg_gross_exposure": float("nan"),
+        "econ_ls_oos_folds_requested": float(max(1, int(oos_folds))),
+        "econ_ls_oos_folds_used": 0.0,
+        "econ_ls_oos_min_fold_days": float(max(10, int(oos_min_fold_days))),
+        "econ_ls_oos_sharpe_uplift_mean": float("nan"),
+        "econ_ls_oos_sharpe_uplift_min": float("nan"),
+        "econ_ls_oos_ann_return_uplift_mean": float("nan"),
+        "econ_ls_oos_ann_return_uplift_min": float("nan"),
+    }
+    if (
+        dates is None
+        or len(dates) == 0
+        or not node_tickers
+        or not node_scores
+        or forward_returns is None
+        or forward_returns.empty
+    ):
+        return out
+
+    min_names = max(2, int(min_names))
+    max_gross = max(0.0, float(max_gross_exposure))
+    cost_bps = max(0.0, float(turnover_cost_bps))
+    borrow_bps = max(0.0, float(short_borrow_bps))
+    unc_scale = max(0.0, float(uncertainty_scale))
+    fwd = forward_returns.copy()
+    fwd.index = pd.to_datetime(fwd.index)
+    if fwd.index.has_duplicates:
+        fwd = fwd.groupby(level=0).mean()
+
+    def _build_candidate(high_first: bool):
+        strat_rets: list[float] = []
+        bench_rets: list[float] = []
+        turnovers: list[float] = []
+        borrow_rates: list[float] = []
+        names_used: list[int] = []
+        gross_used: list[float] = []
+        prev_weights: pd.Series | None = None
+
+        for idx, date_raw in enumerate(dates):
+            if idx >= len(node_tickers) or idx >= len(node_scores):
+                break
+            date = pd.to_datetime(date_raw)
+            if date not in fwd.index:
+                continue
+            tickers = [str(t).upper().strip() for t in list(node_tickers[idx])]
+            scores = np.asarray(node_scores[idx], dtype=float)
+            if scores.size != len(tickers):
+                continue
+            unc = None
+            if uncertainty_scores is not None and idx < len(uncertainty_scores):
+                unc_raw = uncertainty_scores[idx]
+                if unc_raw is not None:
+                    unc_arr = np.asarray(unc_raw, dtype=float)
+                    if unc_arr.shape == scores.shape:
+                        unc = unc_arr
+            returns_row = fwd.loc[date]
+            if isinstance(returns_row, pd.DataFrame):
+                returns_row = returns_row.iloc[0]
+            returns_vals = returns_row.reindex(tickers).to_numpy(dtype=float)
+            mask = np.isfinite(scores) & np.isfinite(returns_vals)
+            if unc is not None:
+                mask = mask & np.isfinite(unc)
+            if int(mask.sum()) < min_names:
+                continue
+            tickers_arr = np.asarray(tickers, dtype=object)[mask]
+            score_arr = np.asarray(scores[mask], dtype=float)
+            return_arr = np.asarray(returns_vals[mask], dtype=float)
+            unc_arr = np.asarray(unc[mask], dtype=float) if unc is not None else None
+            if unc_arr is not None and unc_scale > 0:
+                score_rank = score_arr / (1.0 + unc_scale * np.maximum(0.0, unc_arr))
+            else:
+                score_rank = score_arr
+
+            n_names = int(score_arr.shape[0])
+            k_long = max(1, int(round(float(top_frac) * n_names)))
+            k_short = max(1, int(round(float(bottom_frac) * n_names)))
+            if top_k is not None and int(top_k) > 0:
+                k_long = min(k_long, int(top_k))
+            if bottom_k is not None and int(bottom_k) > 0:
+                k_short = min(k_short, int(bottom_k))
+            k_long = min(k_long, max(1, n_names // 2))
+            k_short = min(k_short, max(1, n_names - k_long))
+            if k_long < 1 or k_short < 1:
+                continue
+
+            order = np.argsort(score_rank)
+            long_idx = order[-k_long:] if high_first else order[:k_long]
+            short_idx = order[:k_short] if high_first else order[-k_short:]
+            selected_unc = None
+            if unc_arr is not None and (long_idx.size + short_idx.size) > 0:
+                selected_unc = float(
+                    np.nanmean(
+                        np.concatenate(
+                            [
+                                unc_arr[long_idx],
+                                unc_arr[short_idx],
+                            ]
+                        )
+                    )
+                )
+            gross_scale = 1.0
+            if selected_unc is not None and unc_scale > 0:
+                gross_scale = float(np.clip(np.exp(-unc_scale * max(0.0, selected_unc)), 0.0, 1.0))
+            gross = max_gross * gross_scale
+            long_weight_total = 0.5 * gross
+            short_weight_total = 0.5 * gross
+
+            weights = pd.Series(0.0, index=pd.Index(tickers_arr, dtype=object), dtype=float)
+            weights.iloc[long_idx] = weights.iloc[long_idx] + (long_weight_total / max(1, long_idx.size))
+            weights.iloc[short_idx] = weights.iloc[short_idx] - (short_weight_total / max(1, short_idx.size))
+            weights = weights.groupby(level=0).sum()
+            ret_aligned = returns_row.reindex(weights.index).to_numpy(dtype=float)
+            bench_mask = np.isfinite(return_arr)
+            bench_ret = float(np.nanmean(return_arr[bench_mask])) if np.any(bench_mask) else float("nan")
+            turnover = _weighted_turnover(prev_weights, weights)
+            borrow_rate = borrow_bps * 1e-4 * float(np.maximum(0.0, -weights).sum())
+            strat_ret = float(np.dot(weights.to_numpy(dtype=float), ret_aligned))
+            strat_ret -= cost_bps * 1e-4 * turnover
+            strat_ret -= borrow_rate
+
+            strat_rets.append(strat_ret)
+            bench_rets.append(bench_ret)
+            turnovers.append(turnover)
+            borrow_rates.append(borrow_rate)
+            names_used.append(int(n_names))
+            gross_used.append(float(np.abs(weights).sum()))
+            prev_weights = weights
+
+        return (
+            np.asarray(strat_rets, dtype=float),
+            np.asarray(bench_rets, dtype=float),
+            np.asarray(turnovers, dtype=float),
+            np.asarray(borrow_rates, dtype=float),
+            np.asarray(names_used, dtype=float),
+            np.asarray(gross_used, dtype=float),
+        )
+
+    candidates = {
+        "high": _build_candidate(high_first=True),
+        "low": _build_candidate(high_first=False),
+    }
+    effective = polarity_requested
+    if polarity_requested == "auto":
+        high_stats = strategy_stats("econ_ls_high", candidates["high"][0], trading_days=trading_days)
+        low_stats = strategy_stats("econ_ls_low", candidates["low"][0], trading_days=trading_days)
+        high_sharpe = float(high_stats.get("sharpe", float("nan")))
+        low_sharpe = float(low_stats.get("sharpe", float("nan")))
+        if np.isfinite(low_sharpe) and (not np.isfinite(high_sharpe) or low_sharpe > high_sharpe):
+            effective = "low"
+        else:
+            effective = "high"
+    elif effective not in candidates:
+        effective = "high"
+
+    strat_ret_1, bench_ret_1, turnover, borrow_rates, names_used, gross_used = candidates[effective]
+    if strat_ret_1.size == 0 or bench_ret_1.size == 0:
+        out["econ_ls_signal_polarity_effective"] = effective
+        return out
+
+    st = strategy_stats("goodness_cross_sectional_long_short", strat_ret_1, trading_days=trading_days)
+    bh = strategy_stats("constituent_equal_weight_long_only", bench_ret_1, trading_days=trading_days)
+    out.update(
+        {
+            "econ_ls_num_days": float(st["num_days"]),
+            "econ_ls_strategy_total_return": float(st["total_return"]),
+            "econ_ls_strategy_ann_return": float(st["ann_return"]),
+            "econ_ls_strategy_ann_vol": float(st["ann_vol"]),
+            "econ_ls_strategy_sharpe": float(st["sharpe"]),
+            "econ_ls_strategy_sortino": float(st["sortino"]),
+            "econ_ls_strategy_calmar": float(st["calmar"]),
+            "econ_ls_strategy_max_drawdown": float(st["max_drawdown"]),
+            "econ_ls_strategy_max_drawdown_duration_days": float(st["max_drawdown_duration_days"]),
+            "econ_ls_strategy_var_95_daily": float(st["var_95_daily"]),
+            "econ_ls_strategy_cvar_95_daily": float(st["cvar_95_daily"]),
+            "econ_ls_strategy_hit_rate_daily": float(st["hit_rate_daily"]),
+            "econ_ls_equal_weight_total_return": float(bh["total_return"]),
+            "econ_ls_equal_weight_ann_return": float(bh["ann_return"]),
+            "econ_ls_equal_weight_ann_vol": float(bh["ann_vol"]),
+            "econ_ls_equal_weight_sharpe": float(bh["sharpe"]),
+            "econ_ls_equal_weight_sortino": float(bh["sortino"]),
+            "econ_ls_equal_weight_calmar": float(bh["calmar"]),
+            "econ_ls_equal_weight_max_drawdown": float(bh["max_drawdown"]),
+            "econ_ls_equal_weight_max_drawdown_duration_days": float(bh["max_drawdown_duration_days"]),
+            "econ_ls_equal_weight_var_95_daily": float(bh["var_95_daily"]),
+            "econ_ls_equal_weight_cvar_95_daily": float(bh["cvar_95_daily"]),
+            "econ_ls_equal_weight_hit_rate_daily": float(bh["hit_rate_daily"]),
+            "econ_ls_ann_return_uplift": _nan_sub(float(st["ann_return"]), float(bh["ann_return"])),
+            "econ_ls_sharpe_uplift": _nan_sub(float(st["sharpe"]), float(bh["sharpe"])),
+            "econ_ls_sortino_uplift": _nan_sub(float(st["sortino"]), float(bh["sortino"])),
+            "econ_ls_calmar_uplift": _nan_sub(float(st["calmar"]), float(bh["calmar"])),
+            "econ_ls_max_drawdown_delta": _nan_sub(float(st["max_drawdown"]), float(bh["max_drawdown"])),
+            "econ_ls_max_drawdown_duration_delta": _nan_sub(
+                float(st["max_drawdown_duration_days"]),
+                float(bh["max_drawdown_duration_days"]),
+            ),
+            "econ_ls_var_95_daily_delta": _nan_sub(float(st["var_95_daily"]), float(bh["var_95_daily"])),
+            "econ_ls_cvar_95_daily_delta": _nan_sub(float(st["cvar_95_daily"]), float(bh["cvar_95_daily"])),
+            "econ_ls_hit_rate_delta": _nan_sub(float(st["hit_rate_daily"]), float(bh["hit_rate_daily"])),
+            "econ_ls_turnover_mean_daily": float(np.nanmean(turnover)) if turnover.size else 0.0,
+            "econ_ls_avg_cost_bps_applied": float(np.nanmean(1e4 * cost_bps * 1e-4 * turnover))
+            if turnover.size
+            else 0.0,
+            "econ_ls_avg_borrow_bps_applied": float(np.nanmean(1e4 * borrow_rates))
+            if borrow_rates.size
+            else 0.0,
+            "econ_ls_signal_polarity_effective": effective,
+            "econ_ls_avg_names": float(np.nanmean(names_used)) if names_used.size else float("nan"),
+            "econ_ls_avg_gross_exposure": float(np.nanmean(gross_used)) if gross_used.size else float("nan"),
+        }
+    )
+
+    valid_mask = np.isfinite(strat_ret_1) & np.isfinite(bench_ret_1)
+    strat_valid = np.asarray(strat_ret_1[valid_mask], dtype=float)
+    bench_valid = np.asarray(bench_ret_1[valid_mask], dtype=float)
+    requested_folds = max(1, int(oos_folds))
+    min_fold_days = max(10, int(oos_min_fold_days))
+    if requested_folds >= 2 and strat_valid.size >= 2 * min_fold_days:
+        max_folds = int(strat_valid.size // min_fold_days)
+        use_folds = max(2, min(requested_folds, max_folds))
+        base_fold_size = int(strat_valid.size // use_folds)
+        remainder = int(strat_valid.size % use_folds)
+        start = 0
+        used_folds = 0
+        sharpe_uplifts: list[float] = []
+        ann_uplifts: list[float] = []
+        for fold_idx in range(use_folds):
+            fold_size = base_fold_size + (1 if fold_idx < remainder else 0)
+            end = start + fold_size
+            if fold_size < min_fold_days:
+                start = end
+                continue
+            st_fold = strategy_stats(
+                f"goodness_cross_sectional_long_short_fold_{fold_idx}",
+                strat_valid[start:end],
+                trading_days=trading_days,
+            )
+            bh_fold = strategy_stats(
+                f"constituent_equal_weight_long_only_fold_{fold_idx}",
+                bench_valid[start:end],
+                trading_days=trading_days,
+            )
+            sharpe_u = _nan_sub(float(st_fold["sharpe"]), float(bh_fold["sharpe"]))
+            ann_u = _nan_sub(float(st_fold["ann_return"]), float(bh_fold["ann_return"]))
+            if np.isfinite(sharpe_u):
+                sharpe_uplifts.append(float(sharpe_u))
+            if np.isfinite(ann_u):
+                ann_uplifts.append(float(ann_u))
+            used_folds += 1
+            start = end
+        out["econ_ls_oos_folds_used"] = float(used_folds)
+        if sharpe_uplifts:
+            out["econ_ls_oos_sharpe_uplift_mean"] = float(np.mean(sharpe_uplifts))
+            out["econ_ls_oos_sharpe_uplift_min"] = float(np.min(sharpe_uplifts))
+        if ann_uplifts:
+            out["econ_ls_oos_ann_return_uplift_mean"] = float(np.mean(ann_uplifts))
+            out["econ_ls_oos_ann_return_uplift_min"] = float(np.min(ann_uplifts))
     return out

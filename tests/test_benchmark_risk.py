@@ -303,6 +303,20 @@ def test_apply_mode_profile_sets_algorithmic_parity_core_defaults():
     assert cfg["goodness_reducer"] == "logsumexp"
 
 
+def test_apply_mode_profile_sets_bootstrap_rank_finance_defaults():
+    mod = _load_script("benchmark_training.py")
+    mode, cfg = mod._apply_mode_profile("ff_bootstrap_rank", {"hidden_dim": 32})
+    assert mode == "ff_bootstrap_rank"
+    assert cfg["task_family"] == "financial_value"
+    assert cfg["signal_family"] == "goodness_rank"
+    assert cfg["ff_loss_type"] == "symba"
+    assert cfg["goodness_norm"] == "layernorm"
+    assert cfg["goodness_reducer"] == "mean"
+    assert cfg["bootstrap_graph_enabled"] is True
+    assert float(cfg["bootstrap_graph_weight"]) > 0.0
+    assert str(cfg["econ_strategy_kind"]) == "both"
+
+
 def test_attach_primary_metrics_prefers_economics_for_financial_track():
     mod = _load_script("benchmark_training.py")
     row = {
@@ -316,6 +330,21 @@ def test_attach_primary_metrics_prefers_economics_for_financial_track():
     assert row["primary_eval_metric_name"] == "econ_oos_sharpe_uplift_min"
     assert float(row["primary_eval_metric"]) == 0.12
     assert row["primary_metric_family"] == "economics"
+
+
+def test_attach_primary_metrics_prefers_long_short_metric_for_goodness_rank():
+    mod = _load_script("benchmark_training.py")
+    row = {
+        "task_family": "financial_value",
+        "signal_family": "goodness_rank",
+        "eval_objective": "ff",
+        "econ_ls_oos_sharpe_uplift_min": 0.08,
+        "econ_oos_sharpe_uplift_min": 0.02,
+        "eval_sep": 0.5,
+    }
+    mod._attach_primary_metrics(row)
+    assert row["primary_eval_metric_name"] == "econ_ls_oos_sharpe_uplift_min"
+    assert float(row["primary_eval_metric"]) == 0.08
 
 
 def test_regression_eval_metrics_reports_finite_regression_outputs():

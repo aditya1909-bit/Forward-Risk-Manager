@@ -71,6 +71,10 @@ def compute_portfolio_head_loss(
     device: torch.device,
     loss_type: str,
     sample_weight: torch.Tensor | None = None,
+    cara_risk_aversion: float = 1.0,
+    baseline_exposure: float = 0.0,
+    delta_scale: float = 1.0,
+    max_abs_exposure: float = 1.0,
 ) -> torch.Tensor | None:
     target, mask = graph_target_tensor(graph_idx, portfolio_targets, device=device)
     if target is None or mask is None or not mask.any():
@@ -93,6 +97,21 @@ def compute_portfolio_head_loss(
             return err.mean()
         return _weighted_mean_loss(err, weight[mask])
 
+    if loss_mode in {"cara", "delta_cara", "baseline_cara"}:
+        risk_aversion = max(1e-6, float(cara_risk_aversion))
+        exposure = pred
+        if loss_mode != "cara":
+            exposure = float(baseline_exposure) + float(delta_scale) * exposure
+        exposure = exposure.clamp(
+            min=-abs(float(max_abs_exposure)),
+            max=abs(float(max_abs_exposure)),
+        )
+        pnl = exposure[mask] * target[mask]
+        utility_loss = torch.exp(-risk_aversion * pnl)
+        if weight is None:
+            return utility_loss.mean()
+        return _weighted_mean_loss(utility_loss, weight[mask])
+
     pnl = pred[mask] * target[mask]
     if pnl.numel() == 0:
         return None
@@ -107,6 +126,76 @@ def compute_portfolio_head_loss(
         mean = (pnl * w).sum()
         std = torch.sqrt(((pnl - mean).pow(2) * w).sum() + 1e-6)
     return -(mean / std)
+
+
+def bootstrap_graph_latent_loss(
+    predictor: torch.nn.Module,
+    online_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
+) -> torch.Tensor | None:
+    if online_embeddings.ndim != 2 or target_embeddings.ndim != 2:
+        raise ValueError("Expected graph embeddings with shape [num_graphs, dim]")
+    if online_embeddings.shape != target_embeddings.shape:
+        raise ValueError(
+            "online_embeddings and target_embeddings must have the same shape"
+        )
+    if online_embeddings.numel() == 0:
+        return None
+    pred = predictor(online_embeddings)
+    if pred.shape != target_embeddings.shape:
+        raise ValueError(
+            f"bootstrap predictor output mismatch: pred={tuple(pred.shape)} target={tuple(target_embeddings.shape)}"
+        )
+    pred_n = F.normalize(pred, p=2, dim=1)
+    target_n = F.normalize(target_embeddings.detach(), p=2, dim=1)
+    return 2.0 - 2.0 * (pred_n * target_n).sum(dim=1).mean()
+
+
+def vicreg_graph_loss(
+    embeddings: torch.Tensor,
+    *,
+    view_embeddings: torch.Tensor | None = None,
+    invariance_weight: float = 0.0,
+    variance_weight: float = 1.0,
+    covariance_weight: float = 1.0,
+    variance_target: float = 1.0,
+    eps: float = 1e-4,
+) -> torch.Tensor | None:
+    if embeddings.ndim != 2:
+        raise ValueError("Expected embeddings with shape [num_graphs, dim]")
+    if embeddings.numel() == 0:
+        return None
+
+    loss = embeddings.new_zeros(())
+    used = False
+
+    if view_embeddings is not None and float(invariance_weight) > 0:
+        if view_embeddings.shape != embeddings.shape:
+            raise ValueError(
+                f"view_embeddings shape mismatch: {tuple(view_embeddings.shape)} vs {tuple(embeddings.shape)}"
+            )
+        loss = loss + float(invariance_weight) * F.mse_loss(embeddings, view_embeddings)
+        used = True
+
+    num_graphs = int(embeddings.size(0))
+    if num_graphs < 2:
+        return loss if used else None
+
+    centered = embeddings - embeddings.mean(dim=0, keepdim=True)
+    if float(variance_weight) > 0:
+        std = torch.sqrt(centered.pow(2).mean(dim=0) + float(eps))
+        var_penalty = F.relu(float(variance_target) - std).mean()
+        loss = loss + float(variance_weight) * var_penalty
+        used = True
+
+    if float(covariance_weight) > 0 and embeddings.size(1) > 1:
+        cov = (centered.T @ centered) / max(1, num_graphs - 1)
+        cov = cov - torch.diag(torch.diag(cov))
+        cov_penalty = cov.pow(2).sum() / float(embeddings.size(1))
+        loss = loss + float(covariance_weight) * cov_penalty
+        used = True
+
+    return loss if used else None
 
 
 def compute_multi_horizon_risk_loss(

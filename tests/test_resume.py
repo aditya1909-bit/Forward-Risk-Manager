@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+import warnings
 
 import torch
 
@@ -67,6 +68,18 @@ def test_resume_payload_respects_fingerprint(tmp_path: Path):
     )
 
     assert load_resume_payload(ckpt_path, expected_fingerprint=resume_fingerprint({"job": "other"})) is None
+
+
+def test_resume_payload_ignores_corrupt_checkpoint(tmp_path: Path):
+    ckpt_path = tmp_path / "resume.pt"
+    ckpt_path.write_bytes(b"not a torch checkpoint")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        payload = load_resume_payload(ckpt_path)
+
+    assert payload is None
+    assert any("Failed to load resume checkpoint" in str(w.message) for w in caught)
 
 
 def test_rng_state_capture_and_restore():

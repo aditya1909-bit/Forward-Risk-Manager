@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
 #SBATCH --output=/local/scratch/%u/forward-risk-manager/logs/slurm-%j.out
@@ -31,4 +31,4 @@ python scripts/prepare_turing_run.py \
 
 python scripts/benchmark_training.py \
   --config "${RUNTIME_CFG}" \
-  --modes ff_e2e,backprop_supervised_return
+  --modes ff_accurate,ff_financial,ff_bootstrap_rank,backprop_supervised_return

@@ -370,6 +370,15 @@ class EnergyCriticEnsemble(nn.Module):
             outs.append(graph_energy_fn(h, batch, temperature=temperature))
         return torch.stack(outs, dim=0)
 
+    def member_node_energy(self, h: torch.Tensor) -> torch.Tensor:
+        outs = []
+        for member in self.members:
+            node_energy_fn = getattr(member, "node_energy", None)
+            if not callable(node_energy_fn):
+                raise ValueError("Ensemble member must expose node_energy(...)")
+            outs.append(node_energy_fn(h))
+        return torch.stack(outs, dim=0)
+
     def graph_energy(
         self,
         h: torch.Tensor,
@@ -381,13 +390,7 @@ class EnergyCriticEnsemble(nn.Module):
         return (w * ge).sum(dim=0)
 
     def node_energy(self, h: torch.Tensor) -> torch.Tensor:
-        outs = []
-        for member in self.members:
-            node_energy_fn = getattr(member, "node_energy", None)
-            if not callable(node_energy_fn):
-                raise ValueError("Ensemble member must expose node_energy(...)")
-            outs.append(node_energy_fn(h))
-        ne = torch.stack(outs, dim=0)
+        ne = self.member_node_energy(h)
         w = self.member_weights.to(device=ne.device, dtype=ne.dtype).view(-1, 1)
         return (w * ne).sum(dim=0)
 
@@ -439,6 +442,13 @@ class CompositeEnergyCritic(nn.Module):
         if y.ndim != 1:
             raise ValueError(f"Expected critic output shape [num_nodes], got {tuple(y.shape)}")
         return F.softplus(y)
+
+    def member_node_energy(self, h: torch.Tensor) -> torch.Tensor:
+        member_node_energy_fn = getattr(self.base_critic, "member_node_energy", None)
+        if callable(member_node_energy_fn):
+            return member_node_energy_fn(h)
+        node_energy = self.node_energy(h)
+        return node_energy.unsqueeze(0)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         return self.node_energy(h)

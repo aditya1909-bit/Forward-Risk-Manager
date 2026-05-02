@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import random
 import time
@@ -64,8 +65,11 @@ from frisk.splits import (
     walk_forward_split_indices,
 )
 from frisk.econ_eval import (
+    evaluate_cross_sectional_goodness_strategy,
     evaluate_goodness_strategy,
+    infer_node_goodness_with_uncertainty,
     infer_graph_goodness_with_uncertainty,
+    load_forward_returns_panel_from_prices,
     load_forward_returns_from_prices,
     resolve_price_ticker,
 )
@@ -84,11 +88,13 @@ from frisk.benchmarking.semantics import (
 )
 from frisk.training.critics import build_critic as _build_critic
 from frisk.training.objectives import (
+    bootstrap_graph_latent_loss as _bootstrap_graph_latent_loss,
     compute_multi_horizon_risk_loss as _compute_multi_horizon_risk_loss,
     compute_portfolio_head_loss as _compute_portfolio_head_loss,
     compute_supervised_return_loss as _compute_supervised_return_loss,
     graph_target_tensor as _graph_target_tensor,
     regression_eval_metrics as _regression_eval_metrics,
+    vicreg_graph_loss as _vicreg_graph_loss,
 )
 from frisk.resume import (
     capture_rng_state,
@@ -299,6 +305,108 @@ def _parse_positive_int_list(value, fallback: int) -> list[int]:
     return [max(1, int(fallback))]
 
 
+def _parse_str_list(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        items = [str(v).strip() for v in value]
+    elif value is None:
+        items = []
+    else:
+        items = [s.strip() for s in str(value).split(",")]
+    return [s for s in items if s]
+
+
+def _parse_float_list(value) -> list[float]:
+    out: list[float] = []
+    for item in _parse_str_list(value):
+        try:
+            out.append(float(item))
+        except ValueError:
+            continue
+    return out
+
+
+def _normalize_mode_weights(modes: list[str], weights: list[float]) -> dict[str, float]:
+    if not modes:
+        return {}
+    if not weights:
+        return {m: 1.0 / len(modes) for m in modes}
+    vals = []
+    for idx, _mode in enumerate(modes):
+        if idx < len(weights):
+            vals.append(max(0.0, float(weights[idx])))
+        else:
+            vals.append(0.0)
+    denom = sum(vals)
+    if denom <= 0:
+        return {m: 1.0 / len(modes) for m in modes}
+    return {m: vals[idx] / denom for idx, m in enumerate(modes)}
+
+
+def _curriculum_phase(epoch: int, total_epochs: int, ratios: list[float]) -> int:
+    if not ratios:
+        vals = [0.33, 0.34, 0.33]
+    else:
+        vals = [max(0.0, float(v)) for v in ratios[:3]]
+        if len(vals) < 3:
+            vals.extend([0.0] * (3 - len(vals)))
+    total = sum(vals)
+    if total <= 0:
+        cuts = [0.33, 0.67]
+    else:
+        norm = [v / total for v in vals]
+        cuts = [norm[0], norm[0] + norm[1]]
+    progress = float(epoch) / max(1.0, float(total_epochs))
+    if progress <= cuts[0]:
+        return 0
+    if progress <= cuts[1]:
+        return 1
+    return 2
+
+
+def _pick_curriculum_neg_mode(
+    base_mode: str,
+    epoch: int,
+    epochs: int,
+    mix_modes: list[str],
+    mix_weights: dict[str, float],
+    phase_ratios: list[float],
+) -> str:
+    mode = str(base_mode).strip().lower()
+    if mode in {"hallucinate", "self_contrastive"}:
+        return mode
+    if not mix_modes:
+        return mode
+    phase = _curriculum_phase(epoch, epochs, phase_ratios)
+    easy = {"shuffle", "noise", "shuffle+noise", "time_flip"}
+    mid = easy | {"sector_swap", "cross_asset_mix"}
+    if phase == 0:
+        allowed = [m for m in mix_modes if m in easy]
+    elif phase == 1:
+        allowed = [m for m in mix_modes if m in mid]
+    else:
+        allowed = list(mix_modes)
+    if not allowed:
+        return mode
+    probs = [max(0.0, float(mix_weights.get(m, 0.0))) for m in allowed]
+    psum = sum(probs)
+    if psum <= 0:
+        return random.choice(allowed)
+    draw = random.random() * psum
+    acc = 0.0
+    for choice, prob in zip(allowed, probs):
+        acc += prob
+        if draw <= acc:
+            return choice
+    return allowed[-1]
+
+
+def _ema_update(target_module: torch.nn.Module, source_module: torch.nn.Module, momentum: float) -> None:
+    m = float(max(0.0, min(0.9999, momentum)))
+    with torch.no_grad():
+        for target_param, source_param in zip(target_module.parameters(), source_module.parameters()):
+            target_param.data.mul_(m).add_(source_param.data, alpha=1.0 - m)
+
+
 def _compute_risk_targets(
     prices_path: str,
     ticker: str,
@@ -436,6 +544,12 @@ def _safe_retry_config(cfg_mode: dict) -> dict:
             "backprop_amp": False,
             "neg_mode": "shuffle+noise",
             "eval_neg_mode": "shuffle",
+            "bootstrap_graph_enabled": False,
+            "bootstrap_graph_weight": 0.0,
+            "embedding_var_weight": 0.0,
+            "embedding_cov_weight": 0.0,
+            "embedding_invariance_weight": 0.0,
+            "energy_penalty_weight": 0.0,
         }
     )
     return safe_cfg
@@ -686,6 +800,22 @@ def _dist_ctx(config: dict):
     )
 
 
+def _resolve_eval_tickers(eval_graphs, graph_tickers) -> list[list[str]]:
+    if eval_graphs is None or graph_tickers is None:
+        return []
+    if isinstance(eval_graphs, GraphIndexSequence):
+        return _slice_by_indices(graph_tickers, eval_graphs.indices)
+    out = []
+    for graph in eval_graphs:
+        graph_idx = getattr(graph, "graph_idx", None)
+        if graph_idx is None:
+            continue
+        idx = int(graph_idx)
+        if 0 <= idx < len(graph_tickers):
+            out.append(list(graph_tickers[idx]))
+    return out
+
+
 def _compute_econ_metrics_for_eval(
     model,
     critic,
@@ -706,9 +836,9 @@ def _compute_econ_metrics_for_eval(
         return meta
     if not eval_graphs or not eval_dates:
         return meta
-    fwd_ret_1 = config.get("econ_fwd_ret_1")
-    if fwd_ret_1 is None:
-        return meta
+    strategy_kind = str(config.get("econ_strategy_kind", "graph_timing")).strip().lower()
+    if strategy_kind not in {"graph_timing", "cross_sectional", "both"}:
+        strategy_kind = "graph_timing"
     if score_values is None:
         g, g_unc = infer_graph_goodness_with_uncertainty(
             model,
@@ -721,60 +851,102 @@ def _compute_econ_metrics_for_eval(
     else:
         g = np.asarray(list(score_values), dtype=float)
         g_unc = None
-    if g.size == 0:
+    if g.size == 0 and strategy_kind in {"graph_timing", "both"}:
         return meta
-    risk_signal = None
-    if bool(config.get("econ_regime_gate_enabled", False)):
-        rgw = max(10, int(config.get("econ_regime_gate_window", 63)))
-        g_ser = np.asarray(g, dtype=float)
-        if g_ser.size > 0:
-            g_roll_mean = np.asarray(
-                pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).mean(),
-                dtype=float,
+    out = {}
+    if strategy_kind in {"graph_timing", "both"}:
+        fwd_ret_1 = config.get("econ_fwd_ret_1")
+        if fwd_ret_1 is not None:
+            risk_signal = None
+            if bool(config.get("econ_regime_gate_enabled", False)):
+                rgw = max(10, int(config.get("econ_regime_gate_window", 63)))
+                g_ser = np.asarray(g, dtype=float)
+                if g_ser.size > 0:
+                    g_roll_mean = np.asarray(
+                        pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).mean(),
+                        dtype=float,
+                    )
+                    g_roll_std = np.asarray(
+                        pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).std(),
+                        dtype=float,
+                    )
+                    risk_signal = (g_roll_mean - g_ser) / (g_roll_std + 1e-8)
+                    if g_unc is not None and g_unc.shape[0] == risk_signal.shape[0]:
+                        risk_signal = risk_signal + np.nan_to_num(np.asarray(g_unc, dtype=float), nan=0.0)
+            out.update(
+                evaluate_goodness_strategy(
+                    eval_dates,
+                    g,
+                    fwd_ret_1=fwd_ret_1,
+                    signal_window=int(config.get("econ_signal_window", 126)),
+                    signal_quantile=float(config.get("econ_signal_quantile", 0.5)),
+                    signal_polarity=str(config.get("econ_signal_polarity", "high")),
+                    oos_folds=int(config.get("econ_oos_folds", 4)),
+                    oos_min_fold_days=int(config.get("econ_oos_min_fold_days", 63)),
+                    turnover_cost_bps=float(config.get("econ_turnover_cost_bps", 0.0)),
+                    slippage_bps=float(config.get("econ_slippage_bps", 0.0)),
+                    slippage_vol_scale=float(config.get("econ_slippage_vol_scale", 0.0)),
+                    slippage_vol_lookback=int(config.get("econ_slippage_vol_lookback", 21)),
+                    short_borrow_bps=float(config.get("econ_short_borrow_bps", 0.0)),
+                    max_abs_exposure=float(config.get("econ_max_abs_exposure", 1.0)),
+                    trading_days=int(config.get("econ_trading_days", 252)),
+                    regime_gate_enabled=bool(config.get("econ_regime_gate_enabled", False)),
+                    regime_gate_window=int(config.get("econ_regime_gate_window", 63)),
+                    regime_confidence_temp=float(config.get("econ_regime_confidence_temp", 1.0)),
+                    regime_neutral_exposure=float(config.get("econ_regime_neutral_exposure", 0.0)),
+                    regime_min_confidence=float(config.get("econ_regime_min_confidence", 0.0)),
+                    goodness_uncertainty=g_unc,
+                    regime_uncertainty_scale=float(config.get("econ_regime_uncertainty_scale", 0.0)),
+                    risk_signal=risk_signal,
+                    regime_risk_scale=float(config.get("econ_regime_risk_scale", 0.0)),
+                    regime_thresholding_enabled=bool(config.get("econ_regime_thresholding_enabled", True)),
+                    regime_threshold_window=int(
+                        config.get("econ_regime_threshold_window", config.get("econ_signal_window", 126))
+                    ),
+                    regime_threshold_quantile=float(
+                        config.get("econ_regime_threshold_quantile", config.get("econ_signal_quantile", 0.5))
+                    ),
+                    regime_vol_window=int(config.get("econ_regime_vol_window", 21)),
+                    regime_low_quantile=float(config.get("econ_regime_low_quantile", 0.33)),
+                    regime_high_quantile=float(config.get("econ_regime_high_quantile", 0.67)),
+                )
             )
-            g_roll_std = np.asarray(
-                pd.Series(g_ser).rolling(rgw, min_periods=max(5, rgw // 3)).std(),
-                dtype=float,
+
+    if strategy_kind in {"cross_sectional", "both"} and critic is not None:
+        graph_tickers = config.get("graph_tickers")
+        eval_tickers = _resolve_eval_tickers(eval_graphs, graph_tickers)
+        fwd_panel = config.get("econ_fwd_ret_panel")
+        if eval_tickers and fwd_panel is not None:
+            node_scores, node_unc = infer_node_goodness_with_uncertainty(
+                model,
+                eval_graphs,
+                goodness_temp=float(config.get("goodness_temp", 1.0)),
+                batch_size=int(config.get("econ_loader_batch_size", config.get("batch_size", 64))),
+                critic=critic,
+                norm=str(config.get("goodness_norm", "none")),
             )
-            risk_signal = (g_roll_mean - g_ser) / (g_roll_std + 1e-8)
-            if g_unc is not None and g_unc.shape[0] == risk_signal.shape[0]:
-                risk_signal = risk_signal + np.nan_to_num(np.asarray(g_unc, dtype=float), nan=0.0)
-    out = evaluate_goodness_strategy(
-        eval_dates,
-        g,
-        fwd_ret_1=fwd_ret_1,
-        signal_window=int(config.get("econ_signal_window", 126)),
-        signal_quantile=float(config.get("econ_signal_quantile", 0.5)),
-        signal_polarity=str(config.get("econ_signal_polarity", "high")),
-        oos_folds=int(config.get("econ_oos_folds", 4)),
-        oos_min_fold_days=int(config.get("econ_oos_min_fold_days", 63)),
-        turnover_cost_bps=float(config.get("econ_turnover_cost_bps", 0.0)),
-        slippage_bps=float(config.get("econ_slippage_bps", 0.0)),
-        slippage_vol_scale=float(config.get("econ_slippage_vol_scale", 0.0)),
-        slippage_vol_lookback=int(config.get("econ_slippage_vol_lookback", 21)),
-        short_borrow_bps=float(config.get("econ_short_borrow_bps", 0.0)),
-        max_abs_exposure=float(config.get("econ_max_abs_exposure", 1.0)),
-        trading_days=int(config.get("econ_trading_days", 252)),
-        regime_gate_enabled=bool(config.get("econ_regime_gate_enabled", False)),
-        regime_gate_window=int(config.get("econ_regime_gate_window", 63)),
-        regime_confidence_temp=float(config.get("econ_regime_confidence_temp", 1.0)),
-        regime_neutral_exposure=float(config.get("econ_regime_neutral_exposure", 0.0)),
-        regime_min_confidence=float(config.get("econ_regime_min_confidence", 0.0)),
-        goodness_uncertainty=g_unc,
-        regime_uncertainty_scale=float(config.get("econ_regime_uncertainty_scale", 0.0)),
-        risk_signal=risk_signal,
-        regime_risk_scale=float(config.get("econ_regime_risk_scale", 0.0)),
-        regime_thresholding_enabled=bool(config.get("econ_regime_thresholding_enabled", True)),
-        regime_threshold_window=int(
-            config.get("econ_regime_threshold_window", config.get("econ_signal_window", 126))
-        ),
-        regime_threshold_quantile=float(
-            config.get("econ_regime_threshold_quantile", config.get("econ_signal_quantile", 0.5))
-        ),
-        regime_vol_window=int(config.get("econ_regime_vol_window", 21)),
-        regime_low_quantile=float(config.get("econ_regime_low_quantile", 0.33)),
-        regime_high_quantile=float(config.get("econ_regime_high_quantile", 0.67)),
-    )
+            out.update(
+                evaluate_cross_sectional_goodness_strategy(
+                    dates=eval_dates,
+                    node_tickers=eval_tickers,
+                    node_scores=node_scores,
+                    forward_returns=fwd_panel,
+                    top_k=int(config.get("econ_ls_top_k", 0)) or None,
+                    bottom_k=int(config.get("econ_ls_bottom_k", 0)) or None,
+                    top_frac=float(config.get("econ_ls_top_frac", 0.2)),
+                    bottom_frac=float(config.get("econ_ls_bottom_frac", 0.2)),
+                    signal_polarity=str(config.get("econ_ls_signal_polarity", config.get("econ_signal_polarity", "high"))),
+                    turnover_cost_bps=float(config.get("econ_ls_turnover_cost_bps", config.get("econ_turnover_cost_bps", 0.0))),
+                    short_borrow_bps=float(config.get("econ_ls_short_borrow_bps", config.get("econ_short_borrow_bps", 0.0))),
+                    max_gross_exposure=float(config.get("econ_ls_max_gross_exposure", 1.0)),
+                    trading_days=int(config.get("econ_trading_days", 252)),
+                    min_names=int(config.get("econ_ls_min_names", 4)),
+                    oos_folds=int(config.get("econ_ls_oos_folds", config.get("econ_oos_folds", 4))),
+                    oos_min_fold_days=int(config.get("econ_ls_oos_min_fold_days", config.get("econ_oos_min_fold_days", 63))),
+                    uncertainty_scores=node_unc,
+                    uncertainty_scale=float(config.get("econ_ls_uncertainty_scale", 0.0)),
+                )
+            )
     out.update(meta)
     out["econ_eval_s"] = float(time.perf_counter() - t0)
     return out
@@ -1138,6 +1310,8 @@ def _eval_ff_metrics(
             "eval_auprc": float("nan"),
             "eval_brier": float("nan"),
             "eval_ece": float("nan"),
+            "eval_finite_goodness_rate_pos": float("nan"),
+            "eval_finite_goodness_rate_neg": float("nan"),
         }
 
     model.eval()
@@ -1220,12 +1394,16 @@ def _eval_ff_metrics(
         threshold=float(goodness_target),
         ece_bins=int(ece_bins),
     )
+    gpos_arr = np.asarray(gpos_all, dtype=float)
+    gneg_arr = np.asarray(gneg_all, dtype=float)
     return {
         "eval_objective": "ff",
         "eval_g_pos": pos_mean,
         "eval_g_neg": neg_mean,
         "eval_sep": pos_mean - neg_mean,
         "eval_acc": float(acc),
+        "eval_finite_goodness_rate_pos": float(np.isfinite(gpos_arr).mean()) if gpos_arr.size else float("nan"),
+        "eval_finite_goodness_rate_neg": float(np.isfinite(gneg_arr).mean()) if gneg_arr.size else float("nan"),
         **cls_metrics,
     }
 
@@ -1454,21 +1632,53 @@ def _benchmark_ff(
     loader = DataLoader(train_graphs, **_dataloader_kwargs_with_sampler(loader_kwargs, train_sampler))
     eval_loader = DataLoader(eval_graphs, batch_size=config["batch_size"], shuffle=False)
 
-    model = GCNEncoder(
-        in_dim=graphs[0].x.shape[1],
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        dropout=config["dropout"],
-        conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
-        gat_heads=int(config.get("encoder_gat_heads", 2)),
-        rgcn_num_relations=max(2, int(config.get("encoder_rgcn_num_relations", 8))),
-        residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
-        residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
-        residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
-        residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
-    ).to(device)
+    def _make_encoder() -> GCNEncoder:
+        return GCNEncoder(
+            in_dim=graphs[0].x.shape[1],
+            hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"],
+            dropout=config["dropout"],
+            conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
+            gat_heads=int(config.get("encoder_gat_heads", 2)),
+            rgcn_num_relations=max(2, int(config.get("encoder_rgcn_num_relations", 8))),
+            residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
+            residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
+            residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
+            residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
+        ).to(device)
+
+    model = _make_encoder()
     model = _maybe_compile_encoder(model, config, device, context="benchmark ff")
     critic = _build_critic(config, hidden_dim=int(config["hidden_dim"]), device=device)
+    bootstrap_graph_weight = max(0.0, float(config.get("bootstrap_graph_weight", 0.0)))
+    bootstrap_graph_enabled = (
+        bool(config.get("bootstrap_graph_enabled", False))
+        and bootstrap_graph_weight > 0.0
+        and not layerwise
+    )
+    bootstrap_graph_momentum = float(config.get("bootstrap_graph_momentum", 0.99))
+    bootstrap_graph_view_mode = str(config.get("bootstrap_graph_view_mode", "shuffle+noise")).strip().lower()
+    bootstrap_graph_view_noise_std = float(
+        config.get("bootstrap_graph_view_noise_std", config.get("noise_std", 0.05))
+    )
+    bootstrap_graph_predictor_hidden_dim = max(
+        1,
+        int(config.get("bootstrap_graph_predictor_hidden_dim", config["hidden_dim"])),
+    )
+    bootstrap_target_model = None
+    bootstrap_predictor = None
+    if bootstrap_graph_enabled:
+        bootstrap_target_model = _make_encoder()
+        bootstrap_target_model.load_state_dict(_unwrap_module(model).state_dict())
+        bootstrap_target_model.eval()
+        for param in bootstrap_target_model.parameters():
+            param.requires_grad_(False)
+        bootstrap_predictor = torch.nn.Sequential(
+            torch.nn.Linear(config["hidden_dim"], bootstrap_graph_predictor_hidden_dim),
+            torch.nn.LayerNorm(bootstrap_graph_predictor_hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(bootstrap_graph_predictor_hidden_dim, config["hidden_dim"]),
+        ).to(device)
     risk_targets_by_horizon = config.get("risk_targets_by_horizon")
     risk_horizons_effective = config.get("risk_horizons_effective", [])
     risk_head_active = bool(config.get("risk_head_enabled", False)) and bool(risk_targets_by_horizon)
@@ -1499,12 +1709,16 @@ def _benchmark_ff(
         risk_head = _maybe_wrap_ddp(risk_head, dist_ctx)
     if portfolio_head is not None:
         portfolio_head = _maybe_wrap_ddp(portfolio_head, dist_ctx)
+    if bootstrap_predictor is not None:
+        bootstrap_predictor = _maybe_wrap_ddp(bootstrap_predictor, dist_ctx)
     optim_params = list(model.parameters())
     optim_params.extend(list(critic.parameters()))
     if risk_head is not None:
         optim_params.extend(list(risk_head.parameters()))
     if portfolio_head is not None:
         optim_params.extend(list(portfolio_head.parameters()))
+    if bootstrap_predictor is not None:
+        optim_params.extend(list(bootstrap_predictor.parameters()))
     optim = _build_optimizer(
         optim_params,
         lr=config["lr"],
@@ -1563,6 +1777,13 @@ def _benchmark_ff(
     dist_margin = float(config.get("distance_forward_margin", 0.15))
     dist_max_graphs = int(config.get("distance_forward_max_graphs", 0))
     dist_interval = max(1, int(config.get("distance_forward_interval", 1)))
+    energy_penalty_weight = max(0.0, float(config.get("energy_penalty_weight", 0.0)))
+    energy_penalty_mode = str(config.get("energy_penalty_mode", "last")).strip().lower()
+    embedding_var_weight = max(0.0, float(config.get("embedding_var_weight", 0.0)))
+    embedding_cov_weight = max(0.0, float(config.get("embedding_cov_weight", 0.0)))
+    embedding_invariance_weight = max(0.0, float(config.get("embedding_invariance_weight", 0.0)))
+    embedding_var_target = float(config.get("embedding_var_target", 1.0))
+    embedding_var_eps = float(config.get("embedding_var_eps", 1e-4))
     amp_dtype = _parse_amp_dtype(config.get("amp_dtype", "float16"))
     amp_enabled = bool(config.get("amp", False) and device.type == "cuda")
     if amp_enabled and amp_dtype == torch.bfloat16:
@@ -1590,6 +1811,8 @@ def _benchmark_ff(
                 "critic": _unwrap_module(critic),
                 "risk_head": _unwrap_module(risk_head),
                 "portfolio_head": _unwrap_module(portfolio_head),
+                "bootstrap_target_model": bootstrap_target_model,
+                "bootstrap_predictor": _unwrap_module(bootstrap_predictor),
             },
             optimizer=optim,
             scaler=scaler,
@@ -1625,6 +1848,12 @@ def _benchmark_ff(
     neg_sector_idx, neg_factor_start_idx, neg_factor_dim = _infer_neg_feature_slices(config)
     hall_every_n_batches = max(1, int(config.get("ff_hall_every_n_batches", 1)))
     hall_warmup_epochs = max(0, int(config.get("ff_hall_warmup_epochs", 0)))
+    ff_neg_mix = [m.strip().lower() for m in _parse_str_list(config.get("ff_neg_mix", []))]
+    ff_neg_mix = [m for m in ff_neg_mix if m in _NEG_AUG_MODES and m != "hallucinate"]
+    ff_neg_mix_weights = config.get("ff_neg_mix_weights", {})
+    if not isinstance(ff_neg_mix_weights, dict):
+        ff_neg_mix_weights = _normalize_mode_weights(ff_neg_mix, _parse_float_list(ff_neg_mix_weights))
+    ff_curriculum_epochs = _parse_float_list(config.get("ff_curriculum_epochs", []))
 
     epoch_times = [
         (float(item[0]), int(item[1]))
@@ -1649,6 +1878,14 @@ def _benchmark_ff(
     rank_aux_batches = int(resume_meta.get("rank_aux_batches", 0))
     rank_corr_sum = float(resume_meta.get("rank_corr_sum", 0.0))
     rank_corr_batches = int(resume_meta.get("rank_corr_batches", 0))
+    energy_penalty_sum = float(resume_meta.get("energy_penalty_sum", 0.0))
+    energy_penalty_batches = int(resume_meta.get("energy_penalty_batches", 0))
+    vicreg_loss_sum = float(resume_meta.get("vicreg_loss_sum", 0.0))
+    vicreg_batches = int(resume_meta.get("vicreg_batches", 0))
+    bootstrap_loss_sum = float(resume_meta.get("bootstrap_loss_sum", 0.0))
+    bootstrap_batches = int(resume_meta.get("bootstrap_batches", 0))
+    finite_goodness_finite = float(resume_meta.get("finite_goodness_finite", 0.0))
+    finite_goodness_total = float(resume_meta.get("finite_goodness_total", 0.0))
     epoch_history = list(resume_meta.get("epoch_history", []))
     start_epoch = max(1, int(resume_payload.get("epoch_completed", 0)) + 1) if resume_payload else 1
 
@@ -1665,6 +1902,14 @@ def _benchmark_ff(
             "rank_aux_batches": int(rank_aux_batches),
             "rank_corr_sum": float(rank_corr_sum),
             "rank_corr_batches": int(rank_corr_batches),
+            "energy_penalty_sum": float(energy_penalty_sum),
+            "energy_penalty_batches": int(energy_penalty_batches),
+            "vicreg_loss_sum": float(vicreg_loss_sum),
+            "vicreg_batches": int(vicreg_batches),
+            "bootstrap_loss_sum": float(bootstrap_loss_sum),
+            "bootstrap_batches": int(bootstrap_batches),
+            "finite_goodness_finite": float(finite_goodness_finite),
+            "finite_goodness_total": float(finite_goodness_total),
             "epoch_history": list(epoch_history),
             "epoch_completed": int(epoch_completed),
         }
@@ -1697,6 +1942,14 @@ def _benchmark_ff(
                 config["neg_mix_start"],
                 config["neg_mix_end"],
                 config["neg_mix_ramp_epochs"],
+            )
+            use_mode = _pick_curriculum_neg_mode(
+                use_mode,
+                epoch=epoch,
+                epochs=int(config["epochs"]),
+                mix_modes=ff_neg_mix,
+                mix_weights=ff_neg_mix_weights,
+                phase_ratios=ff_curriculum_epochs,
             )
             if use_mode == "hallucinate":
                 if epoch <= hall_warmup_epochs or (batch_idx % hall_every_n_batches) != 0:
@@ -1872,6 +2125,9 @@ def _benchmark_ff(
                         loss_updates += 1
                         x_in = h_pos.detach()
             else:
+                pooled_embed = None
+                bootstrap_view_embed = None
+                bootstrap_target_embed = None
                 if use_mode == "self_contrastive":
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
                         t_fwd_pos = time.perf_counter()
@@ -1897,6 +2153,8 @@ def _benchmark_ff(
                             temperature=sc_temp,
                             max_graphs=sc_max_graphs,
                         )
+                        pooled_embed = z_pos
+                        bootstrap_view_embed = z_view
                         if apply_distance:
                             z_neg = permute_graph_embeddings(z_view)
                             loss = loss + dist_weight * pairwise_distance_forward_loss(
@@ -2009,8 +2267,9 @@ def _benchmark_ff(
                         margin_weight=float(config.get("ff_margin_weight", 1.0)),
                         **ff_loss_kwargs,
                     )
+                    pooled_embed = global_mean_pool(h_pos, batch.batch)
                     if apply_distance:
-                        z_pos = global_mean_pool(h_pos, batch.batch)
+                        z_pos = pooled_embed
                         z_neg = global_mean_pool(h_neg, batch.batch)
                         loss = loss + dist_weight * pairwise_distance_forward_loss(
                             z_pos,
@@ -2018,13 +2277,97 @@ def _benchmark_ff(
                             margin=dist_margin,
                             max_graphs=dist_max_graphs,
                         )
+                if pooled_embed is None or int(pooled_embed.size(0)) != int(batch.num_graphs):
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        pooled_embed = global_mean_pool(h_pos, batch.batch)
+                if bootstrap_view_embed is not None and bootstrap_view_embed.shape != pooled_embed.shape:
+                    bootstrap_view_embed = None
+
+                bootstrap_loss_val = None
+                if (
+                    bootstrap_target_model is not None
+                    and bootstrap_predictor is not None
+                    and bootstrap_graph_enabled
+                ):
+                    t_neg_gen = time.perf_counter()
+                    x_boot = _make_self_contrastive_view(
+                        x,
+                        batch.batch,
+                        view_mode=bootstrap_graph_view_mode,
+                        view_noise_std=bootstrap_graph_view_noise_std,
+                        window_len=config.get("window_len"),
+                        summary_dim=config.get("summary_dim", 0),
+                    )
+                    component_times["neg_gen"] += time.perf_counter() - t_neg_gen
+                    with _autocast_if_needed(step_scaler is not None, amp_dtype):
+                        t_fwd_boot = time.perf_counter()
+                        h_boot_online = _forward_encoder(
+                            model,
+                            x_boot,
+                            batch.edge_index,
+                            edge_weight=edge_weight,
+                        )
+                        component_times["forward_neg"] += time.perf_counter() - t_fwd_boot
+                        z_boot_online = global_mean_pool(h_boot_online, batch.batch)
+                        with torch.no_grad():
+                            h_target_pos = _forward_encoder(
+                                bootstrap_target_model,
+                                x,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                            )
+                            h_target_boot = _forward_encoder(
+                                bootstrap_target_model,
+                                x_boot,
+                                batch.edge_index,
+                                edge_weight=edge_weight,
+                            )
+                            z_target_pos = global_mean_pool(h_target_pos, batch.batch)
+                            z_target_boot = global_mean_pool(h_target_boot, batch.batch)
+                        bootstrap_loss_val = 0.5 * (
+                            _bootstrap_graph_latent_loss(
+                                bootstrap_predictor,
+                                pooled_embed,
+                                z_target_boot,
+                            )
+                            + _bootstrap_graph_latent_loss(
+                                bootstrap_predictor,
+                                z_boot_online,
+                                z_target_pos,
+                            )
+                        )
+                        loss = loss + bootstrap_graph_weight * bootstrap_loss_val
+                        bootstrap_view_embed = z_boot_online
+                        bootstrap_target_embed = z_target_pos
+
+                vicreg_loss_val = None
+                if embedding_var_weight > 0 or embedding_cov_weight > 0 or embedding_invariance_weight > 0:
+                    vicreg_loss_val = _vicreg_graph_loss(
+                        pooled_embed,
+                        view_embeddings=bootstrap_view_embed if bootstrap_view_embed is not None else bootstrap_target_embed,
+                        invariance_weight=embedding_invariance_weight,
+                        variance_weight=embedding_var_weight,
+                        covariance_weight=embedding_cov_weight,
+                        variance_target=embedding_var_target,
+                        eps=embedding_var_eps,
+                    )
+                    if vicreg_loss_val is not None:
+                        loss = loss + vicreg_loss_val
+
+                energy_penalty_val = None
+                if energy_penalty_weight > 0:
+                    if energy_penalty_mode == "all" and bootstrap_view_embed is not None:
+                        energy_penalty_val = 0.5 * (pooled_embed.pow(2).mean() + bootstrap_view_embed.pow(2).mean())
+                    else:
+                        energy_penalty_val = pooled_embed.pow(2).mean()
+                    loss = loss + energy_penalty_weight * energy_penalty_val
+
                 risk_loss_val = None
                 if risk_head is not None and risk_targets_by_horizon is not None:
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                        z_risk = global_mean_pool(h_pos, batch.batch)
                         risk_loss_val = _compute_multi_horizon_risk_loss(
                             risk_head=risk_head,
-                            embeddings=z_risk,
+                            embeddings=pooled_embed,
                             graph_idx=batch.graph_idx,
                             risk_targets_by_horizon=risk_targets_by_horizon,
                             device=device,
@@ -2035,14 +2378,17 @@ def _benchmark_ff(
                 portfolio_loss_val = None
                 if portfolio_head is not None and portfolio_targets is not None:
                     with _autocast_if_needed(step_scaler is not None, amp_dtype):
-                        z_port = global_mean_pool(h_pos, batch.batch)
                         portfolio_loss_val = _compute_portfolio_head_loss(
                             portfolio_head=portfolio_head,
-                            embeddings=z_port,
+                            embeddings=pooled_embed,
                             graph_idx=batch.graph_idx,
                             portfolio_targets=portfolio_targets,
                             device=device,
                             loss_type=str(config.get("portfolio_loss_type", "sharpe")).strip().lower(),
+                            cara_risk_aversion=float(config.get("portfolio_cara_risk_aversion", 1.0)),
+                            baseline_exposure=float(config.get("portfolio_baseline_exposure", 0.0)),
+                            delta_scale=float(config.get("portfolio_delta_scale", 1.0)),
+                            max_abs_exposure=float(config.get("portfolio_max_abs_exposure", 1.0)),
                         )
                         if portfolio_loss_val is not None:
                             loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
@@ -2085,8 +2431,28 @@ def _benchmark_ff(
                     scaler=step_scaler,
                 )
                 component_times["optimizer"] += time.perf_counter() - t_opt
+                if bootstrap_target_model is not None:
+                    _ema_update(
+                        bootstrap_target_model,
+                        _unwrap_module(model),
+                        bootstrap_graph_momentum,
+                    )
                 total_loss += loss.item()
                 loss_updates += 1
+                if energy_penalty_val is not None:
+                    energy_penalty_sum += float(energy_penalty_val.detach())
+                    energy_penalty_batches += 1
+                if vicreg_loss_val is not None:
+                    vicreg_loss_sum += float(vicreg_loss_val.detach())
+                    vicreg_batches += 1
+                if bootstrap_loss_val is not None:
+                    bootstrap_loss_sum += float(bootstrap_loss_val.detach())
+                    bootstrap_batches += 1
+                if use_mode != "self_contrastive":
+                    finite_goodness_finite += float(
+                        torch.isfinite(g_pos).sum().item() + torch.isfinite(g_neg).sum().item()
+                    )
+                    finite_goodness_total += float(g_pos.numel() + g_neg.numel())
                 if risk_loss_val is not None:
                     risk_loss_sum += float(risk_loss_val.detach())
                     risk_batches += 1
@@ -2142,6 +2508,8 @@ def _benchmark_ff(
                         "critic": _unwrap_module(critic),
                         "risk_head": _unwrap_module(risk_head),
                         "portfolio_head": _unwrap_module(portfolio_head),
+                        "bootstrap_target_model": bootstrap_target_model,
+                        "bootstrap_predictor": _unwrap_module(bootstrap_predictor),
                     },
                     optimizer=optim,
                     scaler=scaler,
@@ -2212,6 +2580,12 @@ def _benchmark_ff(
     portfolio_loss_train = portfolio_loss_sum / portfolio_batches if portfolio_batches else 0.0
     rank_aux_train = rank_aux_sum / rank_aux_batches if rank_aux_batches else 0.0
     rank_corr_train = rank_corr_sum / rank_corr_batches if rank_corr_batches else 0.0
+    energy_penalty_train = energy_penalty_sum / energy_penalty_batches if energy_penalty_batches else 0.0
+    vicreg_loss_train = vicreg_loss_sum / vicreg_batches if vicreg_batches else 0.0
+    bootstrap_loss_train = bootstrap_loss_sum / bootstrap_batches if bootstrap_batches else 0.0
+    finite_goodness_rate_train = (
+        float(finite_goodness_finite / finite_goodness_total) if finite_goodness_total > 0 else float("nan")
+    )
     steps_denom = max(1, int(steps_total))
     out = {
         "avg_epoch_s": avg_time,
@@ -2241,6 +2615,11 @@ def _benchmark_ff(
         "portfolio_loss_train": portfolio_loss_train,
         "rank_aux_loss_train": rank_aux_train,
         "rank_corr_loss_train": rank_corr_train,
+        "energy_penalty_train": energy_penalty_train,
+        "vicreg_loss_train": vicreg_loss_train,
+        "bootstrap_loss_train": bootstrap_loss_train,
+        "bootstrap_graph_enabled_effective": bool(bootstrap_target_model is not None),
+        "finite_goodness_rate_train": finite_goodness_rate_train,
     }
     if risk_head is not None:
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
@@ -2311,6 +2690,8 @@ def _benchmark_ff(
                 "critic": _unwrap_module(critic),
                 "risk_head": _unwrap_module(risk_head),
                 "portfolio_head": _unwrap_module(portfolio_head),
+                "bootstrap_target_model": bootstrap_target_model,
+                "bootstrap_predictor": _unwrap_module(bootstrap_predictor),
             },
             optimizer=optim,
             scaler=scaler,
@@ -2623,6 +3004,10 @@ def _benchmark_backprop(
                         portfolio_targets=portfolio_targets,
                         device=device,
                         loss_type=str(config.get("portfolio_loss_type", "sharpe")).strip().lower(),
+                        cara_risk_aversion=float(config.get("portfolio_cara_risk_aversion", 1.0)),
+                        baseline_exposure=float(config.get("portfolio_baseline_exposure", 0.0)),
+                        delta_scale=float(config.get("portfolio_delta_scale", 1.0)),
+                        max_abs_exposure=float(config.get("portfolio_max_abs_exposure", 1.0)),
                     )
                     if portfolio_loss_val is not None:
                         loss = loss + float(config.get("portfolio_loss_weight", 0.0)) * portfolio_loss_val
@@ -3216,10 +3601,11 @@ def main() -> int:
     parser.add_argument("--config", required=True, help="Path to TOML config")
     parser.add_argument(
         "--modes",
-        default="ff_e2e_core,ff_financial,backprop_contrastive_core,backprop_supervised_return",
+        default="ff_accurate,ff_financial,ff_bootstrap_rank,backprop_supervised_return",
         help=(
             "Comma-separated modes: ff_layerwise,ff_e2e,ff_e2e_core,ff_financial,ff_fast,"
-            "ff_accurate,backprop_contrastive,backprop_contrastive_core,backprop_supervised_return"
+            "ff_accurate,ff_bootstrap_rank,backprop_contrastive,backprop_contrastive_core,"
+            "backprop_supervised_return"
         ),
     )
     parser.add_argument("--distributed", action="store_true", default=argparse.SUPPRESS)
@@ -3232,9 +3618,26 @@ def main() -> int:
     bench_cfg = cfg.get("benchmark", {})
     build_cfg = cfg.get("build_graphs", {})
     cluster_cfg = cfg.get("cluster", {})
+    requested_modes = [_canonical_mode_name(m.strip()) for m in args.modes.split(",") if m.strip()]
+    if not requested_modes:
+        requested_modes = [
+            "ff_e2e_core",
+            "ff_financial",
+            "backprop_contrastive_core",
+            "backprop_supervised_return",
+        ]
 
     graphs_path = Path(train_cfg.get("graphs", "data/processed/graphs.pt"))
-    artifact = load_graph_artifact(graphs_path, include_tickers=False, prefer_lazy=True, prefer_sharded=True)
+    include_tickers = (
+        str(bench_cfg.get("econ_strategy_kind", "graph_timing")).strip().lower() in {"cross_sectional", "both"}
+        or any(m in {"ff_financial", "ff_accurate", "ff_bootstrap_rank"} for m in requested_modes)
+    )
+    artifact = load_graph_artifact(
+        graphs_path,
+        include_tickers=include_tickers,
+        prefer_lazy=True,
+        prefer_sharded=True,
+    )
     graphs = artifact.graphs
     graph_dates = artifact.dates
     if graph_dates and len(graph_dates) != len(graphs):
@@ -3321,6 +3724,23 @@ def main() -> int:
         "ff_rank_corr_weight": float(train_cfg.get("ff_rank_corr_weight", 0.0)),
         "ff_rank_use_portfolio_targets": bool(
             train_cfg.get("ff_rank_use_portfolio_targets", True)
+        ),
+        "energy_penalty_weight": float(train_cfg.get("energy_penalty_weight", 0.0)),
+        "energy_penalty_mode": str(train_cfg.get("energy_penalty_mode", "last")),
+        "embedding_var_weight": float(train_cfg.get("embedding_var_weight", 0.0)),
+        "embedding_cov_weight": float(train_cfg.get("embedding_cov_weight", 0.0)),
+        "embedding_invariance_weight": float(train_cfg.get("embedding_invariance_weight", 0.0)),
+        "embedding_var_target": float(train_cfg.get("embedding_var_target", 1.0)),
+        "embedding_var_eps": float(train_cfg.get("embedding_var_eps", 1e-4)),
+        "bootstrap_graph_enabled": bool(train_cfg.get("bootstrap_graph_enabled", False)),
+        "bootstrap_graph_weight": float(train_cfg.get("bootstrap_graph_weight", 0.0)),
+        "bootstrap_graph_momentum": float(train_cfg.get("bootstrap_graph_momentum", 0.99)),
+        "bootstrap_graph_view_mode": str(train_cfg.get("bootstrap_graph_view_mode", "shuffle+noise")),
+        "bootstrap_graph_view_noise_std": float(
+            train_cfg.get("bootstrap_graph_view_noise_std", train_cfg.get("noise_std", 0.05))
+        ),
+        "bootstrap_graph_predictor_hidden_dim": int(
+            train_cfg.get("bootstrap_graph_predictor_hidden_dim", train_cfg.get("hidden_dim", 64))
         ),
         "ff_hall_every_n_batches": int(train_cfg.get("ff_hall_every_n_batches", 1)),
         "ff_hall_warmup_epochs": int(train_cfg.get("ff_hall_warmup_epochs", 0)),
@@ -3486,6 +3906,10 @@ def main() -> int:
         "portfolio_horizon": int(train_cfg.get("portfolio_horizon", 5)),
         "portfolio_loss_weight": float(train_cfg.get("portfolio_loss_weight", 0.0)),
         "portfolio_loss_type": str(train_cfg.get("portfolio_loss_type", "sharpe")),
+        "portfolio_cara_risk_aversion": float(train_cfg.get("portfolio_cara_risk_aversion", 1.0)),
+        "portfolio_baseline_exposure": float(train_cfg.get("portfolio_baseline_exposure", 0.0)),
+        "portfolio_delta_scale": float(train_cfg.get("portfolio_delta_scale", 1.0)),
+        "portfolio_max_abs_exposure": float(train_cfg.get("portfolio_max_abs_exposure", 1.0)),
         "portfolio_standardize": bool(train_cfg.get("portfolio_standardize", True)),
         "portfolio_cache_dir": str(train_cfg.get("portfolio_cache_dir", "runs/cache")),
         "portfolio_max_abs_logret": float(train_cfg.get("portfolio_max_abs_logret", 0.5)),
@@ -3515,7 +3939,9 @@ def main() -> int:
         "window_len": int(returns_len),
         "summary_dim": int(summary_dim),
         "econ_enabled": bool(bench_cfg.get("econ_enabled", True)),
+        "econ_strategy_kind": str(bench_cfg.get("econ_strategy_kind", "graph_timing")),
         "econ_ticker": str(bench_cfg.get("econ_ticker", "AUTO")),
+        "econ_prices": str(bench_cfg.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv"))),
         "econ_max_abs_logret": float(bench_cfg.get("econ_max_abs_logret", 0.5)),
         "econ_signal_window": int(bench_cfg.get("econ_signal_window", 126)),
         "econ_signal_quantile": float(bench_cfg.get("econ_signal_quantile", 0.5)),
@@ -3547,6 +3973,26 @@ def main() -> int:
         "econ_regime_vol_window": int(bench_cfg.get("econ_regime_vol_window", 21)),
         "econ_regime_low_quantile": float(bench_cfg.get("econ_regime_low_quantile", 0.33)),
         "econ_regime_high_quantile": float(bench_cfg.get("econ_regime_high_quantile", 0.67)),
+        "econ_ls_top_k": int(bench_cfg.get("econ_ls_top_k", 0)),
+        "econ_ls_bottom_k": int(bench_cfg.get("econ_ls_bottom_k", 0)),
+        "econ_ls_top_frac": float(bench_cfg.get("econ_ls_top_frac", 0.2)),
+        "econ_ls_bottom_frac": float(bench_cfg.get("econ_ls_bottom_frac", 0.2)),
+        "econ_ls_signal_polarity": str(
+            bench_cfg.get("econ_ls_signal_polarity", bench_cfg.get("econ_signal_polarity", "high"))
+        ),
+        "econ_ls_turnover_cost_bps": float(
+            bench_cfg.get("econ_ls_turnover_cost_bps", bench_cfg.get("econ_turnover_cost_bps", 0.0))
+        ),
+        "econ_ls_short_borrow_bps": float(
+            bench_cfg.get("econ_ls_short_borrow_bps", bench_cfg.get("econ_short_borrow_bps", 0.0))
+        ),
+        "econ_ls_max_gross_exposure": float(bench_cfg.get("econ_ls_max_gross_exposure", 1.0)),
+        "econ_ls_min_names": int(bench_cfg.get("econ_ls_min_names", 4)),
+        "econ_ls_oos_folds": int(bench_cfg.get("econ_ls_oos_folds", bench_cfg.get("econ_oos_folds", 4))),
+        "econ_ls_oos_min_fold_days": int(
+            bench_cfg.get("econ_ls_oos_min_fold_days", bench_cfg.get("econ_oos_min_fold_days", 63))
+        ),
+        "econ_ls_uncertainty_scale": float(bench_cfg.get("econ_ls_uncertainty_scale", 0.0)),
         "econ_loader_batch_size": int(bench_cfg.get("econ_loader_batch_size", 128)),
         "econ_trading_days": int(bench_cfg.get("econ_trading_days", 252)),
         "task_family": "custom",
@@ -3555,7 +4001,7 @@ def main() -> int:
         "distributed_backend": str(distributed_backend),
         "distributed_ctx": dist_ctx,
     }
-    modes = [_canonical_mode_name(m.strip()) for m in args.modes.split(",") if m.strip()]
+    modes = list(requested_modes)
     if not modes:
         modes = ["ff_layerwise", "ff_e2e", "backprop_contrastive", "backprop_supervised_return"]
     if bool(config.get("resume_enabled", True)):
@@ -3571,9 +4017,23 @@ def main() -> int:
         Path(str(config["resume_dir"])).mkdir(parents=True, exist_ok=True)
     else:
         config["resume_dir"] = ""
+    ff_neg_mix_list = [m.strip().lower() for m in _parse_str_list(config.get("ff_neg_mix", []))]
+    ff_neg_mix_list = [m for m in ff_neg_mix_list if m in _NEG_AUG_MODES and m != "hallucinate"]
+    config["ff_neg_mix"] = ff_neg_mix_list
+    config["ff_neg_mix_weights"] = _normalize_mode_weights(
+        ff_neg_mix_list,
+        _parse_float_list(config.get("ff_neg_mix_weights", [])),
+    )
+    config["ff_curriculum_epochs"] = _parse_float_list(config.get("ff_curriculum_epochs", []))
     config["econ_fwd_ret_1"] = None
+    config["econ_fwd_ret_panel"] = None
     config["econ_ticker_effective"] = ""
     config["econ_ticker_source"] = ""
+    config["graph_tickers"] = artifact.tickers
+    if str(config.get("econ_strategy_kind", "graph_timing")).strip().lower() in {"cross_sectional", "both"}:
+        if artifact.tickers is None:
+            print("warning: cross-sectional econ requested but graph artifact has no tickers; falling back to graph_timing.")
+            config["econ_strategy_kind"] = "graph_timing"
 
     for label, path_value in (
         ("train.graphs", graphs_path),
@@ -3584,6 +4044,7 @@ def main() -> int:
         ("benchmark.history_out_csv", bench_cfg.get("history_out_csv", "")),
         ("benchmark.plot_path", bench_cfg.get("plot_path", "")),
         ("benchmark.bar_plot_path", bench_cfg.get("bar_plot_path", "")),
+        ("benchmark.econ_prices", config.get("econ_prices", "")),
         ("train.risk_cache_dir", config.get("risk_cache_dir", "")),
         ("train.portfolio_cache_dir", config.get("portfolio_cache_dir", "")),
         ("build_graphs.prices", build_cfg.get("prices", "")),
@@ -3592,7 +4053,7 @@ def main() -> int:
             ensure_safe_cluster_path(path_value, cluster_cfg=cluster_cfg, label=label)
     config["econ_ticker_rows"] = 0
     if bool(config.get("econ_enabled", False)):
-        prices_path = str(bench_cfg.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv")))
+        prices_path = str(config.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv")))
         try:
             ticker_eff, ticker_src, ticker_rows = resolve_price_ticker(
                 prices_path=prices_path,
@@ -3607,6 +4068,14 @@ def main() -> int:
                 ticker=ticker_eff,
                 max_abs_logret=float(config.get("econ_max_abs_logret", 0.5)),
             )
+            if include_tickers or str(config.get("econ_strategy_kind", "graph_timing")).strip().lower() in {
+                "cross_sectional",
+                "both",
+            }:
+                config["econ_fwd_ret_panel"] = load_forward_returns_panel_from_prices(
+                    prices_path=prices_path,
+                    max_abs_logret=float(config.get("econ_max_abs_logret", 0.5)),
+                )
             print(
                 "econ ticker: "
                 f"requested={config.get('econ_ticker')} "
@@ -3764,7 +4233,7 @@ def main() -> int:
                 eval_graphs=ev_graphs,
                 eval_dates=ev_dates,
             )
-        if mode_name in {"ff_e2e", "ff_e2e_core", "ff_financial", "ff_fast", "ff_accurate"}:
+        if mode_name in {"ff_e2e", "ff_e2e_core", "ff_financial", "ff_fast", "ff_accurate", "ff_bootstrap_rank"}:
             return _benchmark_ff(
                 graphs,
                 device,

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import random
 from typing import Any
+import warnings
 
 import torch
 
@@ -113,7 +114,24 @@ def load_resume_payload(
     try:
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     except TypeError:
-        payload = torch.load(checkpoint_path, map_location="cpu")
+        try:
+            payload = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load resume checkpoint {checkpoint_path}: "
+                f"{type(exc).__name__}: {exc}. Starting from scratch.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+    except Exception as exc:
+        warnings.warn(
+            f"Failed to load resume checkpoint {checkpoint_path}: "
+            f"{type(exc).__name__}: {exc}. Starting from scratch.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
     if not isinstance(payload, dict):
         return None
     if expected_fingerprint is not None and str(payload.get("fingerprint", "")) != str(expected_fingerprint):

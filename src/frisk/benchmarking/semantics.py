@@ -17,7 +17,7 @@ def mode_semantics(mode: str) -> dict[str, str]:
     canonical = canonical_mode_name(mode)
     if canonical in {"ff_e2e_core", "backprop_contrastive_core", "ff_fast"}:
         return {"task_family": "algorithmic_parity", "signal_family": "contrastive"}
-    if canonical in {"ff_financial", "ff_accurate"}:
+    if canonical in {"ff_financial", "ff_accurate", "ff_bootstrap_rank"}:
         return {"task_family": "financial_value", "signal_family": "goodness_rank"}
     if canonical == "backprop_supervised_return":
         return {"task_family": "financial_value", "signal_family": "return_forecast"}
@@ -68,13 +68,88 @@ def apply_mode_profile(mode: str, cfg: dict) -> tuple[str, dict]:
                 "ff_loss_type": "symba",
                 "goodness_norm": "layernorm",
                 "goodness_reducer": "mean",
-                "neg_mode": "factor_hard",
+                "neg_mode": "shuffle+noise",
                 "eval_neg_mode": "factor_hard",
                 "eval_neg_modes": [],
+                "ff_neg_mix": ["shuffle", "shuffle+noise", "factor_hard"],
+                "ff_curriculum_epochs": [0.45, 0.35, 0.20],
+                "ff_rank_aux_weight": max(float(out.get("ff_rank_aux_weight", 0.0)), 0.03),
+                "ff_rank_corr_weight": max(float(out.get("ff_rank_corr_weight", 0.0)), 0.02),
+                "energy_penalty_weight": max(float(out.get("energy_penalty_weight", 0.0)), 1e-4),
+                "embedding_var_weight": max(float(out.get("embedding_var_weight", 0.0)), 0.02),
+                "embedding_cov_weight": max(float(out.get("embedding_cov_weight", 0.0)), 0.01),
+                "econ_strategy_kind": str(out.get("econ_strategy_kind", "both")),
+                "econ_ls_top_frac": float(out.get("econ_ls_top_frac", 0.2)),
+                "econ_ls_bottom_frac": float(out.get("econ_ls_bottom_frac", 0.2)),
             }
         )
     elif canonical == "ff_financial":
-        out.update({"task_family": "financial_value", "signal_family": "goodness_rank"})
+        out.update(
+            {
+                "task_family": "financial_value",
+                "signal_family": "goodness_rank",
+                "ff_mode": "classic",
+                "ff_loss_type": "symba",
+                "goodness_norm": "layernorm",
+                "goodness_reducer": "mean",
+                "neg_mode": "shuffle+noise",
+                "eval_neg_mode": "factor_hard",
+                "eval_neg_modes": [],
+                "ff_neg_mix": ["shuffle", "shuffle+noise", "factor_hard", "sector_swap"],
+                "ff_curriculum_epochs": [0.40, 0.35, 0.25],
+                "ff_rank_aux_weight": max(float(out.get("ff_rank_aux_weight", 0.0)), 0.025),
+                "ff_rank_corr_weight": max(float(out.get("ff_rank_corr_weight", 0.0)), 0.02),
+                "energy_penalty_weight": max(float(out.get("energy_penalty_weight", 0.0)), 1e-4),
+                "embedding_var_weight": max(float(out.get("embedding_var_weight", 0.0)), 0.02),
+                "embedding_cov_weight": max(float(out.get("embedding_cov_weight", 0.0)), 0.008),
+                "portfolio_loss_type": str(out.get("portfolio_loss_type", "delta_cara")),
+                "portfolio_loss_weight": max(float(out.get("portfolio_loss_weight", 0.0)), 0.003),
+                "portfolio_baseline_exposure": float(out.get("portfolio_baseline_exposure", 1.0)),
+                "portfolio_delta_scale": float(out.get("portfolio_delta_scale", 0.5)),
+                "portfolio_cara_risk_aversion": float(out.get("portfolio_cara_risk_aversion", 4.0)),
+                "econ_strategy_kind": str(out.get("econ_strategy_kind", "both")),
+                "econ_ls_top_frac": float(out.get("econ_ls_top_frac", 0.2)),
+                "econ_ls_bottom_frac": float(out.get("econ_ls_bottom_frac", 0.2)),
+            }
+        )
+    elif canonical == "ff_bootstrap_rank":
+        out.update(
+            {
+                "task_family": "financial_value",
+                "signal_family": "goodness_rank",
+                "ff_mode": "classic",
+                "ff_loss_type": "symba",
+                "goodness_norm": "layernorm",
+                "goodness_reducer": "mean",
+                "neg_mode": "shuffle+noise",
+                "eval_neg_mode": "factor_hard",
+                "eval_neg_modes": [],
+                "ff_neg_mix": ["shuffle", "shuffle+noise", "factor_hard", "cross_asset_mix"],
+                "ff_curriculum_epochs": [0.40, 0.35, 0.25],
+                "ff_rank_aux_weight": max(float(out.get("ff_rank_aux_weight", 0.0)), 0.03),
+                "ff_rank_corr_weight": max(float(out.get("ff_rank_corr_weight", 0.0)), 0.03),
+                "energy_penalty_weight": max(float(out.get("energy_penalty_weight", 0.0)), 1e-4),
+                "embedding_var_weight": max(float(out.get("embedding_var_weight", 0.0)), 0.03),
+                "embedding_cov_weight": max(float(out.get("embedding_cov_weight", 0.0)), 0.01),
+                "bootstrap_graph_enabled": True,
+                "bootstrap_graph_weight": max(float(out.get("bootstrap_graph_weight", 0.0)), 0.15),
+                "bootstrap_graph_momentum": float(out.get("bootstrap_graph_momentum", 0.99)),
+                "bootstrap_graph_view_mode": str(out.get("bootstrap_graph_view_mode", "cross_asset_mix")),
+                "bootstrap_graph_view_noise_std": float(out.get("bootstrap_graph_view_noise_std", 0.03)),
+                "bootstrap_graph_predictor_hidden_dim": int(
+                    out.get("bootstrap_graph_predictor_hidden_dim", out.get("hidden_dim", 64))
+                ),
+                "portfolio_loss_type": str(out.get("portfolio_loss_type", "delta_cara")),
+                "portfolio_loss_weight": max(float(out.get("portfolio_loss_weight", 0.0)), 0.004),
+                "portfolio_baseline_exposure": float(out.get("portfolio_baseline_exposure", 1.0)),
+                "portfolio_delta_scale": float(out.get("portfolio_delta_scale", 0.5)),
+                "portfolio_cara_risk_aversion": float(out.get("portfolio_cara_risk_aversion", 4.0)),
+                "econ_strategy_kind": str(out.get("econ_strategy_kind", "both")),
+                "econ_ls_top_frac": float(out.get("econ_ls_top_frac", 0.2)),
+                "econ_ls_bottom_frac": float(out.get("econ_ls_bottom_frac", 0.2)),
+                "econ_ls_uncertainty_scale": float(out.get("econ_ls_uncertainty_scale", 0.5)),
+            }
+        )
     elif canonical == "backprop_supervised_return":
         out.update({"task_family": "financial_value", "signal_family": "return_forecast"})
     elif canonical == "backprop_contrastive":
@@ -133,14 +208,29 @@ def _finite_or_none(value):
 def objective_primary_metric(metrics: dict) -> tuple[str, float]:
     task_family = str(metrics.get("task_family", "")).strip().lower()
     objective = str(metrics.get("eval_objective", "")).strip().lower()
+    signal_family = str(metrics.get("signal_family", "")).strip().lower()
     if task_family == "financial_value":
         for key in (
+            "econ_ls_oos_sharpe_uplift_min",
+            "econ_ls_sharpe_uplift",
+            "econ_ls_oos_ann_return_uplift_min",
             "econ_oos_sharpe_uplift_min",
             "econ_sharpe_uplift",
             "eval_return_corr",
             "eval_return_rank_corr",
             "eval_sep",
             "eval_auroc",
+        ):
+            value = _finite_or_none(metrics.get(key))
+            if value is not None:
+                return key, value
+    if signal_family == "goodness_rank":
+        for key in (
+            "econ_ls_oos_sharpe_uplift_min",
+            "econ_ls_sharpe_uplift",
+            "econ_ls_oos_ann_return_uplift_min",
+            "eval_return_rank_corr",
+            "eval_sep",
         ):
             value = _finite_or_none(metrics.get(key))
             if value is not None:
