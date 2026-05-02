@@ -1,0 +1,5 @@
+mode,avg_epoch_s,graphs_per_s,primary_eval_metric_name,primary_eval_metric,econ_sharpe_uplift,baseline_seed,baseline_split_mode,baseline_device,baseline_graphs_total,baseline_batch_size
+ff_accurate,244.69792692723263,30.401321786020986,,,-0.1525036897694038,7,walk_forward,cuda,10400,128
+ff_financial,246.51783359862802,30.120920898889278,,,-0.14481959521932344,7,walk_forward,cuda,10400,128
+ff_bootstrap_rank,248.19181325439123,29.881373450598446,,,-0.12160038532839196,7,walk_forward,cuda,10400,128
+backprop_supervised_return,245.76918955257284,30.245538529457914,,-0.5424895609384265,-0.08559774046280655,7,walk_forward,cuda,10400,128
