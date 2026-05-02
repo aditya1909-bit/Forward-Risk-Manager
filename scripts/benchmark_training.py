@@ -136,6 +136,15 @@ _NEG_AUG_MODES = {
 }
 _RISK_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
 _PORT_TARGET_MEM_CACHE: dict[str, tuple[list[float | None], float, float]] = {}
+_BENCHMARK_RESUME_SCHEMA_VERSION = 2
+_SPEED_COMPONENT_KEYS = (
+    "time_neg_gen_s",
+    "time_hallucinate_s",
+    "time_forward_pos_s",
+    "time_forward_neg_s",
+    "time_loss_terms_s",
+    "time_optimizer_s",
+)
 
 
 def _slug_token(value) -> str:
@@ -178,7 +187,77 @@ def _benchmark_resume_signature(
     train_len: int,
     eval_len: int,
 ) -> str:
+    sensitive_keys = (
+        "ff_loss_type",
+        "goodness_norm",
+        "goodness_reducer",
+        "goodness_temp",
+        "goodness_target",
+        "neg_mode",
+        "eval_neg_mode",
+        "eval_neg_modes",
+        "ff_mode",
+        "ff_neg_mix",
+        "ff_neg_mix_weights",
+        "ff_curriculum_epochs",
+        "ff_rank_aux_weight",
+        "ff_rank_corr_weight",
+        "bootstrap_graph_enabled",
+        "bootstrap_graph_weight",
+        "bootstrap_graph_momentum",
+        "bootstrap_graph_view_mode",
+        "portfolio_loss_type",
+        "portfolio_loss_weight",
+        "portfolio_baseline_exposure",
+        "portfolio_delta_scale",
+        "portfolio_cara_risk_aversion",
+        "risk_loss_weight",
+        "supervised_return_loss_type",
+        "econ_enabled",
+        "econ_strategy_kind",
+        "econ_ticker",
+        "econ_prices",
+        "econ_signal_window",
+        "econ_signal_quantile",
+        "econ_signal_polarity",
+        "econ_oos_folds",
+        "econ_oos_min_fold_days",
+        "econ_turnover_cost_bps",
+        "econ_slippage_bps",
+        "econ_slippage_vol_scale",
+        "econ_slippage_vol_lookback",
+        "econ_short_borrow_bps",
+        "econ_max_abs_exposure",
+        "econ_max_abs_logret",
+        "econ_regime_gate_enabled",
+        "econ_regime_thresholding_enabled",
+        "econ_regime_threshold_window",
+        "econ_regime_threshold_quantile",
+        "econ_regime_vol_window",
+        "econ_regime_low_quantile",
+        "econ_regime_high_quantile",
+        "econ_ls_top_k",
+        "econ_ls_bottom_k",
+        "econ_ls_top_frac",
+        "econ_ls_bottom_frac",
+        "econ_ls_signal_polarity",
+        "econ_ls_turnover_cost_bps",
+        "econ_ls_short_borrow_bps",
+        "econ_ls_max_gross_exposure",
+        "econ_ls_min_names",
+        "econ_ls_oos_folds",
+        "econ_ls_oos_min_fold_days",
+        "econ_ls_uncertainty_scale",
+        "timing_warmup_epochs",
+        "loader_workers",
+        "pin_memory",
+        "persistent_workers",
+        "prefetch_factor",
+        "amp",
+        "backprop_amp",
+    )
     payload = {
+        "resume_schema_version": _BENCHMARK_RESUME_SCHEMA_VERSION,
         "script": "benchmark_training",
         "mode_name": str(mode_name),
         "seed_run": int(seed_run),
@@ -203,7 +282,88 @@ def _benchmark_resume_signature(
         "portfolio_head_enabled": bool(cfg_attempt.get("portfolio_head_enabled", False)),
         "backprop_concat_posneg": bool(cfg_attempt.get("backprop_concat_posneg", True)),
     }
+    for key in sensitive_keys:
+        if key in cfg_attempt:
+            payload[key] = cfg_attempt.get(key)
     return resume_fingerprint(payload)
+
+
+def _stamp_resume_provenance(
+    row: dict,
+    *,
+    checkpoint_path: str = "",
+    loaded_completed: bool = False,
+) -> dict:
+    row["resume_schema_version"] = int(_BENCHMARK_RESUME_SCHEMA_VERSION)
+    row["resume_checkpoint_path"] = str(checkpoint_path or row.get("resume_checkpoint_path", "") or "")
+    row["resume_loaded_completed"] = bool(loaded_completed or row.get("resume_loaded_completed", False))
+    return row
+
+
+def _add_speed_reporting_metrics(row: dict) -> dict:
+    vals = []
+    for key in _SPEED_COMPONENT_KEYS:
+        value = row.get(key)
+        if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
+            vals.append(max(0.0, float(value)))
+    if vals:
+        row["time_tracked_step_s"] = float(sum(vals))
+    return row
+
+
+def _mark_auto_polarity_diagnostics(row: dict) -> dict:
+    requested = str(row.get("econ_signal_polarity_requested", "")).strip().lower()
+    if requested == "auto":
+        row["econ_signal_polarity_auto_is_diagnostic"] = True
+    requested_ls = str(row.get("econ_ls_signal_polarity_requested", "")).strip().lower()
+    if requested_ls == "auto":
+        row["econ_ls_signal_polarity_auto_is_diagnostic"] = True
+    return row
+
+
+def _finalize_benchmark_result(
+    row: dict,
+    *,
+    checkpoint_path: str = "",
+    loaded_completed: bool = False,
+) -> dict:
+    _attach_primary_metrics(row)
+    _stamp_resume_provenance(
+        row,
+        checkpoint_path=checkpoint_path,
+        loaded_completed=loaded_completed,
+    )
+    _add_speed_reporting_metrics(row)
+    _mark_auto_polarity_diagnostics(row)
+    return row
+
+
+def _benchmark_baseline_row(row: dict) -> dict:
+    return {
+        "mode": row.get("mode"),
+        "avg_epoch_s": row.get("avg_epoch_s"),
+        "graphs_per_s": row.get("graphs_per_s"),
+        "time_tracked_step_s": row.get("time_tracked_step_s"),
+        "time_forward_pos_s": row.get("time_forward_pos_s"),
+        "time_forward_neg_s": row.get("time_forward_neg_s"),
+        "time_loss_terms_s": row.get("time_loss_terms_s"),
+        "time_optimizer_s": row.get("time_optimizer_s"),
+        "time_neg_gen_s": row.get("time_neg_gen_s"),
+        "time_hallucinate_s": row.get("time_hallucinate_s"),
+        "time_econ_eval_s": row.get("time_econ_eval_s"),
+        "primary_eval_metric_name": row.get("primary_eval_metric_name"),
+        "primary_eval_metric": row.get("primary_eval_metric"),
+        "econ_sharpe_uplift": row.get("econ_sharpe_uplift"),
+        "econ_exposure_adjusted_sharpe_uplift": row.get("econ_exposure_adjusted_sharpe_uplift"),
+        "econ_ls_oos_sharpe_uplift_min": row.get("econ_ls_oos_sharpe_uplift_min"),
+        "resume_loaded_completed": row.get("resume_loaded_completed"),
+        "resume_schema_version": row.get("resume_schema_version"),
+        "baseline_seed": row.get("baseline_seed"),
+        "baseline_split_mode": row.get("baseline_split_mode"),
+        "baseline_device": row.get("baseline_device"),
+        "baseline_graphs_total": row.get("baseline_graphs_total"),
+        "baseline_batch_size": row.get("baseline_batch_size"),
+    }
 
 
 def _load_benchmark_resume_state(
@@ -666,6 +826,10 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
         "portfolio_head_enabled_effective",
         "task_family",
         "signal_family",
+        "econ_signal_polarity_requested",
+        "econ_signal_polarity_effective",
+        "econ_ls_signal_polarity_requested",
+        "econ_ls_signal_polarity_effective",
     ):
         if key in first:
             out[key] = first[key]
@@ -677,6 +841,8 @@ def _aggregate_fold_results(fold_rows: list[dict]) -> dict:
     out["error_message"] = ""
     out["retry_applied"] = bool(any(bool(r.get("retry_applied", False)) for r in successful_rows))
     out["safe_mode_applied"] = bool(any(bool(r.get("safe_mode_applied", False)) for r in successful_rows))
+    out["resume_loaded_completed"] = bool(any(bool(r.get("resume_loaded_completed", False)) for r in successful_rows))
+    out["resume_schema_version"] = int(_BENCHMARK_RESUME_SCHEMA_VERSION)
     return out
 
 
@@ -780,6 +946,10 @@ def _aggregate_seed_results(
         "split_mode_effective",
         "task_family",
         "signal_family",
+        "econ_signal_polarity_requested",
+        "econ_signal_polarity_effective",
+        "econ_ls_signal_polarity_requested",
+        "econ_ls_signal_polarity_effective",
     ):
         if key in first:
             out[key] = first[key]
@@ -790,6 +960,8 @@ def _aggregate_seed_results(
     out["error_message"] = ""
     out["retry_applied"] = bool(any(bool(r.get("retry_applied", False)) for r in successful_rows))
     out["safe_mode_applied"] = bool(any(bool(r.get("safe_mode_applied", False)) for r in successful_rows))
+    out["resume_loaded_completed"] = bool(any(bool(r.get("resume_loaded_completed", False)) for r in successful_rows))
+    out["resume_schema_version"] = int(_BENCHMARK_RESUME_SCHEMA_VERSION)
     return out
 
 
@@ -823,6 +995,7 @@ def _compute_econ_metrics_for_eval(
     eval_dates,
     config: dict,
     score_values: Sequence[float] | None = None,
+    goodness_values: Sequence[float] | None = None,
 ):
     t0 = time.perf_counter()
     meta = {
@@ -834,7 +1007,11 @@ def _compute_econ_metrics_for_eval(
     }
     if not bool(config.get("econ_enabled", False)):
         return meta
-    if not eval_graphs or not eval_dates:
+    if score_values is None and goodness_values is not None:
+        score_values = goodness_values
+    if not eval_dates:
+        return meta
+    if not eval_graphs and score_values is None:
         return meta
     strategy_kind = str(config.get("econ_strategy_kind", "graph_timing")).strip().lower()
     if strategy_kind not in {"graph_timing", "cross_sectional", "both"}:
@@ -950,6 +1127,291 @@ def _compute_econ_metrics_for_eval(
     out.update(meta)
     out["econ_eval_s"] = float(time.perf_counter() - t0)
     return out
+
+
+def _csv_rows(path: str | Path) -> list[dict]:
+    p = Path(str(path))
+    if not p.exists():
+        return []
+    df = pd.read_csv(p)
+    if df.empty:
+        return []
+    df = df.replace({np.nan: None})
+    return [dict(row) for row in df.to_dict(orient="records")]
+
+
+def _finite_value(value) -> bool:
+    if value is None:
+        return False
+    try:
+        return bool(np.isfinite(float(value)))
+    except Exception:
+        return False
+
+
+def _legacy_benchmark_resume_path(config: dict, mode: str, seed_run: int, fold_id: int | None) -> Path:
+    resume_dir = str(config.get("repair_resume_dir", "") or config.get("resume_dir", "")).strip()
+    if not resume_dir:
+        return Path("")
+    return _benchmark_resume_path(
+        resume_dir=resume_dir,
+        mode_name=mode,
+        seed_run=int(seed_run),
+        split_mode_effective="walk_forward"
+        if is_walk_forward_mode(str(config.get("split_mode", "")))
+        else str(config.get("split_mode", "chronological")),
+        fold_id=fold_id,
+        attempt_tag="base",
+    )
+
+
+def _instantiate_encoder_for_eval(graphs, config: dict, device: torch.device):
+    if not graphs:
+        return None
+    model = GCNEncoder(
+        in_dim=graphs[0].x.shape[1],
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        dropout=config["dropout"],
+        conv_type=str(config.get("encoder_conv_type", "gcn")).strip().lower(),
+        gat_heads=int(config.get("encoder_gat_heads", 2)),
+        rgcn_num_relations=max(2, int(config.get("encoder_rgcn_num_relations", 8))),
+        residual_edge_enabled=bool(config.get("residual_edge_weight_enabled", False)),
+        residual_edge_hidden_dim=int(config.get("residual_edge_hidden_dim", 32)),
+        residual_edge_max_delta=float(config.get("residual_edge_max_delta", 0.25)),
+        residual_edge_detach_features=bool(config.get("residual_edge_detach_features", True)),
+    ).to(device)
+    return model
+
+
+def _load_legacy_eval_modules(
+    *,
+    mode: str,
+    config: dict,
+    graphs,
+    device: torch.device,
+    checkpoint_path: Path,
+) -> tuple[torch.nn.Module | None, torch.nn.Module | None, dict | None]:
+    if not checkpoint_path or not checkpoint_path.exists():
+        return None, None, None
+    payload = load_resume_payload(checkpoint_path, expected_fingerprint=None)
+    if not payload or not isinstance(payload.get("model_states"), dict):
+        return None, None, payload
+    model_states = payload["model_states"]
+    model = _instantiate_encoder_for_eval(graphs, config, device)
+    if model is None or "model" not in model_states:
+        return None, None, payload
+    try:
+        load_module_state_for_resume(model, model_states["model"], strict=True)
+    except Exception:
+        load_module_state_for_resume(model, model_states["model"], strict=False)
+    model.eval()
+
+    critic = None
+    if mode in {"ff_accurate", "ff_financial", "ff_bootstrap_rank", "ff_e2e", "ff_e2e_core", "ff_fast", "ff_layerwise"}:
+        critic = _build_critic(config, hidden_dim=int(config["hidden_dim"]), device=device)
+        if "critic" in model_states:
+            try:
+                load_module_state_for_resume(critic, model_states["critic"], strict=True)
+            except Exception:
+                load_module_state_for_resume(critic, model_states["critic"], strict=False)
+            critic.eval()
+        else:
+            critic = None
+    return model, critic, payload
+
+
+def _needs_econ_ls_rescore(row: dict, config: dict) -> bool:
+    if not bool(config.get("repair_recompute_missing_econ_ls", True)):
+        return False
+    if _finite_value(row.get("econ_ls_oos_sharpe_uplift_min")) or _finite_value(row.get("econ_ls_sharpe_uplift")):
+        return bool(config.get("repair_force_econ_rescore", False))
+    return True
+
+
+def _repair_eval_only_benchmark(
+    *,
+    config: dict,
+    graphs,
+    graph_dates: list[str],
+    walk_forward: list[dict],
+    modes: list[str],
+    mode_overrides: dict,
+    benchmark_seeds: list[int],
+    base_ctx: dict,
+    device: torch.device,
+) -> tuple[list[dict], list[dict], list[dict], dict[str, bool]]:
+    source_fold_csv = str(config.get("repair_source_walk_forward_csv", "")).strip()
+    source_history_csv = str(config.get("repair_source_history_csv", "")).strip()
+    if not source_fold_csv:
+        raise ValueError("repair_eval_only requires benchmark.repair_source_walk_forward_csv")
+
+    source_fold_rows = _csv_rows(source_fold_csv)
+    if not source_fold_rows:
+        raise ValueError(f"repair source fold csv is empty or missing: {source_fold_csv}")
+    history_rows = _csv_rows(source_history_csv) if source_history_csv else []
+    for item in history_rows:
+        item.setdefault("row_type", "epoch")
+
+    source_by_key: dict[tuple[str, int, int], dict] = {}
+    for row in source_fold_rows:
+        try:
+            key = (str(row.get("mode", "")), int(row.get("seed_run")), int(row.get("fold_id")))
+        except Exception:
+            continue
+        source_by_key[key] = row
+
+    results: list[dict] = []
+    fold_results: list[dict] = []
+    mode_success_map: dict[str, bool] = {m: False for m in modes}
+    multi_seed = len(benchmark_seeds) > 1
+
+    for raw_mode in modes:
+        mode = _canonical_mode_name(raw_mode)
+        cfg_mode_base = config.copy()
+        mode, cfg_mode_base = _apply_mode_profile(mode, cfg_mode_base)
+        mode_override = mode_overrides.get(mode, {})
+        if isinstance(mode_override, dict):
+            cfg_mode_base.update(mode_override)
+        mode_seed_rows: list[dict] = []
+
+        for seed_run in benchmark_seeds:
+            fold_rows: list[dict] = []
+            cfg_mode = cfg_mode_base.copy()
+            cfg_mode["seed"] = int(seed_run)
+
+            for fold in walk_forward:
+                fold_id = int(fold.get("fold_id", -1))
+                src = source_by_key.get((mode, int(seed_run), fold_id))
+                if src is None:
+                    fold_res = {
+                        "mode": mode,
+                        "row_type": "fold",
+                        "split_mode_effective": "walk_forward",
+                        "fold_id": fold_id,
+                        "seed_run": int(seed_run),
+                        **base_ctx,
+                        "status": "failed",
+                        "error_type": "FileNotFoundError",
+                        "error_message": f"missing source fold row for mode={mode} seed={seed_run} fold={fold_id}",
+                        "retry_applied": False,
+                        "safe_mode_applied": False,
+                    }
+                    _stamp_resume_provenance(fold_res)
+                    fold_rows.append(fold_res)
+                    fold_results.append(fold_res)
+                    continue
+
+                fold_res = dict(src)
+                fold_res.update(base_ctx)
+                fold_res["mode"] = mode
+                fold_res["row_type"] = "fold"
+                fold_res["seed_run"] = int(seed_run)
+                fold_res["fold_id"] = fold_id
+                fold_res["status"] = str(fold_res.get("status", "ok") or "ok")
+                fold_res["error_type"] = "" if fold_res["status"] == "ok" else str(fold_res.get("error_type", ""))
+                fold_res["error_message"] = "" if fold_res["status"] == "ok" else str(fold_res.get("error_message", ""))
+                checkpoint_path = _legacy_benchmark_resume_path(config, mode, int(seed_run), fold_id)
+                _stamp_resume_provenance(
+                    fold_res,
+                    checkpoint_path=str(checkpoint_path),
+                    loaded_completed=checkpoint_path.exists(),
+                )
+
+                if (
+                    str(fold_res.get("status", "ok")).strip().lower() == "ok"
+                    and mode in {"ff_accurate", "ff_financial", "ff_bootstrap_rank"}
+                    and _needs_econ_ls_rescore(fold_res, cfg_mode)
+                ):
+                    train_idx = [int(i) for i in fold["train_idx"]]
+                    eval_idx = [int(i) for i in fold["eval_idx"]]
+                    eval_fold = GraphIndexSequence(graphs, eval_idx)
+                    eval_dates_fold = _slice_by_indices(graph_dates, eval_idx)
+                    cfg_fold = cfg_mode.copy()
+                    cfg_fold["split_mode"] = "chronological"
+                    model, critic, payload = _load_legacy_eval_modules(
+                        mode=mode,
+                        config=cfg_fold,
+                        graphs=graphs,
+                        device=device,
+                        checkpoint_path=checkpoint_path,
+                    )
+                    if model is not None and critic is not None:
+                        try:
+                            econ = _compute_econ_metrics_for_eval(
+                                model,
+                                critic,
+                                eval_fold,
+                                eval_dates_fold,
+                                cfg_fold,
+                            )
+                            fold_res.update(econ)
+                            fold_res["repair_econ_rescore_applied"] = True
+                            fold_res["repair_eval_train_graphs"] = len(train_idx)
+                            fold_res["repair_eval_eval_graphs"] = len(eval_idx)
+                        except Exception as exc:
+                            err_type, err_msg = _error_metadata(exc)
+                            fold_res["repair_econ_rescore_applied"] = False
+                            fold_res["repair_econ_rescore_error_type"] = err_type
+                            fold_res["repair_econ_rescore_error_message"] = err_msg
+                    else:
+                        fold_res["repair_econ_rescore_applied"] = False
+                        fold_res["repair_econ_rescore_error_type"] = "FileNotFoundError" if not checkpoint_path.exists() else "KeyError"
+                        fold_res["repair_econ_rescore_error_message"] = (
+                            f"checkpoint unavailable or missing FF model/critic state: {checkpoint_path}"
+                        )
+                        if payload is not None and isinstance(payload.get("result"), dict):
+                            for key, value in payload["result"].items():
+                                fold_res.setdefault(key, value)
+
+                if isinstance(mode_override, dict):
+                    for key, value in mode_override.items():
+                        if key not in fold_res:
+                            fold_res[key] = value
+                _finalize_benchmark_result(
+                    fold_res,
+                    checkpoint_path=str(checkpoint_path),
+                    loaded_completed=checkpoint_path.exists(),
+                )
+                fold_rows.append(fold_res)
+                fold_results.append(fold_res)
+                if str(fold_res.get("status", "")).strip().lower() == "ok":
+                    mode_success_map[mode] = True
+
+            agg = _aggregate_fold_results(fold_rows)
+            agg["mode"] = mode
+            agg["seed_run"] = int(seed_run)
+            agg["row_type"] = "aggregate_seed" if multi_seed else "aggregate"
+            agg.update(base_ctx)
+            if isinstance(mode_override, dict):
+                for key, value in mode_override.items():
+                    if key not in agg:
+                        agg[key] = value
+            _finalize_benchmark_result(agg)
+            results.append(agg)
+            mode_seed_rows.append(agg)
+
+        if multi_seed and mode_seed_rows:
+            seed_agg = _aggregate_seed_results(
+                mode_seed_rows,
+                bootstrap_samples=int(config.get("seed_bootstrap_samples", 2000)),
+                bootstrap_alpha=float(config.get("seed_bootstrap_alpha", 0.05)),
+                bootstrap_seed=int(config.get("seed_bootstrap_seed", 7)),
+            )
+            seed_agg["mode"] = mode
+            seed_agg["row_type"] = "aggregate"
+            seed_agg["seed_run"] = "ALL"
+            seed_agg.update(base_ctx)
+            if isinstance(mode_override, dict):
+                for key, value in mode_override.items():
+                    if key not in seed_agg:
+                        seed_agg[key] = value
+            _finalize_benchmark_result(seed_agg)
+            results.append(seed_agg)
+            if str(seed_agg.get("status", "")).strip().lower() == "ok":
+                mode_success_map[mode] = True
+
+    return results, fold_results, history_rows, mode_success_map
 
 
 def _get_use_mode(epoch: int, neg_mode: str, warmup: int, mix_start: float, mix_end: float, ramp: int):
@@ -1823,7 +2285,11 @@ def _benchmark_ff(
             and isinstance(resume_payload.get("result"), dict)
         ):
             print(f"resume checkpoint already completed: {resume_checkpoint_path}")
-            return dict(resume_payload["result"])
+            return _finalize_benchmark_result(
+                dict(resume_payload["result"]),
+                checkpoint_path=resume_checkpoint_path,
+                loaded_completed=True,
+            )
     train_neg_mode = str(config["neg_mode"]).strip().lower()
     if layerwise and train_neg_mode == "self_contrastive":
         fallback = str(config.get("layerwise_neg_mode", "shuffle")).strip().lower()
@@ -2678,6 +3144,11 @@ def _benchmark_ff(
         out["eval_neg_modes_reported"] = ",".join(reported)
         if skipped:
             out["eval_neg_modes_skipped"] = ",".join(skipped)
+    _finalize_benchmark_result(
+        out,
+        checkpoint_path=resume_checkpoint_path,
+        loaded_completed=False,
+    )
     out["_epoch_history"] = epoch_history
     if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
         _save_benchmark_resume_state(
@@ -2699,7 +3170,6 @@ def _benchmark_ff(
             result=out,
             epoch_history=epoch_history,
         )
-    _attach_primary_metrics(out)
     return out
 
 
@@ -2817,7 +3287,11 @@ def _benchmark_backprop(
             and isinstance(resume_payload.get("result"), dict)
         ):
             print(f"resume checkpoint already completed: {resume_checkpoint_path}")
-            return dict(resume_payload["result"])
+            return _finalize_benchmark_result(
+                dict(resume_payload["result"]),
+                checkpoint_path=resume_checkpoint_path,
+                loaded_completed=True,
+            )
 
     hall_cfg = HallucinationConfig(
         steps=config["hall_steps"],
@@ -3237,6 +3711,11 @@ def _benchmark_backprop(
     if econ:
         out.update(econ)
         out["time_econ_eval_s"] = float(econ.get("econ_eval_s", 0.0))
+    _finalize_benchmark_result(
+        out,
+        checkpoint_path=resume_checkpoint_path,
+        loaded_completed=False,
+    )
     out["_epoch_history"] = epoch_history
     if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
         _save_benchmark_resume_state(
@@ -3256,7 +3735,6 @@ def _benchmark_backprop(
             result=out,
             epoch_history=epoch_history,
         )
-    _attach_primary_metrics(out)
     return out
 
 
@@ -3369,7 +3847,11 @@ def _benchmark_backprop_supervised_return(
             and isinstance(resume_payload.get("result"), dict)
         ):
             print(f"resume checkpoint already completed: {resume_checkpoint_path}")
-            return dict(resume_payload["result"])
+            return _finalize_benchmark_result(
+                dict(resume_payload["result"]),
+                checkpoint_path=resume_checkpoint_path,
+                loaded_completed=True,
+            )
 
     component_times = {
         "neg_gen": float(resume_meta.get("component_times", {}).get("neg_gen", 0.0)),
@@ -3574,6 +4056,11 @@ def _benchmark_backprop_supervised_return(
     if risk_head is not None:
         out["risk_horizons_effective"] = ",".join(str(h) for h in risk_horizons_effective)
         out["risk_ticker_effective"] = str(config.get("risk_ticker_effective", ""))
+    _finalize_benchmark_result(
+        out,
+        checkpoint_path=resume_checkpoint_path,
+        loaded_completed=False,
+    )
     out["_epoch_history"] = epoch_history
     if resume_checkpoint_path and resume_fingerprint_key and dist_ctx.is_primary:
         _save_benchmark_resume_state(
@@ -3592,7 +4079,6 @@ def _benchmark_backprop_supervised_return(
             result=out,
             epoch_history=epoch_history,
         )
-    _attach_primary_metrics(out)
     return out
 
 
@@ -3934,12 +4420,19 @@ def main() -> int:
         "resume_save_every_epochs": int(bench_cfg.get("resume_save_every_epochs", 1)),
         "resume_save_every_minutes": float(bench_cfg.get("resume_save_every_minutes", 55.0)),
         "resume_on_signal": bool(bench_cfg.get("resume_on_signal", True)),
+        "repair_eval_only": bool(bench_cfg.get("repair_eval_only", False)),
+        "repair_resume_dir": str(bench_cfg.get("repair_resume_dir", bench_cfg.get("resume_dir", ""))),
+        "repair_source_walk_forward_csv": str(bench_cfg.get("repair_source_walk_forward_csv", "")),
+        "repair_source_history_csv": str(bench_cfg.get("repair_source_history_csv", "")),
+        "repair_recompute_missing_econ_ls": bool(bench_cfg.get("repair_recompute_missing_econ_ls", True)),
+        "repair_force_econ_rescore": bool(bench_cfg.get("repair_force_econ_rescore", False)),
         "layerwise_neg_mode": str(train_cfg.get("layerwise_neg_mode", "shuffle")),
         "layerwise_noise_std": float(train_cfg.get("layerwise_noise_std", train_cfg.get("noise_std", 0.05))),
         "window_len": int(returns_len),
         "summary_dim": int(summary_dim),
         "econ_enabled": bool(bench_cfg.get("econ_enabled", True)),
-        "econ_strategy_kind": str(bench_cfg.get("econ_strategy_kind", "graph_timing")),
+        "econ_strategy_kind": str(bench_cfg.get("econ_strategy_kind", "")),
+        "econ_strategy_kind_explicit": "econ_strategy_kind" in bench_cfg,
         "econ_ticker": str(bench_cfg.get("econ_ticker", "AUTO")),
         "econ_prices": str(bench_cfg.get("econ_prices", build_cfg.get("prices", "data/processed/prices.csv"))),
         "econ_max_abs_logret": float(bench_cfg.get("econ_max_abs_logret", 0.5)),
@@ -4025,12 +4518,27 @@ def main() -> int:
         _parse_float_list(config.get("ff_neg_mix_weights", [])),
     )
     config["ff_curriculum_epochs"] = _parse_float_list(config.get("ff_curriculum_epochs", []))
+    cross_sectional_econ_needed = (
+        str(config.get("econ_strategy_kind", "graph_timing")).strip().lower()
+        in {"cross_sectional", "both"}
+    )
+    for requested_mode in modes:
+        try:
+            _, profiled_cfg = _apply_mode_profile(requested_mode, config.copy())
+        except Exception:
+            continue
+        if str(profiled_cfg.get("econ_strategy_kind", "graph_timing")).strip().lower() in {
+            "cross_sectional",
+            "both",
+        }:
+            cross_sectional_econ_needed = True
+            break
     config["econ_fwd_ret_1"] = None
     config["econ_fwd_ret_panel"] = None
     config["econ_ticker_effective"] = ""
     config["econ_ticker_source"] = ""
     config["graph_tickers"] = artifact.tickers
-    if str(config.get("econ_strategy_kind", "graph_timing")).strip().lower() in {"cross_sectional", "both"}:
+    if cross_sectional_econ_needed:
         if artifact.tickers is None:
             print("warning: cross-sectional econ requested but graph artifact has no tickers; falling back to graph_timing.")
             config["econ_strategy_kind"] = "graph_timing"
@@ -4042,6 +4550,9 @@ def main() -> int:
         ("benchmark.baseline_out_csv", bench_cfg.get("baseline_out_csv", "")),
         ("benchmark.walk_forward_out_csv", bench_cfg.get("walk_forward_out_csv", "")),
         ("benchmark.history_out_csv", bench_cfg.get("history_out_csv", "")),
+        ("benchmark.repair_resume_dir", config.get("repair_resume_dir", "")),
+        ("benchmark.repair_source_walk_forward_csv", config.get("repair_source_walk_forward_csv", "")),
+        ("benchmark.repair_source_history_csv", config.get("repair_source_history_csv", "")),
         ("benchmark.plot_path", bench_cfg.get("plot_path", "")),
         ("benchmark.bar_plot_path", bench_cfg.get("bar_plot_path", "")),
         ("benchmark.econ_prices", config.get("econ_prices", "")),
@@ -4068,7 +4579,7 @@ def main() -> int:
                 ticker=ticker_eff,
                 max_abs_logret=float(config.get("econ_max_abs_logret", 0.5)),
             )
-            if include_tickers or str(config.get("econ_strategy_kind", "graph_timing")).strip().lower() in {
+            if cross_sectional_econ_needed or str(config.get("econ_strategy_kind", "graph_timing")).strip().lower() in {
                 "cross_sectional",
                 "both",
             }:
@@ -4294,6 +4805,26 @@ def main() -> int:
     multi_seed = len(benchmark_seeds) > 1
     print(f"benchmark seeds: {benchmark_seeds}")
 
+    if bool(config.get("repair_eval_only", False)):
+        if not use_walk_forward:
+            raise ValueError("repair_eval_only currently requires walk-forward benchmark splits")
+        print(
+            "benchmark repair/eval-only mode: reusing completed fold checkpoints and source fold CSV; "
+            "no training epochs will run."
+        )
+        results, fold_results, history_rows, mode_success_map = _repair_eval_only_benchmark(
+            config=config,
+            graphs=graphs,
+            graph_dates=list(graph_dates),
+            walk_forward=walk_forward,
+            modes=[_canonical_mode_name(m) for m in modes],
+            mode_overrides=mode_overrides,
+            benchmark_seeds=benchmark_seeds,
+            base_ctx=base_ctx,
+            device=device,
+        )
+        modes = []
+
     for mode in modes:
         mode = _canonical_mode_name(mode)
         cfg_mode_base = config.copy()
@@ -4433,6 +4964,8 @@ def main() -> int:
                         for key, value in mode_override.items():
                             if key not in fold_res:
                                 fold_res[key] = value
+                    _stamp_resume_provenance(fold_res)
+                    _add_speed_reporting_metrics(fold_res)
                     fold_rows.append(fold_res)
                     fold_results.append(fold_res)
                     if str(fold_res.get("status", "")).strip().lower() == "ok":
@@ -4449,6 +4982,7 @@ def main() -> int:
                     for key, value in mode_override.items():
                         if key not in agg:
                             agg[key] = value
+                _finalize_benchmark_result(agg)
                 results.append(agg)
                 mode_seed_rows.append(agg)
                 if str(agg.get("status", "")).strip().lower() == "ok":
@@ -4556,6 +5090,10 @@ def main() -> int:
                     for key, value in mode_override.items():
                         if key not in mode_row:
                             mode_row[key] = value
+                if str(mode_row.get("status", "")).strip().lower() == "ok":
+                    _finalize_benchmark_result(mode_row)
+                else:
+                    _stamp_resume_provenance(mode_row)
                 results.append(mode_row)
                 mode_seed_rows.append(mode_row)
                 if abort_after_write and not continue_on_mode_error:
@@ -4576,6 +5114,7 @@ def main() -> int:
                 for key, value in mode_override.items():
                     if key not in seed_agg:
                         seed_agg[key] = value
+            _finalize_benchmark_result(seed_agg)
             results.append(seed_agg)
             if str(seed_agg.get("status", "")).strip().lower() == "ok":
                 mode_success_map[mode] = True
@@ -4652,21 +5191,7 @@ def main() -> int:
         ] or list(results)
     baseline_rows = []
     for r in baseline_source_rows:
-        baseline_rows.append(
-            {
-                "mode": r.get("mode"),
-                "avg_epoch_s": r.get("avg_epoch_s"),
-                "graphs_per_s": r.get("graphs_per_s"),
-                "primary_eval_metric_name": r.get("primary_eval_metric_name"),
-                "primary_eval_metric": r.get("primary_eval_metric"),
-                "econ_sharpe_uplift": r.get("econ_sharpe_uplift"),
-                "baseline_seed": r.get("baseline_seed"),
-                "baseline_split_mode": r.get("baseline_split_mode"),
-                "baseline_device": r.get("baseline_device"),
-                "baseline_graphs_total": r.get("baseline_graphs_total"),
-                "baseline_batch_size": r.get("baseline_batch_size"),
-            }
-        )
+        baseline_rows.append(_benchmark_baseline_row(r))
     if dist_ctx.is_primary:
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         with baseline_path.open("w", newline="") as f:
@@ -4786,7 +5311,7 @@ def main() -> int:
         plt.close(fig)
         print(f"Wrote {plot_path}")
 
-        fig, axes = plt.subplots(len(families), 2, figsize=(12, 4 * max(1, len(families))))
+        fig, axes = plt.subplots(len(families), 3, figsize=(16, 4 * max(1, len(families))))
         if len(families) == 1:
             axes = np.asarray([axes], dtype=object)
         for row_axes, family in zip(axes, families):
@@ -4794,12 +5319,18 @@ def main() -> int:
             modes_family = [str(r.get("mode", "")) for r in family_rows]
             epoch_s_family = [float(r.get("avg_epoch_s", float("nan"))) for r in family_rows]
             quality_family = [float(r.get("primary_eval_metric", float("nan"))) for r in family_rows]
+            tracked_step_family = [float(r.get("time_tracked_step_s", float("nan"))) for r in family_rows]
             row_axes[0].bar(modes_family, epoch_s_family, color="#4C78A8")
             row_axes[0].set_title(f"{family}: avg epoch time")
             row_axes[0].set_ylabel("seconds")
             row_axes[1].bar(modes_family, quality_family, color="#72B7B2")
             row_axes[1].set_title(f"{family}: primary metric")
             row_axes[1].set_ylabel("value")
+            row_axes[2].bar(modes_family, tracked_step_family, color="#F58518")
+            row_axes[2].set_title(f"{family}: tracked time per step")
+            row_axes[2].set_ylabel("seconds")
+            for ax in row_axes:
+                ax.tick_params(axis="x", rotation=25)
         fig.tight_layout()
         bar_plot_path = Path(bar_plot_path)
         bar_plot_path.parent.mkdir(parents=True, exist_ok=True)

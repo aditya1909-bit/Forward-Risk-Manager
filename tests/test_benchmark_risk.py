@@ -317,6 +317,24 @@ def test_apply_mode_profile_sets_bootstrap_rank_finance_defaults():
     assert str(cfg["econ_strategy_kind"]) == "both"
 
 
+def test_apply_mode_profile_does_not_preserve_implicit_graph_timing_default():
+    mod = _load_script("benchmark_training.py")
+    _, cfg = mod._apply_mode_profile(
+        "ff_financial",
+        {"econ_strategy_kind": "graph_timing", "econ_strategy_kind_explicit": False},
+    )
+    assert cfg["econ_strategy_kind"] == "both"
+
+
+def test_apply_mode_profile_respects_explicit_graph_timing_choice():
+    mod = _load_script("benchmark_training.py")
+    _, cfg = mod._apply_mode_profile(
+        "ff_financial",
+        {"econ_strategy_kind": "graph_timing", "econ_strategy_kind_explicit": True},
+    )
+    assert cfg["econ_strategy_kind"] == "graph_timing"
+
+
 def test_attach_primary_metrics_prefers_economics_for_financial_track():
     mod = _load_script("benchmark_training.py")
     row = {
@@ -332,6 +350,21 @@ def test_attach_primary_metrics_prefers_economics_for_financial_track():
     assert row["primary_metric_family"] == "economics"
 
 
+def test_attach_primary_metrics_prefers_exposure_adjusted_before_full_buy_hold_uplift():
+    mod = _load_script("benchmark_training.py")
+    row = {
+        "task_family": "financial_value",
+        "signal_family": "return_forecast",
+        "eval_objective": "supervised_return",
+        "econ_exposure_adjusted_sharpe_uplift": 0.05,
+        "econ_oos_sharpe_uplift_min": 0.12,
+        "econ_sharpe_uplift": 0.2,
+    }
+    mod._attach_primary_metrics(row)
+    assert row["primary_eval_metric_name"] == "econ_exposure_adjusted_sharpe_uplift"
+    assert float(row["primary_eval_metric"]) == 0.05
+
+
 def test_attach_primary_metrics_prefers_long_short_metric_for_goodness_rank():
     mod = _load_script("benchmark_training.py")
     row = {
@@ -345,6 +378,153 @@ def test_attach_primary_metrics_prefers_long_short_metric_for_goodness_rank():
     mod._attach_primary_metrics(row)
     assert row["primary_eval_metric_name"] == "econ_ls_oos_sharpe_uplift_min"
     assert float(row["primary_eval_metric"]) == 0.08
+
+
+def test_completed_resume_result_is_repaired_and_stamped():
+    mod = _load_script("benchmark_training.py")
+    row = {
+        "task_family": "financial_value",
+        "signal_family": "return_forecast",
+        "eval_objective": "supervised_return",
+        "econ_oos_sharpe_uplift_min": 0.18,
+        "time_forward_pos_s": 0.01,
+        "time_loss_terms_s": 0.02,
+        "time_optimizer_s": 0.03,
+    }
+
+    out = mod._finalize_benchmark_result(
+        row,
+        checkpoint_path="/tmp/old-completed.pt",
+        loaded_completed=True,
+    )
+
+    assert out["primary_eval_metric_name"] == "econ_oos_sharpe_uplift_min"
+    assert float(out["primary_eval_metric"]) == 0.18
+    assert out["resume_loaded_completed"] is True
+    assert out["resume_checkpoint_path"] == "/tmp/old-completed.pt"
+    assert int(out["resume_schema_version"]) == mod._BENCHMARK_RESUME_SCHEMA_VERSION
+    assert abs(float(out["time_tracked_step_s"]) - 0.06) < 1e-12
+
+
+def test_benchmark_resume_signature_changes_for_econ_profile_settings():
+    mod = _load_script("benchmark_training.py")
+    cfg = {
+        "epochs": 2,
+        "batch_size": 4,
+        "hidden_dim": 8,
+        "num_layers": 2,
+        "dropout": 0.1,
+        "lr": 1e-3,
+        "neg_mode": "shuffle+noise",
+        "eval_neg_mode": "factor_hard",
+        "ff_mode": "classic",
+        "ff_loss_type": "symba",
+        "goodness_norm": "layernorm",
+        "goodness_reducer": "mean",
+        "econ_signal_window": 126,
+        "econ_strategy_kind": "graph_timing",
+    }
+    sig_a = mod._benchmark_resume_signature(
+        cfg,
+        mode_name="ff_financial",
+        seed_run=7,
+        split_mode_effective="walk_forward",
+        fold_id=0,
+        attempt_tag="base",
+        train_len=10,
+        eval_len=4,
+    )
+    cfg_changed = dict(cfg)
+    cfg_changed["econ_strategy_kind"] = "both"
+    cfg_changed["econ_signal_window"] = 252
+    sig_b = mod._benchmark_resume_signature(
+        cfg_changed,
+        mode_name="ff_financial",
+        seed_run=7,
+        split_mode_effective="walk_forward",
+        fold_id=0,
+        attempt_tag="base",
+        train_len=10,
+        eval_len=4,
+    )
+    assert sig_a != sig_b
+
+
+def test_benchmark_baseline_row_exposes_component_timings():
+    mod = _load_script("benchmark_training.py")
+    row = {
+        "mode": "ff_financial",
+        "avg_epoch_s": 10.0,
+        "graphs_per_s": 2.0,
+        "time_forward_pos_s": 0.01,
+        "time_loss_terms_s": 0.02,
+        "time_optimizer_s": 0.03,
+        "primary_eval_metric_name": "econ_ls_oos_sharpe_uplift_min",
+        "primary_eval_metric": 0.1,
+    }
+    mod._add_speed_reporting_metrics(row)
+    baseline = mod._benchmark_baseline_row(row)
+    assert abs(float(baseline["time_tracked_step_s"]) - 0.06) < 1e-12
+    assert baseline["time_forward_pos_s"] == 0.01
+    assert baseline["time_loss_terms_s"] == 0.02
+    assert baseline["time_optimizer_s"] == 0.03
+
+
+def test_compute_econ_metrics_emits_long_short_when_cross_sectional_data_available(monkeypatch):
+    mod = _load_script("benchmark_training.py")
+    eval_dates = ["2024-01-01", "2024-01-02"]
+    graphs = []
+    for idx in range(2):
+        g = Data(
+            x=torch.randn(4, 3),
+            edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        )
+        g.graph_idx = idx
+        graphs.append(g)
+    fwd_panel = pd.DataFrame(
+        {
+            "AAA": [0.01, 0.02],
+            "BBB": [-0.01, -0.02],
+            "CCC": [0.02, 0.01],
+            "DDD": [-0.02, -0.01],
+        },
+        index=pd.to_datetime(eval_dates),
+    )
+    captured = {}
+
+    def _fake_node_scores(*_args, **_kwargs):
+        return [[0.4, 0.3, 0.2, 0.1], [0.1, 0.2, 0.3, 0.4]], [None, None]
+
+    def _fake_cross_sectional(**kwargs):
+        captured.update(kwargs)
+        return {
+            "econ_ls_oos_sharpe_uplift_min": 0.22,
+            "econ_ls_sharpe_uplift": 0.33,
+        }
+
+    monkeypatch.setattr(mod, "infer_node_goodness_with_uncertainty", _fake_node_scores)
+    monkeypatch.setattr(mod, "evaluate_cross_sectional_goodness_strategy", _fake_cross_sectional)
+
+    out = mod._compute_econ_metrics_for_eval(
+        model=object(),
+        critic=object(),
+        eval_graphs=graphs,
+        eval_dates=eval_dates,
+        config={
+            "econ_enabled": True,
+            "econ_strategy_kind": "both",
+            "econ_fwd_ret_panel": fwd_panel,
+            "graph_tickers": [["AAA", "BBB", "CCC", "DDD"], ["AAA", "BBB", "CCC", "DDD"]],
+            "goodness_temp": 1.0,
+            "batch_size": 2,
+            "econ_ticker": "SPY",
+        },
+        score_values=[0.1, 0.2],
+    )
+
+    assert captured["forward_returns"] is fwd_panel
+    assert captured["node_tickers"] == [["AAA", "BBB", "CCC", "DDD"], ["AAA", "BBB", "CCC", "DDD"]]
+    assert out["econ_ls_oos_sharpe_uplift_min"] == 0.22
 
 
 def test_regression_eval_metrics_reports_finite_regression_outputs():

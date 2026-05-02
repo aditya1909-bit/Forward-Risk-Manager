@@ -22,6 +22,7 @@ else
   source "/local/scratch/${NETID}/venv/bin/activate"
 fi
 export XDG_CACHE_HOME="${SCRATCH_ROOT}/.cache"
+export MPLCONFIGDIR="${SCRATCH_ROOT}/.cache/matplotlib"
 
 python scripts/prepare_turing_run.py \
   --base-config configs/default.toml \
@@ -32,3 +33,9 @@ python scripts/prepare_turing_run.py \
 python scripts/benchmark_training.py \
   --config "${RUNTIME_CFG}" \
   --modes ff_accurate,ff_financial,ff_bootstrap_rank,backprop_supervised_return
+
+python scripts/plot_benchmark_report.py \
+  --benchmark-csv "${SCRATCH_ROOT}/runs/experiments/turing_econ_large/metrics/benchmark_repaired.csv" \
+  --fold-csv "${SCRATCH_ROOT}/runs/experiments/turing_econ_large/metrics/benchmark_repaired_walk_forward_folds.csv" \
+  --out-dir "${SCRATCH_ROOT}/runs/experiments/turing_econ_large/plots" \
+  --prefix benchmark_repaired

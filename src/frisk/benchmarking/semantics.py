@@ -26,6 +26,13 @@ def mode_semantics(mode: str) -> dict[str, str]:
     return {"task_family": "custom", "signal_family": "custom"}
 
 
+def _financial_econ_strategy(out: dict) -> str:
+    requested = str(out.get("econ_strategy_kind", "")).strip()
+    if bool(out.get("econ_strategy_kind_explicit", False)) and requested:
+        return requested
+    return "both"
+
+
 def apply_mode_profile(mode: str, cfg: dict) -> tuple[str, dict]:
     canonical = canonical_mode_name(mode)
     out = dict(cfg)
@@ -78,7 +85,7 @@ def apply_mode_profile(mode: str, cfg: dict) -> tuple[str, dict]:
                 "energy_penalty_weight": max(float(out.get("energy_penalty_weight", 0.0)), 1e-4),
                 "embedding_var_weight": max(float(out.get("embedding_var_weight", 0.0)), 0.02),
                 "embedding_cov_weight": max(float(out.get("embedding_cov_weight", 0.0)), 0.01),
-                "econ_strategy_kind": str(out.get("econ_strategy_kind", "both")),
+                "econ_strategy_kind": _financial_econ_strategy(out),
                 "econ_ls_top_frac": float(out.get("econ_ls_top_frac", 0.2)),
                 "econ_ls_bottom_frac": float(out.get("econ_ls_bottom_frac", 0.2)),
             }
@@ -107,7 +114,7 @@ def apply_mode_profile(mode: str, cfg: dict) -> tuple[str, dict]:
                 "portfolio_baseline_exposure": float(out.get("portfolio_baseline_exposure", 1.0)),
                 "portfolio_delta_scale": float(out.get("portfolio_delta_scale", 0.5)),
                 "portfolio_cara_risk_aversion": float(out.get("portfolio_cara_risk_aversion", 4.0)),
-                "econ_strategy_kind": str(out.get("econ_strategy_kind", "both")),
+                "econ_strategy_kind": _financial_econ_strategy(out),
                 "econ_ls_top_frac": float(out.get("econ_ls_top_frac", 0.2)),
                 "econ_ls_bottom_frac": float(out.get("econ_ls_bottom_frac", 0.2)),
             }
@@ -144,7 +151,7 @@ def apply_mode_profile(mode: str, cfg: dict) -> tuple[str, dict]:
                 "portfolio_baseline_exposure": float(out.get("portfolio_baseline_exposure", 1.0)),
                 "portfolio_delta_scale": float(out.get("portfolio_delta_scale", 0.5)),
                 "portfolio_cara_risk_aversion": float(out.get("portfolio_cara_risk_aversion", 4.0)),
-                "econ_strategy_kind": str(out.get("econ_strategy_kind", "both")),
+                "econ_strategy_kind": _financial_econ_strategy(out),
                 "econ_ls_top_frac": float(out.get("econ_ls_top_frac", 0.2)),
                 "econ_ls_bottom_frac": float(out.get("econ_ls_bottom_frac", 0.2)),
                 "econ_ls_uncertainty_scale": float(out.get("econ_ls_uncertainty_scale", 0.5)),
@@ -214,6 +221,8 @@ def objective_primary_metric(metrics: dict) -> tuple[str, float]:
             "econ_ls_oos_sharpe_uplift_min",
             "econ_ls_sharpe_uplift",
             "econ_ls_oos_ann_return_uplift_min",
+            "econ_exposure_adjusted_sharpe_uplift",
+            "econ_exposure_adjusted_ann_return_uplift",
             "econ_oos_sharpe_uplift_min",
             "econ_sharpe_uplift",
             "eval_return_corr",
